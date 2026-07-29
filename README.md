@@ -212,6 +212,12 @@ audio stream. The default canvas follows the first clip; choose `largest`,
 `1080p`, or `4k` with `--canvas`. Use `--encoder videotoolbox` for the fast M4
 hardware path.
 
+The app shows input expansion and metadata progress as soon as a combine job
+starts. After probing the clips, it reports clip count, total playback time,
+source size, estimated output size and size change, and estimated encode time.
+Encode progress and ETA then update while the job runs. The verified output
+size replaces the estimate when the job finishes.
+
 For mixed HDR and SDR inputs, the default creates separately named `-sdr` and
 `-hdr` outputs so each group keeps an appropriate dynamic range. Select
 `--mixed-dynamic-range sdr` to request one BT.709 SDR output using Hable

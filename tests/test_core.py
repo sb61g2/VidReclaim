@@ -35,7 +35,13 @@ from vidreclaim.runner import (
     delete_verified_dvd_source,
     delete_verified_file_source,
 )
-from vidreclaim.stitch import StitchSettings, canvas_dimensions, natural_key, stitch
+from vidreclaim.stitch import (
+    StitchSettings,
+    canvas_dimensions,
+    estimate_stitch,
+    natural_key,
+    stitch,
+)
 from vidreclaim.space import SpaceNode, scan_space, write_space_json
 
 
@@ -271,6 +277,24 @@ class StitchTests(unittest.TestCase):
         second = media(Path("/tmp/second.mp4"), 1920, 1080)
         self.assertEqual((1280, 720), canvas_dimensions([first, second], "first"))
         self.assertEqual((1920, 1080), canvas_dimensions([first, second], "largest"))
+
+    def test_estimate_reports_source_output_runtime_and_encode_time(self) -> None:
+        first = media(Path("/tmp/first.mp4"), 1920, 1080)
+        second = media(Path("/tmp/second.mp4"), 1920, 1080)
+        first.size_bytes = 4_000_000_000
+        first.duration = 1800
+        second.size_bytes = 6_000_000_000
+        second.duration = 2700
+        estimate = estimate_stitch(
+            [first, second],
+            StitchSettings(encoder="videotoolbox"),
+        )
+        self.assertEqual(2, estimate.clip_count)
+        self.assertEqual(10_000_000_000, estimate.source_bytes)
+        self.assertEqual(4500, estimate.total_duration_seconds)
+        self.assertGreater(estimate.projected_output_bytes, 0)
+        self.assertGreater(estimate.projected_encode_seconds, 0)
+        self.assertEqual((1920, 1080), (estimate.width, estimate.height))
 
     def test_mixed_dynamic_range_splits_into_named_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

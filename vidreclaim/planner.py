@@ -62,14 +62,15 @@ def candidate_dimensions(media: MediaInfo) -> list[tuple[int, int]]:
     return dimensions
 
 
-def _estimated_encode_fps(
-    media: MediaInfo,
+def estimated_encode_fps(
+    width: int,
+    height: int,
     *,
     encoder: Encoder,
     preset: str,
 ) -> float:
     """Conservative M4-oriented estimate, replaced by observed speed at runtime."""
-    megapixels = max(0.25, media.megapixels)
+    megapixels = max(0.25, width * height / 1_000_000)
     if encoder == "videotoolbox":
         return 310 / (megapixels ** 0.78)
     preset_factor = {
@@ -131,8 +132,11 @@ def analyze_fast(
         "slow": 0.94,
     }.get(preset, 1.0)
     candidates: list[Candidate] = []
-    encode_fps = _estimated_encode_fps(
-        media, encoder=encoder, preset=preset,
+    encode_fps = estimated_encode_fps(
+        media.width,
+        media.height,
+        encoder=encoder,
+        preset=preset,
     )
     for width, height in dimensions:
         resolution_factor = 1.45 if height <= 576 else (1.15 if height <= 720 else 1.0)

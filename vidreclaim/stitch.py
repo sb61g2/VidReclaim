@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import math
 import re
 import tempfile
 from dataclasses import dataclass
@@ -8,11 +10,11 @@ from typing import Literal
 
 from .discovery import discover
 from .model import PROFILES, MediaInfo, Profile, Source
-from .planner import base_crf
+from .planner import base_crf, estimated_encode_fps
 from .probe import probe_file, probe_output
 from .progress import ProgressReporter
 from .runner import _stream_command
-from .util import CommandError, human_bytes, run
+from .util import CommandError, duration_text, human_bytes, run
 
 
 Canvas = Literal["first", "largest", "1080p", "4k"]
@@ -27,6 +29,30 @@ class StitchSettings:
     canvas: Canvas = "first"
     nice: int = 10
     mixed_dynamic_range: MixedDynamicRange = "split"
+
+
+@dataclass(frozen=True)
+class StitchEstimate:
+    clip_count: int
+    source_bytes: int
+    projected_output_bytes: int
+    total_duration_seconds: float
+    projected_encode_seconds: float
+    width: int
+    height: int
+    fps: float
+
+    def to_dict(self) -> dict[str, int | float]:
+        return {
+            "clip_count": self.clip_count,
+            "source_bytes": self.source_bytes,
+            "projected_output_bytes": self.projected_output_bytes,
+            "total_duration_seconds": self.total_duration_seconds,
+            "projected_encode_seconds": self.projected_encode_seconds,
+            "width": self.width,
+            "height": self.height,
+            "fps": self.fps,
+        }
 
 
 def natural_key(path: Path) -> list[object]:
@@ -78,6 +104,97 @@ def canvas_dimensions(media: list[MediaInfo], canvas: Canvas) -> tuple[int, int]
         else max(media, key=lambda item: item.width * item.height)
     )
     return max(2, chosen.width // 2 * 2), max(2, chosen.height // 2 * 2)
+
+
+def estimate_stitch(
+    media: list[MediaInfo],
+    settings: StitchSettings,
+) -> StitchEstimate:
+    width, height = canvas_dimensions(media, settings.canvas)
+    fps = min(60.0, max(1.0, media[0].fps))
+    duration = sum(item.duration for item in media)
+    source_bytes = sum(item.size_bytes for item in media)
+    base_bpp = {
+        "conservative": 0.066,
+        "balanced": 0.052,
+        "compact": 0.042,
+    }[settings.profile.name]
+    encoder_size_factor = 1.25 if settings.encoder == "videotoolbox" else {
+        "ultrafast": 1.18,
+        "superfast": 1.14,
+        "veryfast": 1.11,
+        "faster": 1.07,
+        "fast": 1.03,
+        "medium": 1.0,
+        "slow": 0.94,
+    }.get(settings.preset, 1.0)
+    resolution_factor = 1.45 if height <= 576 else (1.15 if height <= 720 else 1.0)
+    video_rate = round(
+        width * height * max(fps, 23.976)
+        * base_bpp * resolution_factor * encoder_size_factor
+    )
+    projected_output_bytes = math.ceil(
+        (video_rate + 192_000) * duration / 8 * 1.02
+    )
+    encode_fps = estimated_encode_fps(
+        width,
+        height,
+        encoder=settings.encoder,
+        preset=settings.preset,
+    )
+    projected_encode_seconds = duration * fps / max(encode_fps, 1.0)
+    return StitchEstimate(
+        clip_count=len(media),
+        source_bytes=source_bytes,
+        projected_output_bytes=projected_output_bytes,
+        total_duration_seconds=duration,
+        projected_encode_seconds=projected_encode_seconds,
+        width=width,
+        height=height,
+        fps=fps,
+    )
+
+
+def _print_stitch_estimate(estimate: StitchEstimate) -> None:
+    print(
+        "COMBINE_ESTIMATE " + json.dumps(
+            estimate.to_dict(),
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    difference = estimate.source_bytes - estimate.projected_output_bytes
+    change = (
+        f"about {human_bytes(difference)} smaller"
+        if difference >= 0
+        else f"about {human_bytes(abs(difference))} larger"
+    )
+    print(
+        f"Combine estimate: {estimate.clip_count} clips · "
+        f"{duration_text(estimate.total_duration_seconds)} total runtime · "
+        f"{human_bytes(estimate.source_bytes)} source → "
+        f"{human_bytes(estimate.projected_output_bytes)} output ({change}) · "
+        f"{duration_text(estimate.projected_encode_seconds)} encode time",
+        flush=True,
+    )
+
+
+def _print_stitch_result(outputs: list[Path]) -> None:
+    existing = [path for path in outputs if path.exists()]
+    if not existing:
+        return
+    print(
+        "COMBINE_RESULT " + json.dumps(
+            {
+                "output_bytes": sum(path.stat().st_size for path in existing),
+                "output_count": len(existing),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        flush=True,
+    )
 
 
 def _escape_ffmetadata(value: str) -> str:
@@ -307,11 +424,28 @@ def stitch(
         output = output.with_suffix(".mkv")
     if output.suffix.lower() not in {".mkv", ".mp4", ".m4v", ".mov"}:
         raise CommandError("Stitch output must be MKV, MP4, M4V, or MOV")
+    print("Combine preflight: expanding selected files and folders…", flush=True)
     paths = expand_inputs(inputs, output)
-    media = [probe_file(Source(path)) for path in paths]
+    print(
+        f"Combine preflight: found {len(paths)} clips; reading metadata…",
+        flush=True,
+    )
+    media: list[MediaInfo] = []
+    update_interval = max(1, len(paths) // 20)
+    for index, path in enumerate(paths, 1):
+        media.append(probe_file(Source(path)))
+        if index == 1 or index == len(paths) or index % update_interval == 0:
+            print(
+                f"Combine metadata: {index}/{len(paths)} · {path.name}",
+                flush=True,
+            )
+    estimate = estimate_stitch(media, settings)
+    _print_stitch_estimate(estimate)
     hdr_values = {item.hdr for item in media}
     if len(hdr_values) == 1:
-        return [_stitch_prepared(paths, media, output, settings=settings)]
+        outputs = [_stitch_prepared(paths, media, output, settings=settings)]
+        _print_stitch_result(outputs)
+        return outputs
 
     if settings.mixed_dynamic_range == "sdr" and _supports_hdr_tonemap():
         print(
@@ -319,7 +453,7 @@ def stitch(
             "BT.709 SDR with the Hable operator.",
             flush=True,
         )
-        return [
+        outputs = [
             _stitch_prepared(
                 paths,
                 media,
@@ -328,6 +462,8 @@ def stitch(
                 tone_map_hdr=True,
             )
         ]
+        _print_stitch_result(outputs)
+        return outputs
 
     if settings.mixed_dynamic_range == "sdr":
         print(
@@ -373,4 +509,5 @@ def stitch(
                 settings=settings,
             )
         )
+    _print_stitch_result(outputs)
     return outputs

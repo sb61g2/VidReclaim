@@ -43,6 +43,36 @@ struct OptionEstimate: Codable, Identifiable {
     }
 }
 
+struct CombineEstimate: Codable {
+    let clipCount: Int
+    let sourceBytes: Int64
+    let projectedOutputBytes: Int64
+    let totalDurationSeconds: Double
+    let projectedEncodeSeconds: Double
+    let width: Int
+    let height: Int
+    let fps: Double
+
+    enum CodingKeys: String, CodingKey {
+        case width, height, fps
+        case clipCount = "clip_count"
+        case sourceBytes = "source_bytes"
+        case projectedOutputBytes = "projected_output_bytes"
+        case totalDurationSeconds = "total_duration_seconds"
+        case projectedEncodeSeconds = "projected_encode_seconds"
+    }
+}
+
+struct CombineResult: Codable {
+    let outputBytes: Int64
+    let outputCount: Int
+
+    enum CodingKeys: String, CodingKey {
+        case outputBytes = "output_bytes"
+        case outputCount = "output_count"
+    }
+}
+
 struct ReviewPair: Codable, Identifiable {
     let before: String
     let after: String
@@ -219,7 +249,7 @@ enum SourcePolicy: String, CaseIterable, Identifiable {
         case .archive:
             return "Replace files only after verification and move originals to .reclaim-originals."
         case .delete:
-            return "Low-disk-space mode. Permanently delete each source only after its result verifies."
+            return "Permanently delete each source only after its result verifies."
         }
     }
 }
@@ -265,6 +295,11 @@ final class AppModel: ObservableObject {
     @Published var stitchEncoder = "videotoolbox"
     @Published var stitchPreset = "medium"
     @Published var stitchMixedDynamicRange = "split"
+    @Published var combineEstimate: CombineEstimate?
+    @Published var combineResult: CombineResult?
+    @Published var combinePreflightProgress: Double?
+    @Published var combineAttempted = false
+    @Published private(set) var runningCombine = false
 
     @Published var spacePaths: [URL] = []
     @Published var useLogicalSizes = false
@@ -340,6 +375,7 @@ final class AppModel: ObservableObject {
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = true
         if panel.runModal() == .OK {
+            resetCombineEstimate()
             for url in panel.urls where !stitchInputs.contains(url) {
                 stitchInputs.append(url)
             }
@@ -415,6 +451,14 @@ final class AppModel: ObservableObject {
     var canStitchSelection: Bool {
         stitchInputs.count >= 2
             || stitchInputs.contains(where: \.hasDirectoryPath)
+    }
+
+    func resetCombineEstimate() {
+        guard !runningCombine else { return }
+        combineEstimate = nil
+        combineResult = nil
+        combinePreflightProgress = nil
+        combineAttempted = false
     }
 
     private func availableSuggestedStitchOutput() -> URL? {
@@ -676,7 +720,22 @@ final class AppModel: ObservableObject {
     }
 
     func runStitch() {
-        guard stitchInputs.count >= 2, let output = stitchOutput else { return }
+        guard canStitchSelection else {
+            phase = "Choose at least two clips or a folder"
+            lastSummary = "Combine needs at least two clips. A folder may contain both."
+            lastExitSuccessful = false
+            return
+        }
+        guard let output = stitchOutput else {
+            phase = "Choose an output file"
+            lastSummary = "Choose where to save the combined video."
+            lastExitSuccessful = false
+            return
+        }
+        combineEstimate = nil
+        combineResult = nil
+        combinePreflightProgress = 0
+        combineAttempted = true
         let arguments = [
             "stitch", output.path,
         ] + stitchInputs.map(\.path) + [
@@ -689,7 +748,7 @@ final class AppModel: ObservableObject {
         ]
         run(
             arguments: arguments,
-            title: "Stitching \(stitchInputs.count) clips",
+            title: "Preparing clips",
             section: .workspace
         )
     }
@@ -872,6 +931,7 @@ final class AppModel: ObservableObject {
         let destination = index + offset
         guard stitchInputs.indices.contains(index),
               stitchInputs.indices.contains(destination) else { return }
+        resetCombineEstimate()
         stitchInputs.swapAt(index, destination)
     }
 
@@ -889,6 +949,15 @@ final class AppModel: ObservableObject {
             guard let process, process.isRunning else { return }
             process.terminate()
             self?.appendLog("The worker did not stop after interrupt; termination was requested.\n")
+        }
+    }
+
+    func stopForApplicationTermination() {
+        queueTimer?.invalidate()
+        queueTimer = nil
+        outputPipe?.fileHandleForReading.readabilityHandler = nil
+        if let process, process.isRunning {
+            process.interrupt()
         }
     }
 
@@ -932,6 +1001,7 @@ final class AppModel: ObservableObject {
         pendingOutput = ""
         jobTitle = title
         runningQueue = arguments.first?.hasPrefix("queue-") == true
+        runningCombine = arguments.first == "stitch"
         isRunning = true
         phase = title
         jobName = ""
@@ -987,6 +1057,7 @@ final class AppModel: ObservableObject {
                 self.process = nil
                 self.outputPipe = nil
                 self.runningQueue = false
+                self.runningCombine = false
             }
         }
 
@@ -997,6 +1068,7 @@ final class AppModel: ObservableObject {
             process = nil
             outputPipe = nil
             runningQueue = false
+            runningCombine = false
             isRunning = false
             phase = "Could not start"
             lastExitSuccessful = false
@@ -1017,6 +1089,55 @@ final class AppModel: ObservableObject {
     }
 
     private func handleLine(_ line: String) {
+        if line.hasPrefix("Combine preflight:") {
+            phase = "Preparing clips"
+            jobName = String(line.dropFirst("Combine preflight:".count))
+                .trimmingCharacters(in: .whitespaces)
+            if line.contains("reading metadata") {
+                combinePreflightProgress = 0
+            }
+            eta = "Estimating…"
+            return
+        }
+        if line.hasPrefix("Combine metadata:") {
+            phase = "Reading clip metadata"
+            let detail = String(line.dropFirst("Combine metadata:".count))
+                .trimmingCharacters(in: .whitespaces)
+            jobName = detail
+            if let marker = detail.split(separator: " ").first {
+                let values = marker.split(separator: "/")
+                if values.count == 2,
+                   let current = Double(values[0]),
+                   let total = Double(values[1]), total > 0 {
+                    combinePreflightProgress = max(0, min(1, current / total))
+                }
+            }
+            return
+        }
+        if line.hasPrefix("COMBINE_ESTIMATE ") {
+            let json = String(line.dropFirst("COMBINE_ESTIMATE ".count))
+            if let data = json.data(using: .utf8),
+               let estimate = try? JSONDecoder().decode(
+                   CombineEstimate.self, from: data
+               ) {
+                combineEstimate = estimate
+                combinePreflightProgress = 1
+                phase = "Encoding combined video"
+                jobName = "\(estimate.clipCount) clips · \(estimate.width)×\(estimate.height)"
+                eta = durationLabel(estimate.projectedEncodeSeconds)
+            }
+            return
+        }
+        if line.hasPrefix("COMBINE_RESULT ") {
+            let json = String(line.dropFirst("COMBINE_RESULT ".count))
+            if let data = json.data(using: .utf8),
+               let result = try? JSONDecoder().decode(
+                   CombineResult.self, from: data
+               ) {
+                combineResult = result
+            }
+            return
+        }
         if line.hasPrefix("Plan:") {
             lastSummary = line
             phase = "Plan ready"
@@ -1748,7 +1869,7 @@ struct CompressView: View {
                 VStack(alignment: .leading, spacing: 22) {
                 SectionHeading(
                     title: "Reclaim Space",
-                    subtitle: "Choose library content, analyze worthwhile savings, review selected frames, and start a resumable job."
+                    subtitle: "Select videos, choose settings, and prepare the queue."
                 )
                 CompressionSourcePicker(
                     model: model,
@@ -1821,7 +1942,7 @@ struct CompressView: View {
                 }
                 .id("encode-settings")
 
-                GroupBox("Worthwhile-work threshold") {
+                GroupBox("Savings threshold") {
                     Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 13) {
                         GridRow {
                             Text("Minimum savings")
@@ -1843,7 +1964,7 @@ struct CompressView: View {
                     .padding(.top, 6)
                 }
 
-                GroupBox("Fast scan, optional review, and disc handling") {
+                GroupBox("Scan, review, and disc options") {
                     VStack(alignment: .leading, spacing: 9) {
                         Toggle(
                             "Thorough visual analysis (trial encodes and XPSNR)",
@@ -1984,15 +2105,47 @@ struct CompressView: View {
 struct StitchView: View {
     @ObservedObject var model: AppModel
 
+    private var outputSizeTitle: String {
+        model.combineResult == nil ? "Estimated output" : "Actual output"
+    }
+
+    private var outputSize: Int64? {
+        model.combineResult?.outputBytes
+            ?? model.combineEstimate?.projectedOutputBytes
+    }
+
+    private var sizeDifference: Int64? {
+        guard let source = model.combineEstimate?.sourceBytes,
+              let output = outputSize else { return nil }
+        return source - output
+    }
+
+    private var differenceTitle: String {
+        guard let difference = sizeDifference else { return "Estimated change" }
+        let prefix = model.combineResult == nil ? "Estimated" : "Actual"
+        return "\(prefix) \(difference >= 0 ? "savings" : "increase")"
+    }
+
+    private var differenceValue: String {
+        guard let difference = sizeDifference,
+              let source = model.combineEstimate?.sourceBytes,
+              source > 0 else { return "—" }
+        let percent = abs(Double(difference) / Double(source) * 100)
+        return "\(model.bytesLabel(abs(difference))) (\(percent.formatted(.number.precision(.fractionLength(1))))%)"
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
             SectionHeading(
                 title: "Combine Clips",
-                subtitle: "Join mixed clips in order. VidReclaim normalizes their size, frame rate, and audio, then adds chapter markers."
+                subtitle: "Join clips in the listed order."
             )
             HStack {
                 Button("Add Clips or Folders…") { model.addStitchInputs() }
+                    .disabled(model.isRunning)
                 Button("Clear") {
+                    model.resetCombineEstimate()
                     model.stitchInputs.removeAll()
                     model.stitchOutput = nil
                 }
@@ -2016,17 +2169,24 @@ struct StitchView: View {
                         Button { model.moveStitchInput(from: index, by: -1) } label: {
                             Image(systemName: "chevron.up")
                         }
-                        .buttonStyle(.plain).disabled(index == 0)
+                        .buttonStyle(.plain)
+                        .disabled(index == 0 || model.isRunning)
                         Button { model.moveStitchInput(from: index, by: 1) } label: {
                             Image(systemName: "chevron.down")
                         }
-                        .buttonStyle(.plain).disabled(index == model.stitchInputs.count - 1)
+                        .buttonStyle(.plain)
+                        .disabled(
+                            index == model.stitchInputs.count - 1
+                                || model.isRunning
+                        )
                         Button(role: .destructive) {
+                            model.resetCombineEstimate()
                             model.stitchInputs.remove(at: index)
                         } label: {
                             Image(systemName: "xmark.circle")
                         }
                         .buttonStyle(.plain)
+                        .disabled(model.isRunning)
                     }
                 }
             }
@@ -2041,6 +2201,141 @@ struct StitchView: View {
             }
             .frame(minHeight: 190, idealHeight: 280, maxHeight: 360)
 
+            if model.combineAttempted {
+                GroupBox("Combine status") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack(spacing: 10) {
+                            if model.runningCombine
+                                && model.combineEstimate == nil {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Image(
+                                    systemName: model.combineResult != nil
+                                        ? "checkmark.circle.fill"
+                                        : (
+                                            model.lastExitSuccessful == false
+                                                ? "exclamationmark.triangle.fill"
+                                                : "clock"
+                                        )
+                                )
+                                .foregroundStyle(
+                                    model.combineResult != nil
+                                        ? Color.green
+                                        : (
+                                            model.lastExitSuccessful == false
+                                                ? Color.red : Color.accentColor
+                                        )
+                                )
+                            }
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(model.phase).fontWeight(.semibold)
+                                if !model.jobName.isEmpty {
+                                    Text(model.jobName)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
+                            Spacer()
+                            if model.runningCombine {
+                                Text(
+                                    model.combineEstimate == nil
+                                        ? "Calculating estimates"
+                                        : "ETA \(model.eta)"
+                                )
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                            }
+                        }
+
+                        if model.runningCombine {
+                            if model.combineEstimate == nil {
+                                if let progress = model.combinePreflightProgress {
+                                    ProgressView(value: progress)
+                                        .progressViewStyle(.linear)
+                                } else {
+                                    ProgressView()
+                                        .progressViewStyle(.linear)
+                                }
+                            } else {
+                                ProgressView(value: model.jobProgress)
+                                    .progressViewStyle(.linear)
+                            }
+                        }
+
+                        if let estimate = model.combineEstimate {
+                            Grid(
+                                alignment: .leading,
+                                horizontalSpacing: 24,
+                                verticalSpacing: 7
+                            ) {
+                                GridRow {
+                                    Text("Clips").foregroundStyle(.secondary)
+                                    Text(estimate.clipCount.formatted())
+                                        .monospacedDigit()
+                                    Text("Total runtime")
+                                        .foregroundStyle(.secondary)
+                                    Text(
+                                        model.durationLabel(
+                                            estimate.totalDurationSeconds
+                                        )
+                                    )
+                                    .monospacedDigit()
+                                    Text("Resolution")
+                                        .foregroundStyle(.secondary)
+                                    Text("\(estimate.width)×\(estimate.height)")
+                                        .monospacedDigit()
+                                }
+                                GridRow {
+                                    Text("Source size")
+                                        .foregroundStyle(.secondary)
+                                    Text(model.bytesLabel(estimate.sourceBytes))
+                                        .monospacedDigit()
+                                    Text(outputSizeTitle)
+                                        .foregroundStyle(.secondary)
+                                    Text(model.bytesLabel(outputSize))
+                                        .monospacedDigit()
+                                    Text(differenceTitle)
+                                        .foregroundStyle(.secondary)
+                                    Text(differenceValue)
+                                        .monospacedDigit()
+                                }
+                                GridRow {
+                                    Text("Estimated encode")
+                                        .foregroundStyle(.secondary)
+                                    Text(
+                                        model.durationLabel(
+                                            estimate.projectedEncodeSeconds
+                                        )
+                                    )
+                                    .monospacedDigit()
+                                    Text("Output files")
+                                        .foregroundStyle(.secondary)
+                                    Text(
+                                        model.combineResult?.outputCount
+                                            .formatted() ?? (
+                                                model.stitchMixedDynamicRange
+                                                    == "split"
+                                                ? "1 or 2" : "1"
+                                            )
+                                    )
+                                    Text("")
+                                    Text("")
+                                }
+                            }
+                            .font(.caption)
+                            Text(
+                                "Size and encode time are metadata-based estimates. Live progress replaces the time estimate during encoding."
+                            )
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.top, 5)
+                }
+            }
+
             PathChooser(
                 title: model.stitchOutput?.lastPathComponent
                     ?? model.suggestedStitchFilename,
@@ -2048,6 +2343,7 @@ struct StitchView: View {
                     ?? "Suggested name; choose where to save it.",
                 action: model.chooseStitchOutput
             )
+            .disabled(model.isRunning)
 
             GroupBox("Output") {
                 Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 13) {
@@ -2092,17 +2388,30 @@ struct StitchView: View {
                 }
                 .padding(.top, 6)
             }
+            .disabled(model.isRunning)
 
             HStack {
                 Label(
                     model.stitchMixedDynamicRange == "split"
                         ? "Mixed inputs create “-sdr” and “-hdr” files so neither color range is compromised."
-                        : "HDR clips are converted to BT.709 SDR when the installed engine supports color-aware tone mapping; otherwise two safe outputs are created.",
+                        : "HDR clips are converted to BT.709 SDR when color-aware tone mapping is available; otherwise two outputs are created.",
                     systemImage: "info.circle"
                 )
                 .font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Button("Combine Videos") { model.runStitch() }
+                Button {
+                    model.runStitch()
+                } label: {
+                    HStack(spacing: 7) {
+                        if model.runningCombine {
+                            ProgressView().controlSize(.small)
+                        }
+                        Text(
+                            model.runningCombine
+                                ? "Combining…" : "Combine Videos"
+                        )
+                    }
+                }
                     .buttonStyle(.borderedProminent)
                     .disabled(
                         !model.canStitchSelection
@@ -2110,9 +2419,25 @@ struct StitchView: View {
                         || model.isRunning
                     )
             }
+            }
+            .onChange(of: model.stitchCanvas) { _, _ in
+                model.resetCombineEstimate()
+            }
+            .onChange(of: model.stitchProfile) { _, _ in
+                model.resetCombineEstimate()
+            }
+            .onChange(of: model.stitchEncoder) { _, _ in
+                model.resetCombineEstimate()
+            }
+            .onChange(of: model.stitchPreset) { _, _ in
+                model.resetCombineEstimate()
+            }
+            .onChange(of: model.stitchMixedDynamicRange) { _, _ in
+                model.resetCombineEstimate()
+            }
+            .padding(28)
+            .frame(maxWidth: 920, alignment: .topLeading)
         }
-        .padding(28)
-        .frame(maxWidth: 920, maxHeight: .infinity, alignment: .topLeading)
     }
 }
 
@@ -2168,7 +2493,7 @@ struct SpaceMapView: View {
         VStack(alignment: .leading, spacing: 20) {
             SectionHeading(
                 title: "Space Map",
-                subtitle: "Find large media, select files or folders, and prepare a queue without scanning the whole library again."
+                subtitle: "Scan disk usage and select files or folders."
             )
             HStack {
                 Button("Add Folders or Disks…") { model.addSpacePaths() }
@@ -2335,9 +2660,6 @@ struct SpaceMapView: View {
             }
 
             HStack {
-                Text("Results stay in the app and can feed a queue directly.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
                 Spacer()
                 Button(model.spaceScan == nil ? "Scan" : "Scan Again") {
                     model.runSpaceMap()
@@ -2381,7 +2703,7 @@ struct WhatIfView: View {
                     Text("Compare encode options").font(.title2.bold())
                     Text(item.name).font(.headline)
                     Text(
-                        "Instant metadata estimates—no additional probing, samples, or test encodes."
+                        "Uses metadata already collected for this session."
                     )
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -2449,7 +2771,7 @@ struct WhatIfView: View {
                 .overlay(RoundedRectangle(cornerRadius: 10).stroke(.separator))
 
                 Label(
-                    "These are planning estimates, not guarantees. Grain, motion, HDR, and source complexity can change actual size and speed; live ETA corrects itself during encoding.",
+                    "Estimates can vary with grain, motion, HDR, and source complexity. The ETA updates during encoding.",
                     systemImage: "info.circle"
                 )
                 .font(.caption)
@@ -2693,7 +3015,7 @@ struct ActivityView: View {
             HStack {
                 SectionHeading(
                     title: "Queue",
-                    subtitle: "Persistent per-video controls with reboot-resumable sessions."
+                    subtitle: "Monitor and manage scans and encodes."
                 )
                 Spacer()
                 Button("Open Saved Queue…") { model.openQueueSession() }
@@ -3163,7 +3485,7 @@ struct ActivityView: View {
                             ContentUnavailableView(
                                 orderedItems.isEmpty
                                     && session.status == "scanning"
-                                    ? "Scanning quickly…" : "No matching videos",
+                                    ? "Scanning…" : "No matching videos",
                                 systemImage: "line.3.horizontal.decrease.circle",
                                 description: Text(
                                     showProcessed
@@ -3224,7 +3546,7 @@ struct WorkspaceView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("What would you like to do?")
+                Text("Task")
                     .font(.headline)
                 Picker(
                     "Workspace operation",
@@ -3271,7 +3593,7 @@ struct ContentView: View {
             .safeAreaInset(edge: .bottom) {
                 VStack(alignment: .leading, spacing: 3) {
                     Label(model.engineStatus, systemImage: model.cliPath == nil ? "xmark.circle" : "checkmark.circle")
-                    Text("Local processing workspace")
+                    Text("Runs locally on this Mac")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 .padding(12)
@@ -3290,11 +3612,28 @@ struct ContentView: View {
                 }
             }
         }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: NSApplication.willTerminateNotification
+            )
+        ) { _ in
+            model.stopForApplicationTermination()
+        }
+    }
+}
+
+final class VidReclaimAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(
+        _ sender: NSApplication
+    ) -> Bool {
+        true
     }
 }
 
 @main
 struct VidReclaimApp: App {
+    @NSApplicationDelegateAdaptor(VidReclaimAppDelegate.self)
+    private var appDelegate
     @StateObject private var model = AppModel()
 
     var body: some Scene {
