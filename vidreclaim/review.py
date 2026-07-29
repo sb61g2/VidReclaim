@@ -50,9 +50,12 @@ def build_review_assets(
     *,
     session_dir: Path,
     sample_seconds: float,
+    plan_indices: set[int] | None = None,
 ) -> list[dict[str, object]]:
     cards: list[dict[str, object]] = []
     for plan_index, plan in enumerate(plans):
+        if plan_indices is not None and plan_index not in plan_indices:
+            continue
         if plan.status != "encode" or plan.candidate is None:
             continue
         try:
@@ -234,9 +237,13 @@ def review_in_browser(
     session_dir: Path,
     decisions_path: Path,
     sample_seconds: float,
+    plan_indices: set[int] | None = None,
 ) -> set[int]:
     cards = build_review_assets(
-        plans, session_dir=session_dir, sample_seconds=sample_seconds,
+        plans,
+        session_dir=session_dir,
+        sample_seconds=sample_seconds,
+        plan_indices=plan_indices,
     )
     if not cards:
         return set()

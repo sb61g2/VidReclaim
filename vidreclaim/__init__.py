@@ -2,6 +2,6 @@
 
 from .runtime import configure_bundled_tools
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 configure_bundled_tools()

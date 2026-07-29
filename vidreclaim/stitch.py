@@ -12,10 +12,11 @@ from .planner import base_crf
 from .probe import probe_file, probe_output
 from .progress import ProgressReporter
 from .runner import _stream_command
-from .util import CommandError, human_bytes
+from .util import CommandError, human_bytes, run
 
 
 Canvas = Literal["first", "largest", "1080p", "4k"]
+MixedDynamicRange = Literal["split", "sdr"]
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,7 @@ class StitchSettings:
     profile: Profile = PROFILES["balanced"]
     canvas: Canvas = "first"
     nice: int = 10
+    mixed_dynamic_range: MixedDynamicRange = "split"
 
 
 def natural_key(path: Path) -> list[object]:
@@ -110,6 +112,7 @@ def _filter_graph(
     height: int,
     fps: float,
     pixel_format: str,
+    tone_map_hdr: bool = False,
 ) -> str:
     chains: list[str] = []
     concat_inputs: list[str] = []
@@ -117,6 +120,14 @@ def _filter_graph(
         video_filters: list[str] = []
         if item.field_order not in {"progressive", "unknown", ""}:
             video_filters.append("bwdif=mode=send_frame:parity=auto:deint=interlaced")
+        if tone_map_hdr and item.hdr:
+            video_filters.extend([
+                "zscale=t=linear:npl=100",
+                "format=gbrpf32le",
+                "zscale=p=bt709",
+                "tonemap=hable:desat=1",
+                "zscale=t=bt709:m=bt709:r=tv",
+            ])
         video_filters.extend([
             f"scale={width}:{height}:force_original_aspect_ratio=decrease:flags=lanczos",
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black",
@@ -181,30 +192,32 @@ def _video_encoder_args(
     ]
 
 
-def stitch(
-    inputs: list[Path],
+def _supports_hdr_tonemap() -> bool:
+    result = run(
+        ["ffmpeg", "-hide_banner", "-filters"],
+        check=False,
+        capture=True,
+    )
+    filters = (result.stdout or "") + (result.stderr or "")
+    return " zscale " in filters and " tonemap " in filters
+
+
+def _stitch_prepared(
+    paths: list[Path],
+    media: list[MediaInfo],
     output: Path,
     *,
     settings: StitchSettings,
+    tone_map_hdr: bool = False,
 ) -> Path:
-    output = output.expanduser().resolve()
-    if not output.suffix:
-        output = output.with_suffix(".mkv")
-    if output.suffix.lower() not in {".mkv", ".mp4", ".m4v", ".mov"}:
-        raise CommandError("Stitch output must be MKV, MP4, M4V, or MOV")
     if output.exists():
         raise CommandError(f"Refusing to overwrite existing output: {output}")
-    paths = expand_inputs(inputs, output)
-    media = [probe_file(Source(path)) for path in paths]
-    hdr_values = {item.hdr for item in media}
-    if len(hdr_values) > 1:
-        raise CommandError(
-            "Mixing HDR and SDR clips needs an explicit tone-mapping decision; "
-            "convert them to a common color space first"
-        )
     width, height = canvas_dimensions(media, settings.canvas)
     fps = min(60.0, max(1.0, media[0].fps))
-    ten_bit = all(item.bit_depth > 8 or item.hdr for item in media)
+    ten_bit = (
+        False if tone_map_hdr
+        else all(item.bit_depth > 8 or item.hdr for item in media)
+    )
     pixel_format = "yuv420p10le" if ten_bit else "yuv420p"
     total_duration = sum(item.duration for item in media)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -221,7 +234,14 @@ def stitch(
             args.extend(["-i", str(path)])
         args.extend([
             "-f", "ffmetadata", "-i", str(metadata),
-            "-filter_complex", _filter_graph(media, width, height, fps, pixel_format),
+            "-filter_complex", _filter_graph(
+                media,
+                width,
+                height,
+                fps,
+                pixel_format,
+                tone_map_hdr=tone_map_hdr,
+            ),
             "-map", "[outv]", "-map", "[outa]",
             *_video_encoder_args(settings, height=height, ten_bit=ten_bit),
             "-c:a", "aac", "-b:a", "192k",
@@ -274,3 +294,83 @@ def stitch(
         f"({width}x{height}, {fps:.3f} fps, {human_bytes(output.stat().st_size)})"
     )
     return output
+
+
+def stitch(
+    inputs: list[Path],
+    output: Path,
+    *,
+    settings: StitchSettings,
+) -> list[Path]:
+    output = output.expanduser().resolve()
+    if not output.suffix:
+        output = output.with_suffix(".mkv")
+    if output.suffix.lower() not in {".mkv", ".mp4", ".m4v", ".mov"}:
+        raise CommandError("Stitch output must be MKV, MP4, M4V, or MOV")
+    paths = expand_inputs(inputs, output)
+    media = [probe_file(Source(path)) for path in paths]
+    hdr_values = {item.hdr for item in media}
+    if len(hdr_values) == 1:
+        return [_stitch_prepared(paths, media, output, settings=settings)]
+
+    if settings.mixed_dynamic_range == "sdr" and _supports_hdr_tonemap():
+        print(
+            "Mixed HDR and SDR detected; tone-mapping HDR clips to "
+            "BT.709 SDR with the Hable operator.",
+            flush=True,
+        )
+        return [
+            _stitch_prepared(
+                paths,
+                media,
+                output,
+                settings=settings,
+                tone_map_hdr=True,
+            )
+        ]
+
+    if settings.mixed_dynamic_range == "sdr":
+        print(
+            "This FFmpeg build lacks the zscale filter required for "
+            "color-aware HDR-to-SDR conversion; creating separate outputs.",
+            flush=True,
+        )
+    sdr_output = output.with_name(f"{output.stem}-sdr{output.suffix}")
+    hdr_output = output.with_name(f"{output.stem}-hdr{output.suffix}")
+    groups = [
+        (
+            "SDR",
+            sdr_output,
+            [
+                (path, item) for path, item in zip(paths, media, strict=True)
+                if not item.hdr
+            ],
+        ),
+        (
+            "HDR",
+            hdr_output,
+            [
+                (path, item) for path, item in zip(paths, media, strict=True)
+                if item.hdr
+            ],
+        ),
+    ]
+    print(
+        "Mixed HDR and SDR detected; preserving color by creating separate "
+        f"outputs: {sdr_output.name} and {hdr_output.name}.",
+        flush=True,
+    )
+    outputs: list[Path] = []
+    for label, group_output, group in groups:
+        group_paths = [path for path, _ in group]
+        group_media = [item for _, item in group]
+        print(f"Stitching {label} clips…", flush=True)
+        outputs.append(
+            _stitch_prepared(
+                group_paths,
+                group_media,
+                group_output,
+                settings=settings,
+            )
+        )
+    return outputs

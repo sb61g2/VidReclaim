@@ -135,6 +135,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--nice", type=int, default=10,
         help="macOS process niceness, 0-20 (default: 10)",
     )
+    stitch_parser.add_argument(
+        "--mixed-dynamic-range",
+        choices=("split", "sdr"),
+        default="split",
+        help=(
+            "for mixed HDR/SDR inputs, create separate outputs or tone-map "
+            "HDR to SDR when supported"
+        ),
+    )
     stitch_parser.set_defaults(handler=command_stitch)
 
     space_parser = subparsers.add_parser(
@@ -175,6 +184,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="limit discovery to this file or directory; may be repeated",
+    )
+    queue_start.add_argument(
+        "--review-path",
+        type=Path,
+        action="append",
+        default=[],
+        help="generate side-by-side samples only for this selected path; may be repeated",
     )
     _add_analysis_options(queue_start)
     queue_start.add_argument("--output-dir", type=Path)
@@ -289,6 +305,7 @@ def command_stitch(args: argparse.Namespace) -> int:
                 profile=PROFILES[args.profile],
                 canvas=args.canvas,
                 nice=args.nice,
+                mixed_dynamic_range=args.mixed_dynamic_range,
             ),
         )
         return 0
@@ -351,7 +368,9 @@ def _queue_settings(args: argparse.Namespace, root: Path) -> dict[str, Any]:
         "nice": args.nice,
         "keep_dvd_extras": args.keep_dvd_extras,
         "dvd_min_title_minutes": args.dvd_min_title_minutes,
-        "thorough_analysis": bool(args.thorough_analysis or args.review),
+        "thorough_analysis": bool(
+            args.thorough_analysis or (args.review and not args.review_path)
+        ),
         "scan_workers": args.scan_workers,
         "visual_review": args.review,
         "deep_verify": args.deep_verify,
@@ -361,6 +380,9 @@ def _queue_settings(args: argparse.Namespace, root: Path) -> dict[str, Any]:
         "output_dir": str(output_root),
         "include_paths": [
             str(path.expanduser().resolve()) for path in args.include_path
+        ],
+        "review_paths": [
+            str(path.expanduser().resolve()) for path in args.review_path
         ],
     }
 

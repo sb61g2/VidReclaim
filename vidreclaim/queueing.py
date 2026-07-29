@@ -138,7 +138,7 @@ def create_session(
         raise CommandError(f"Root does not exist: {root}")
     now = time.time()
     data = {
-        "schema": 3,
+        "schema": 4,
         "id": uuid.uuid4().hex,
         "name": root.name or str(root),
         "root": str(root),
@@ -151,6 +151,8 @@ def create_session(
         "settings": settings,
         "items": [],
         "overall_fraction": 0.0,
+        "scan_fraction": 0.0,
+        "encode_fraction": 0.0,
         "eta_seconds": None,
         "completed_count": 0,
         "error_count": 0,
@@ -402,6 +404,25 @@ def _replace_item(
     store.mutate(change)
 
 
+def _scan_progress_fraction(data: dict[str, Any]) -> float:
+    items = data.get("items", [])
+    if not items:
+        return 0.0
+    completed_states = {
+        "ready", "complete", "processed", "skipped", "cancelled", "error",
+    }
+    progress = 0.0
+    for item in items:
+        status = item.get("status")
+        if status in completed_states:
+            progress += 1.0
+        elif status == "analyzing":
+            progress += 0.5 + 0.5 * min(
+                1.0, max(0.0, float(item.get("progress") or 0.0)),
+            )
+    return min(1.0, progress / len(items))
+
+
 def _update_item(store: SessionStore, item_id: str, **updates: Any) -> None:
     def change(data: dict[str, Any]) -> None:
         item = next(
@@ -410,6 +431,10 @@ def _update_item(store: SessionStore, item_id: str, **updates: Any) -> None:
         )
         if item is not None:
             item.update(updates)
+            data["scan_fraction"] = max(
+                float(data.get("scan_fraction") or 0.0),
+                _scan_progress_fraction(data),
+            )
 
     store.mutate(change)
 
@@ -493,10 +518,36 @@ def _prepare_session(store: SessionStore) -> tuple[list[Plan], list[dict[str, An
     settings = session["settings"]
     root = Path(session["root"])
     output_root = Path(settings["output_dir"])
+
+    def discovering(data: dict[str, Any]) -> None:
+        data.update({
+            "status": "scanning",
+            "phase": "Scanning folders for video sources",
+            "scan_fraction": 0.0,
+            "worker_pid": os.getpid(),
+        })
+
+    store.mutate(discovering)
     include_paths = [
         Path(value).expanduser().resolve()
         for value in settings.get("include_paths", [])
     ]
+    review_paths = [
+        Path(value).expanduser().resolve()
+        for value in settings.get("review_paths", [])
+    ]
+
+    def selected_for_review(path: Path) -> bool:
+        resolved = path.expanduser().resolve()
+        for selected in review_paths:
+            if resolved == selected:
+                return True
+            try:
+                resolved.relative_to(selected)
+                return True
+            except ValueError:
+                continue
+        return False
     if include_paths:
         sources_by_key: dict[str, Source] = {}
         for include_path in include_paths:
@@ -540,6 +591,8 @@ def _prepare_session(store: SessionStore) -> tuple[list[Plan], list[dict[str, An
             "status": "scanning",
             "phase": f"Reading metadata for {len(sources)} candidate items",
             "items": items,
+            "scan_fraction": _scan_progress_fraction({"items": items}),
+            "encode_fraction": 0.0,
             "summary": f"Found {len(sources)} candidate items",
             "worker_pid": os.getpid(),
         })
@@ -643,6 +696,7 @@ def _prepare_session(store: SessionStore) -> tuple[list[Plan], list[dict[str, An
                 data["items"][index:index + 1] = replacements
                 for order, item in enumerate(data["items"]):
                     item["order"] = order
+                data["scan_fraction"] = _scan_progress_fraction(data)
 
             store.mutate(expand_dvd)
             dvd_media.extend(unprocessed_media)
@@ -658,10 +712,16 @@ def _prepare_session(store: SessionStore) -> tuple[list[Plan], list[dict[str, An
     all_media.sort(key=lambda media: item_order.get(_item_id(media.source.key), 10**9))
 
     plans: list[Plan] = []
+    review_plan_indices: set[int] = set()
     assets_dir = store.path.with_suffix("") / "review"
     for media in all_media:
         item_id = _item_id(media.source.key)
         plan_index = len(plans)
+        review_this_media = selected_for_review(media.source.path)
+        media_settings = dict(settings)
+        media_settings["thorough_analysis"] = bool(
+            settings.get("thorough_analysis", False) or review_this_media
+        )
 
         def report_sample(done: int, total: int, detail: str) -> None:
             _update_item(
@@ -675,16 +735,18 @@ def _prepare_session(store: SessionStore) -> tuple[list[Plan], list[dict[str, An
         try:
             plan = _plan_media(
                 media,
-                settings,
+                media_settings,
                 work_dir=(
                     assets_dir / "clips" / str(plan_index)
-                    if settings.get("thorough_analysis", False) else None
+                    if media_settings["thorough_analysis"] else None
                 ),
                 sample_progress=report_sample,
             )
             if plan.status == "encode":
                 plan.output = output_path(root, plan, output_root)
             plans.append(plan)
+            if review_this_media:
+                review_plan_indices.add(plan_index)
             candidate = plan.candidate
             item_status = (
                 "ready" if plan.status == "encode"
@@ -719,6 +781,8 @@ def _prepare_session(store: SessionStore) -> tuple[list[Plan], list[dict[str, An
             )
 
     if settings.get("visual_review", False):
+        targeted_review = bool(review_paths)
+
         def review_phase(data: dict[str, Any]) -> None:
             data.update({
                 "status": "reviewing",
@@ -731,9 +795,14 @@ def _prepare_session(store: SessionStore) -> tuple[list[Plan], list[dict[str, An
             session_dir=assets_dir,
             decisions_path=store.path.with_suffix(".review.json"),
             sample_seconds=settings["sample_seconds"],
+            plan_indices=review_plan_indices if targeted_review else None,
         )
         for index, plan in enumerate(plans):
-            if plan.status == "encode" and index not in approved:
+            if (
+                plan.status == "encode"
+                and (not targeted_review or index in review_plan_indices)
+                and index not in approved
+            ):
                 plan.status = "skip"
                 plan.reason = "skipped in visual review"
                 _update_item(
@@ -759,6 +828,8 @@ def _prepare_session(store: SessionStore) -> tuple[list[Plan], list[dict[str, An
             "phase": "Queue ready",
             "summary": f"{queued} item(s) ready to encode",
             "overall_fraction": 0.0,
+            "scan_fraction": 1.0,
+            "encode_fraction": 0.0,
             "eta_seconds": eta,
         })
 
@@ -962,6 +1033,7 @@ def run_session(path: Path) -> int:
 
             def update_overall(data: dict[str, Any]) -> None:
                 data["overall_fraction"] = overall
+                data["encode_fraction"] = overall
                 data["eta_seconds"] = eta
 
             store.mutate(update_overall)
@@ -1136,6 +1208,8 @@ def run_session(path: Path) -> int:
             "phase": phase,
             "worker_pid": None,
             "overall_fraction": overall,
+            "scan_fraction": 1.0,
+            "encode_fraction": overall,
             "eta_seconds": eta,
             "completed_count": completed,
             "error_count": errors,
@@ -1208,6 +1282,8 @@ def control_session(
                 "phase": "Queue cleared",
                 "summary": "Queue is empty",
                 "overall_fraction": 0.0,
+                "scan_fraction": 0.0,
+                "encode_fraction": 0.0,
                 "eta_seconds": 0.0,
             })
             return
@@ -1225,6 +1301,10 @@ def control_session(
             ):
                 item["order"] = order
             data["summary"] = f"{len(data['items'])} item(s) remain"
+            overall, eta = _session_progress(data)
+            data["overall_fraction"] = overall
+            data["encode_fraction"] = overall
+            data["eta_seconds"] = eta
             return
         if action in {"move-up", "move-down"}:
             if len(requested_ids) != 1:
@@ -1309,5 +1389,10 @@ def control_session(
             ):
                 data["status"] = "queued"
                 data["phase"] = "Queue selection updated"
+        overall, progress_eta = _session_progress(data)
+        data["overall_fraction"] = overall
+        data["encode_fraction"] = overall
+        if action not in {"include", "exclude", "only"}:
+            data["eta_seconds"] = progress_eta
 
     return store.mutate(change)

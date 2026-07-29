@@ -22,19 +22,20 @@ from vidreclaim.queueing import (
     _normalize_interrupted,
     _processed_record,
     _save_processed_record,
+    _scan_progress_fraction,
     _source_signature,
     _what_if_estimates,
     control_session,
     create_session,
 )
-from vidreclaim.review import _render_html
+from vidreclaim.review import _render_html, build_review_assets
 from vidreclaim.runner import EncodeControl, _stream_command, output_path
 from vidreclaim.runner import (
     EncodeResult,
     delete_verified_dvd_source,
     delete_verified_file_source,
 )
-from vidreclaim.stitch import canvas_dimensions, natural_key
+from vidreclaim.stitch import StitchSettings, canvas_dimensions, natural_key, stitch
 from vidreclaim.space import SpaceNode, scan_space, write_space_json
 
 
@@ -201,6 +202,34 @@ class ReviewTests(unittest.TestCase):
         self.assertIn("before.jpg", page)
         self.assertIn("after.jpg", page)
 
+    def test_review_assets_can_target_selected_plan_indices(self) -> None:
+        first_candidate = Candidate(1920, 1080, 22)
+        second_candidate = Candidate(1920, 1080, 22)
+        plans = [
+            Plan(
+                media(Path("/media/first.mkv"), 1920, 1080),
+                "encode",
+                "test",
+                candidate=first_candidate,
+                candidates=[first_candidate],
+            ),
+            Plan(
+                media(Path("/media/second.mkv"), 1920, 1080),
+                "encode",
+                "test",
+                candidate=second_candidate,
+                candidates=[second_candidate],
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            cards = build_review_assets(
+                plans,
+                session_dir=Path(temporary),
+                sample_seconds=10,
+                plan_indices={1},
+            )
+        self.assertEqual([1], [card["plan_index"] for card in cards])
+
 
 class StitchTests(unittest.TestCase):
     def test_natural_order_places_clip_2_before_clip_10(self) -> None:
@@ -215,6 +244,36 @@ class StitchTests(unittest.TestCase):
         second = media(Path("/tmp/second.mp4"), 1920, 1080)
         self.assertEqual((1280, 720), canvas_dimensions([first, second], "first"))
         self.assertEqual((1920, 1080), canvas_dimensions([first, second], "largest"))
+
+    def test_mixed_dynamic_range_splits_into_named_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sdr_path = root / "clip-sdr.mp4"
+            hdr_path = root / "clip-hdr.mp4"
+            sdr_path.touch()
+            hdr_path.touch()
+            sdr = media(sdr_path, 1920, 1080)
+            hdr = media(hdr_path, 3840, 2160)
+            hdr.hdr = True
+            with (
+                mock.patch(
+                    "vidreclaim.stitch.probe_file",
+                    side_effect=[sdr, hdr],
+                ),
+                mock.patch(
+                    "vidreclaim.stitch._stitch_prepared",
+                    side_effect=lambda paths, media, output, **_: output,
+                ),
+            ):
+                outputs = stitch(
+                    [sdr_path, hdr_path],
+                    root / "combined.mkv",
+                    settings=StitchSettings(mixed_dynamic_range="split"),
+                )
+        self.assertEqual(
+            ["combined-sdr.mkv", "combined-hdr.mkv"],
+            [path.name for path in outputs],
+        )
 
 
 class SpaceMapTests(unittest.TestCase):
@@ -248,6 +307,19 @@ class SpaceMapTests(unittest.TestCase):
 
 
 class QueueTests(unittest.TestCase):
+    def test_scan_progress_tracks_metadata_and_analysis_stages(self) -> None:
+        data = {
+            "items": [
+                {"status": "probing", "progress": 0.0},
+                {"status": "analyzing", "progress": 0.5},
+                {"status": "ready", "progress": 0.0},
+            ],
+        }
+        self.assertAlmostEqual(
+            _scan_progress_fraction(data),
+            (0.0 + 0.75 + 1.0) / 3.0,
+        )
+
     def settings(self, root: Path) -> dict[str, object]:
         return {
             "profile": "balanced",

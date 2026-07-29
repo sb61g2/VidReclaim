@@ -18,12 +18,15 @@ pickers, clearly explained source-handling modes, a destructive-action
 confirmation for rolling deletion, live whole-job and current-file progress,
 speed and ETA, safe cancellation, and a persistent activity log. Its
 persistent queue can pause, resume, skip, cancel, and reorder individual
-videos. Sessions survive app restarts and reboots.
+videos. Separate bars report scan and analysis, total batch encoding, and the
+active file. Sessions survive app restarts and reboots.
 
 The app uses the same installed command-line engine described below. Disk-usage
 findings stay in the native interface and can feed selected files or folders
-directly into a queue. The optional side-by-side screenshot reviewer opens
-locally in the default browser.
+directly into a queue. Its unified picking flow first scans user-selected
+library locations, then lets the user independently choose which discovered
+contents to analyze and which smaller subset should receive side-by-side
+samples. The optional screenshot reviewer opens locally in the default browser.
 
 ## What it does
 
@@ -49,9 +52,12 @@ locally in the default browser.
   dominant feature; episodic discs keep the cluster of similarly long titles.
 - Verifies duration, stream counts, decodability, and the *actual* savings
   before an output is accepted.
-- Tracks per-item and whole-queue progress, speed, and a continuously corrected
-  ETA in an atomic session file.
+- Tracks scan and analysis, per-item encoding, and whole-queue encoding
+  separately, with speed and continuously corrected ETAs in an atomic session
+  file.
 - Can optionally open a local side-by-side review gallery before the full run.
+- Generates side-by-side samples only for the specifically checked files or
+  folders, so the rest of a large selection stays on the fast metadata path.
 - Persists queue order and item state. After a reboot, completed videos remain
   complete and the interrupted video restarts from its beginning; partially
   written MKV/HEVC output is not unsafely appended.
@@ -197,8 +203,12 @@ audio stream. The default canvas follows the first clip; choose `largest`,
 `1080p`, or `4k` with `--canvas`. Use `--encoder videotoolbox` for the fast M4
 hardware path.
 
-Mixed HDR and SDR clips are refused because joining them correctly requires an
-explicit tone-mapping choice.
+For mixed HDR and SDR inputs, the default creates separately named `-sdr` and
+`-hdr` outputs so each group keeps an appropriate dynamic range. Select
+`--mixed-dynamic-range sdr` to request one BT.709 SDR output using Hable
+tone-mapping. That unified path requires FFmpeg's `zscale` and `tonemap`
+filters; when they are unavailable, VidReclaim safely falls back to the two
+outputs instead of applying a misleading color conversion.
 
 ## Finding what uses the space
 
