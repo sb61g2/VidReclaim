@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -27,6 +28,7 @@ from vidreclaim.queueing import (
     _what_if_estimates,
     control_session,
     create_session,
+    run_session,
 )
 from vidreclaim.review import _render_html, build_review_assets
 from vidreclaim.runner import EncodeControl, _stream_command, output_path
@@ -43,6 +45,7 @@ from vidreclaim.stitch import (
     stitch,
 )
 from vidreclaim.space import SpaceNode, scan_space, write_space_json
+from vidreclaim.util import CommandError
 
 
 def dvd_title(index: int, minutes: float) -> DvdTitle:
@@ -415,6 +418,109 @@ class QueueTests(unittest.TestCase):
             items = sorted(store.read()["items"], key=lambda item: item["order"])
             self.assertEqual(["b", "a"], [item["id"] for item in items])
 
+    def test_starting_a_plan_reactivates_cancelled_selected_items(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_path = root / "movie.mp4"
+            source_path.write_bytes(b"source")
+            output = root / ".vidreclaim" / "output" / "movie.mkv"
+            output.parent.mkdir(parents=True)
+            output.write_bytes(b"encoded")
+            path = root / "session.json"
+            settings = self.settings(root)
+            settings["plan_only"] = True
+            create_session(path, root=root, settings=settings)
+            store = SessionStore(path)
+            source_media = media(source_path, 1920, 1080)
+            source_media.size_bytes = source_path.stat().st_size
+            candidate = Candidate(
+                width=1920,
+                height=1080,
+                crf=22,
+                projected_bytes=4,
+                projected_encode_seconds=10,
+                savings_pct=50,
+                accepted=True,
+                reason="ready",
+            )
+            plan = Plan(
+                source_media,
+                "encode",
+                "ready",
+                candidate=candidate,
+                output=output,
+            )
+
+            def add_cancelled_item(data: dict[str, object]) -> None:
+                data["status"] = "paused"
+                data["phase"] = "Plan ready"
+                data["items"] = [{
+                    "id": "movie",
+                    "order": 0,
+                    "name": "movie.mp4",
+                    "status": "cancelled",
+                    "selected": True,
+                    "processed": False,
+                    "requested_action": "cancel",
+                    "progress": 0.5,
+                    "duration": source_media.duration,
+                    "eta_seconds": 10.0,
+                    "encode_elapsed_seconds": 0.0,
+                    "plan": plan.to_dict(),
+                    "source_signature": None,
+                }]
+
+            store.mutate(add_cancelled_item)
+            encoded = EncodeResult(
+                plan=plan,
+                output=output,
+                output_bytes=output.stat().st_size,
+                actual_savings_pct=25.0,
+                verified=True,
+            )
+            with (
+                mock.patch("vidreclaim.queueing.encode", return_value=encoded),
+                mock.patch("vidreclaim.queueing._save_processed_record"),
+            ):
+                result = run_session(path, start_encoding=True)
+
+            session = store.read()
+            self.assertEqual(0, result)
+            self.assertEqual("complete", session["status"])
+            self.assertEqual("complete", session["items"][0]["status"])
+            self.assertFalse(session["settings"]["plan_only"])
+
+    def test_starting_with_no_runnable_items_does_not_enter_running_state(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "session.json"
+            settings = self.settings(root)
+            settings["plan_only"] = True
+            create_session(path, root=root, settings=settings)
+            store = SessionStore(path)
+
+            def add_skipped_item(data: dict[str, object]) -> None:
+                data["status"] = "paused"
+                data["items"] = [{
+                    "id": "skip",
+                    "order": 0,
+                    "status": "skipped",
+                    "selected": False,
+                    "duration": 1.0,
+                }]
+
+            store.mutate(add_skipped_item)
+            result = run_session(path, start_encoding=True)
+            session = store.read()
+            self.assertEqual(0, result)
+            self.assertEqual("complete", session["status"])
+            self.assertEqual(
+                "No selected items are ready to encode",
+                session["phase"],
+            )
+
     def test_folder_selection_only_mode_and_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -475,6 +581,28 @@ class QueueTests(unittest.TestCase):
             )
             control_session(path, action="clear-all")
             self.assertEqual([], store.read()["items"])
+
+    def test_running_queue_cannot_be_cleared(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "session.json"
+            create_session(path, root=root, settings=self.settings(root))
+            store = SessionStore(path)
+
+            def add_running_item(data: dict[str, object]) -> None:
+                data["status"] = "running"
+                data["worker_pid"] = os.getpid()
+                data["items"] = [{
+                    "id": "a",
+                    "order": 0,
+                    "status": "ready",
+                    "selected": True,
+                }]
+
+            store.mutate(add_running_item)
+            with self.assertRaises(CommandError):
+                control_session(path, action="clear-finished")
+            self.assertEqual(1, len(store.read()["items"]))
 
     def test_processed_catalog_requires_unchanged_media_and_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

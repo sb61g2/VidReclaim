@@ -1,23 +1,22 @@
 import AppKit
 import SwiftUI
 
-enum SidebarSection: String, CaseIterable, Identifiable {
-    case workspace = "Workspace"
-    case activity = "Activity"
-
-    var id: String { rawValue }
-
-    var icon: String {
-        switch self {
-        case .workspace: return "rectangle.3.group.bubble.left"
-        case .activity: return "list.bullet.rectangle"
-        }
-    }
+enum SidebarSection {
+    case workspace
+    case activity
 }
 
 enum WorkspaceOperation: String, CaseIterable, Identifiable {
     case reclaim = "Reclaim Space"
     case combine = "Combine Clips"
+
+    var id: String { rawValue }
+}
+
+enum AppDestination: String, CaseIterable, Identifiable {
+    case reclaim = "Reclaim"
+    case combine = "Combine"
+    case activity = "Activity"
 
     var id: String { rawValue }
 }
@@ -351,8 +350,23 @@ final class AppModel: ObservableObject {
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
-    var engineStatus: String {
-        cliPath == nil ? "Engine not found" : "Engine ready"
+    var destination: AppDestination {
+        get {
+            if selection == .activity { return .activity }
+            return workspaceOperation == .combine ? .combine : .reclaim
+        }
+        set {
+            switch newValue {
+            case .reclaim:
+                selection = .workspace
+                workspaceOperation = .reclaim
+            case .combine:
+                selection = .workspace
+                workspaceOperation = .combine
+            case .activity:
+                selection = .activity
+            }
+        }
     }
 
     func chooseCompressionSource() {
@@ -585,6 +599,19 @@ final class AppModel: ObservableObject {
 
     func resumeQueue() {
         guard let session = currentSessionURL else { return }
+        let runnable = queueSession?.items.contains {
+            $0.isIncluded
+                && ["ready", "paused", "cancelled", "error"].contains($0.status)
+                && $0.output != nil
+        } ?? false
+        let canContinuePreparation = queueSession.map {
+            ["new", "scanning", "analyzing", "reviewing"].contains($0.status)
+        } ?? false
+        guard runnable || canContinuePreparation else {
+            phase = "No selected items are ready to encode"
+            lastSummary = "0 items ready to encode"
+            return
+        }
         run(
             arguments: ["queue-resume", session.path],
             title: "Resuming \(queueSession?.name ?? "queue")",
@@ -609,12 +636,24 @@ final class AppModel: ObservableObject {
         }
         if let folder { arguments += ["--folder", folder] }
         control.arguments = arguments
-        control.standardOutput = FileHandle.nullDevice
-        control.standardError = FileHandle.nullDevice
-        control.terminationHandler = { [weak self] _ in
+        let pipe = Pipe()
+        control.standardOutput = pipe
+        control.standardError = pipe
+        control.terminationHandler = { [weak self] completed in
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let message = String(decoding: data, as: UTF8.self)
             DispatchQueue.main.async {
                 self?.loadQueueSession()
-                if action == "resume", self?.isRunning == false {
+                if completed.terminationStatus != 0 {
+                    self?.phase = "Queue command failed"
+                    self?.lastExitSuccessful = false
+                    if !message.isEmpty {
+                        self?.appendLog(message)
+                    }
+                }
+                if action == "resume",
+                   completed.terminationStatus == 0,
+                   self?.isRunning == false {
                     self?.resumeQueue()
                 }
             }
@@ -1791,6 +1830,14 @@ struct PreparedQueueView: View {
         }.count
     }
 
+    private var runnableCount: Int {
+        session.items.filter {
+            $0.isIncluded
+                && ["ready", "paused", "cancelled", "error"].contains($0.status)
+                && $0.output != nil
+        }.count
+    }
+
     var body: some View {
         GroupBox("Step 4 — Review and proceed") {
             VStack(alignment: .leading, spacing: 14) {
@@ -1818,12 +1865,6 @@ struct PreparedQueueView: View {
                             initiallyExpanded: index == 0
                         )
                     }
-                } else {
-                    Label(
-                        "Analysis is ready. No side-by-side checks were requested.",
-                        systemImage: "bolt.fill"
-                    )
-                    .foregroundStyle(.secondary)
                 }
 
                 HStack {
@@ -1834,12 +1875,12 @@ struct PreparedQueueView: View {
                     Button("Manage Detailed Queue") {
                         model.selection = .activity
                     }
-                    Button("Start Selected Encodes") {
+                    Button("Start \(runnableCount) Encode\(runnableCount == 1 ? "" : "s")") {
                         model.resumeQueue()
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(
-                        includedCount == 0
+                        runnableCount == 0
                         || model.isRunning
                         || !["paused", "queued"].contains(session.status)
                     )
@@ -3013,14 +3054,9 @@ struct ActivityView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
-                SectionHeading(
-                    title: "Queue",
-                    subtitle: "Monitor and manage scans and encodes."
-                )
+                Text("Queue").font(.largeTitle.bold())
                 Spacer()
                 Button("Open Saved Queue…") { model.openQueueSession() }
-                Label(model.engineStatus, systemImage: model.cliPath == nil ? "xmark.circle" : "checkmark.circle")
-                    .foregroundStyle(model.cliPath == nil ? Color.red : Color.green)
             }
 
             if let session = model.queueSession {
@@ -3139,8 +3175,23 @@ struct ActivityView: View {
                                 Label("Cancel All", systemImage: "xmark")
                             }
                             if !model.isRunning
-                                && !["complete", "attention", "running"].contains(session.status) {
-                                Button("Resume Session") { model.resumeQueue() }
+                                && !["complete", "attention", "running"].contains(session.status)
+                                && (
+                                    ["new", "scanning", "analyzing", "reviewing"]
+                                        .contains(session.status)
+                                    || includedItems.contains(where: {
+                                        ["ready", "paused", "cancelled", "error"]
+                                            .contains($0.status)
+                                            && $0.output != nil
+                                    })
+                                ) {
+                                Button(
+                                    ["new", "scanning", "analyzing", "reviewing"]
+                                        .contains(session.status)
+                                        ? "Resume Analysis" : "Resume Queue"
+                                ) {
+                                    model.resumeQueue()
+                                }
                                     .buttonStyle(.borderedProminent)
                             }
                         }
@@ -3544,39 +3595,11 @@ struct WorkspaceView: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("Task")
-                    .font(.headline)
-                Picker(
-                    "Workspace operation",
-                    selection: $model.workspaceOperation
-                ) {
-                    ForEach(WorkspaceOperation.allCases) { operation in
-                        Text(operation.rawValue).tag(operation)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                .frame(maxWidth: 360)
-                Spacer()
-                if model.queueSession != nil {
-                    Button("Manage Queue") {
-                        model.selection = .activity
-                    }
-                }
-            }
-            .padding(.horizontal, 28)
-            .padding(.vertical, 12)
-            .background(.bar)
-            Divider()
-
-            switch model.workspaceOperation {
-            case .reclaim:
-                CompressView(model: model)
-            case .combine:
-                StitchView(model: model)
-            }
+        switch model.workspaceOperation {
+        case .reclaim:
+            CompressView(model: model)
+        case .combine:
+            StitchView(model: model)
         }
     }
 }
@@ -3585,21 +3608,29 @@ struct ContentView: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        NavigationSplitView {
-            List(SidebarSection.allCases, selection: $model.selection) { section in
-                Label(section.rawValue, systemImage: section.icon).tag(section)
-            }
-            .navigationTitle("VidReclaim")
-            .safeAreaInset(edge: .bottom) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Label(model.engineStatus, systemImage: model.cliPath == nil ? "xmark.circle" : "checkmark.circle")
-                    Text("Runs locally on this Mac")
-                        .font(.caption).foregroundStyle(.secondary)
+        VStack(spacing: 0) {
+            HStack {
+                Picker(
+                    "View",
+                    selection: Binding(
+                        get: { model.destination },
+                        set: { model.destination = $0 }
+                    )
+                ) {
+                    ForEach(AppDestination.allCases) { destination in
+                        Text(destination.rawValue).tag(destination)
+                    }
                 }
-                .padding(12)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .frame(width: 300)
+                Spacer()
             }
-        } detail: {
+            .padding(.horizontal, 20)
+            .padding(.vertical, 10)
+            .background(.bar)
+            Divider()
+
             VStack(spacing: 0) {
                 Group {
                     switch model.selection {

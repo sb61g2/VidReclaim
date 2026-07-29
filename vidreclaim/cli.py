@@ -428,7 +428,10 @@ def command_queue_start(args: argparse.Namespace) -> int:
             settings=_queue_settings(args, root),
         )
         print(f"Queue session: {session}", flush=True)
-        return run_session(session)
+        return run_session(
+            session,
+            start_encoding=not args.plan_only,
+        )
     except (CommandError, OSError) as error:
         print(f"Queue ERROR: {error}", file=sys.stderr)
         return 1
@@ -437,7 +440,7 @@ def command_queue_start(args: argparse.Namespace) -> int:
 def command_queue_resume(args: argparse.Namespace) -> int:
     try:
         print(f"Queue session: {args.session.expanduser().resolve()}", flush=True)
-        return run_session(args.session)
+        return run_session(args.session, start_encoding=True)
     except (CommandError, OSError) as error:
         print(f"Queue resume ERROR: {error}", file=sys.stderr)
         return 1

@@ -1,6 +1,6 @@
 # vidreclaim
 
-`vidreclaim` is a cautious, sample-driven batch transcoder for a Mac video
+`vidreclaim` is a sample-driven batch transcoder for a Mac video
 archive. It recursively finds video files and `VIDEO_TS` folders, chooses an
 adaptive HEVC plan, and schedules a full encode only when the estimated reclaim
 clears both percentage and absolute storage-savings gates. The default fast
@@ -14,12 +14,11 @@ preservation.
 
 The self-contained installer adds `/Applications/VidReclaim.app`, a native
 SwiftUI workspace. Library scanning, storage prioritization, hierarchical
-selection, encode settings, analysis, side-by-side review, and the decision to
-start encoding form one guided flow. Combining clips is available from the
-same workspace, while Activity holds advanced queue controls and saved jobs.
-The app provides clearly explained source-handling modes, a destructive-action
+selection, encode settings, analysis, side-by-side review, and starting the
+queue use one flow. A top switch opens Reclaim, Combine, or Activity without a
+sidebar. The app provides source-handling modes, a destructive-action
 confirmation for rolling deletion, live scan, batch, and current-file
-progress, speed and ETA, safe cancellation, and a persistent activity log.
+progress, speed and ETA, cancellation, and a persistent activity log.
 Sessions survive app restarts and reboots.
 
 The app uses the same installed command-line engine described below. Disk-usage
@@ -172,6 +171,10 @@ place while the computer remains on. After a reboot, the session, completed
 items, decisions, inclusion flags, and order are restored; only an interrupted
 current encode starts over because appending to a partial MKV is not safely
 supported. A saved queue can be reopened without scanning its source tree.
+Starting a prepared queue reactivates its selected paused, cancelled, and
+failed items. A plan with no qualifying files reports that result instead of
+entering an empty encode cycle. Queue items cannot be cleared while a worker
+is active.
 
 ## x265 versus the M4 hardware encoder
 

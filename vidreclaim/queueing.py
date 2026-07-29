@@ -932,10 +932,18 @@ def _normalize_interrupted(store: SessionStore) -> None:
     store.mutate(change)
 
 
-def run_session(path: Path) -> int:
+def run_session(
+    path: Path,
+    *,
+    start_encoding: bool | None = None,
+) -> int:
     store = SessionStore(path)
     _normalize_interrupted(store)
     session = store.read()
+    if start_encoding is None:
+        start_encoding = not bool(
+            session.get("settings", {}).get("plan_only", False)
+        )
     existing_pid = session.get("worker_pid")
     if (
         existing_pid
@@ -947,26 +955,84 @@ def run_session(path: Path) -> int:
             flush=True,
         )
         return 0
-    prepared_now = False
     if session["status"] in {"new", "scanning", "analyzing"} or not session["items"]:
         _prepare_session(store)
-        prepared_now = True
     session = store.read()
     settings = session["settings"]
-    if prepared_now and settings.get("plan_only", False):
+    if settings.get("plan_only", False) and not start_encoding:
         def planned(data: dict[str, Any]) -> None:
+            ready_count = sum(
+                item["status"] == "ready" and item.get("selected", True)
+                for item in data["items"]
+            )
             data.update({
-                "status": "paused",
-                "phase": "Plan ready; start when convenient",
-                "worker_pid": None,
-                "summary": (
-                    f"{sum(item['status'] == 'ready' and item.get('selected', True) for item in data['items'])} "
-                    "item(s) ready to encode"
+                "status": "paused" if ready_count else "complete",
+                "phase": (
+                    "Plan ready"
+                    if ready_count
+                    else "No files met the encode thresholds"
                 ),
+                "worker_pid": None,
+                "summary": f"{ready_count} item(s) ready to encode",
             })
 
         store.mutate(planned)
         return 0
+
+    if start_encoding:
+        def activate_selected(data: dict[str, Any]) -> None:
+            data["settings"]["plan_only"] = False
+            for item in data["items"]:
+                if (
+                    item.get("selected", True)
+                    and item["status"] in {"paused", "cancelled", "error"}
+                    and item.get("plan")
+                ):
+                    plan_data = item["plan"]
+                    if item["status"] == "error" and plan_data.get("output"):
+                        output = Path(plan_data["output"])
+                        output.with_name(
+                            f".{output.stem}.part.mkv"
+                        ).unlink(missing_ok=True)
+                    item.update({
+                        "status": "ready",
+                        "requested_action": None,
+                        "progress": 0.0,
+                        "speed_x": None,
+                        "message": "Ready to encode",
+                    })
+
+        store.mutate(activate_selected)
+
+    session = store.read()
+    runnable_count = sum(
+        item["status"] in RUNNABLE_ITEM_STATES
+        and item.get("selected", True)
+        and item.get("plan") is not None
+        for item in session["items"]
+    )
+    if runnable_count == 0:
+        def nothing_to_start(data: dict[str, Any]) -> None:
+            remaining = sum(
+                item.get("selected", True)
+                and item["status"] not in TERMINAL_ITEM_STATES
+                for item in data["items"]
+            )
+            data.update({
+                "status": "paused" if remaining else "complete",
+                "phase": "No selected items are ready to encode",
+                "worker_pid": None,
+                "summary": "0 items ready to encode",
+            })
+
+        store.mutate(nothing_to_start)
+        print("Queue: no selected items are ready to encode", flush=True)
+        return 0
+
+    print(
+        f"Queue: starting {runnable_count} selected encode(s)",
+        flush=True,
+    )
     root = Path(session["root"])
     output_root = Path(settings["output_dir"])
     profile = PROFILES[settings["profile"]]
@@ -1268,6 +1334,21 @@ def control_session(
 
     def change(data: dict[str, Any]) -> None:
         items = data["items"]
+        if action in {
+            "clear-all",
+            "clear-completed",
+            "clear-cancelled",
+            "clear-finished",
+        } and (
+            _pid_is_alive(data.get("worker_pid"))
+            or any(
+                item["status"] in {"encoding", "verifying"}
+                for item in items
+            )
+        ):
+            raise CommandError(
+                "Cancel the running queue before clearing items",
+            )
         requested_ids = set(item_ids or [])
         if item_id:
             requested_ids.add(item_id)
@@ -1302,13 +1383,6 @@ def control_session(
                 f"Queue item not found: {sorted(missing)[0]}",
             )
         if action == "clear-all":
-            if _pid_is_alive(data.get("worker_pid")) or any(
-                item["status"] in {"encoding", "verifying"}
-                for item in items
-            ):
-                raise CommandError(
-                    "Cancel the running queue before clearing it",
-                )
             data["items"] = []
             data.update({
                 "status": "empty",
