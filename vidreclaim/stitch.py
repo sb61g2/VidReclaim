@@ -106,6 +106,10 @@ def canvas_dimensions(media: list[MediaInfo], canvas: Canvas) -> tuple[int, int]
     return max(2, chosen.width // 2 * 2), max(2, chosen.height // 2 * 2)
 
 
+def partial_output_path(output: Path) -> Path:
+    return output.with_name(f".{output.stem}.part{output.suffix}")
+
+
 def estimate_stitch(
     media: list[MediaInfo],
     settings: StitchSettings,
@@ -329,6 +333,9 @@ def _stitch_prepared(
 ) -> Path:
     if output.exists():
         raise CommandError(f"Refusing to overwrite existing output: {output}")
+    temporary = partial_output_path(output)
+    if temporary.exists():
+        raise CommandError(f"Stale partial stitch exists: {temporary}")
     width, height = canvas_dimensions(media, settings.canvas)
     fps = min(60.0, max(1.0, media[0].fps))
     ten_bit = (
@@ -338,9 +345,6 @@ def _stitch_prepared(
     pixel_format = "yuv420p10le" if ten_bit else "yuv420p"
     total_duration = sum(item.duration for item in media)
     output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(f".{output.stem}.part{output.suffix}")
-    if temporary.exists():
-        raise CommandError(f"Stale partial stitch exists: {temporary}")
 
     with tempfile.TemporaryDirectory(prefix="vidreclaim-stitch-") as temp:
         metadata = Path(temp) / "chapters.ffmetadata"
@@ -424,6 +428,9 @@ def stitch(
         output = output.with_suffix(".mkv")
     if output.suffix.lower() not in {".mkv", ".mp4", ".m4v", ".mov"}:
         raise CommandError("Stitch output must be MKV, MP4, M4V, or MOV")
+    temporary = partial_output_path(output)
+    if temporary.exists():
+        raise CommandError(f"Stale partial stitch exists: {temporary}")
     print("Combine preflight: expanding selected files and folders…", flush=True)
     paths = expand_inputs(inputs, output)
     print(

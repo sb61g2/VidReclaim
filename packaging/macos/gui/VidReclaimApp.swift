@@ -298,6 +298,7 @@ final class AppModel: ObservableObject {
     @Published var combineResult: CombineResult?
     @Published var combinePreflightProgress: Double?
     @Published var combineAttempted = false
+    @Published var combinePartialURL: URL?
     @Published private(set) var runningCombine = false
 
     @Published var spacePaths: [URL] = []
@@ -473,6 +474,15 @@ final class AppModel: ObservableObject {
         combineResult = nil
         combinePreflightProgress = nil
         combineAttempted = false
+        combinePartialURL = nil
+    }
+
+    private func combinePartialURL(for output: URL) -> URL {
+        let extensionPart = output.pathExtension.isEmpty
+            ? "" : ".\(output.pathExtension)"
+        return output.deletingLastPathComponent().appendingPathComponent(
+            ".\(output.deletingPathExtension().lastPathComponent).part\(extensionPart)"
+        )
     }
 
     private func availableSuggestedStitchOutput() -> URL? {
@@ -775,6 +785,16 @@ final class AppModel: ObservableObject {
         combineResult = nil
         combinePreflightProgress = 0
         combineAttempted = true
+        combinePartialURL = nil
+        let partial = combinePartialURL(for: output)
+        if FileManager.default.fileExists(atPath: partial.path) {
+            combinePartialURL = partial
+            phase = "Incomplete output found"
+            jobName = partial.lastPathComponent
+            lastSummary = "Move the incomplete output to Trash before retrying."
+            lastExitSuccessful = false
+            return
+        }
         let arguments = [
             "stitch", output.path,
         ] + stitchInputs.map(\.path) + [
@@ -790,6 +810,32 @@ final class AppModel: ObservableObject {
             title: "Preparing clips",
             section: .workspace
         )
+    }
+
+    func revealCombinePartial() {
+        guard let combinePartialURL else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([combinePartialURL])
+    }
+
+    func discardCombinePartialAndRetry() {
+        guard !isRunning, let partial = combinePartialURL else { return }
+        do {
+            var trashed: NSURL?
+            try FileManager.default.trashItem(
+                at: partial,
+                resultingItemURL: &trashed
+            )
+            combinePartialURL = nil
+            runStitch()
+        } catch {
+            phase = "Could not move partial output to Trash"
+            lastSummary = error.localizedDescription
+            lastExitSuccessful = false
+            appendLog(
+                "Could not move \(partial.path) to Trash: "
+                    + "\(error.localizedDescription)\n"
+            )
+        }
     }
 
     func runSpaceMap(section: SidebarSection = .workspace) {
@@ -1075,9 +1121,14 @@ final class AppModel: ObservableObject {
                 if self.runningQueue {
                     self.loadQueueSession()
                 } else {
-                    self.phase = succeeded ? "Complete" : (
-                        completed.terminationStatus == 130 ? "Cancelled" : "Needs attention"
-                    )
+                    if succeeded {
+                        self.phase = "Complete"
+                    } else if self.combinePartialURL != nil {
+                        self.phase = "Incomplete output found"
+                    } else {
+                        self.phase = completed.terminationStatus == 130
+                            ? "Cancelled" : "Needs attention"
+                    }
                     if succeeded {
                         self.overallProgress = 1
                         self.jobProgress = 1
@@ -1128,6 +1179,18 @@ final class AppModel: ObservableObject {
     }
 
     private func handleLine(_ line: String) {
+        let stalePartialPrefix = "Stitch ERROR: Stale partial stitch exists: "
+        if line.hasPrefix(stalePartialPrefix) {
+            let path = String(line.dropFirst(stalePartialPrefix.count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            combinePartialURL = URL(fileURLWithPath: path)
+            combineAttempted = true
+            phase = "Incomplete output found"
+            jobName = URL(fileURLWithPath: path).lastPathComponent
+            lastSummary = "Move the incomplete output to Trash before retrying."
+            lastExitSuccessful = false
+            return
+        }
         if line.hasPrefix("Combine preflight:") {
             phase = "Preparing clips"
             jobName = String(line.dropFirst("Combine preflight:".count))
@@ -1972,11 +2035,30 @@ struct CompressView: View {
                             }
                         }
                         GridRow {
-                            Text("Keep Mac responsive")
-                            Stepper(
-                                "Niceness \(model.nice) \(model.nice == 0 ? "(full speed)" : "")",
-                                value: $model.nice, in: 0...20
-                            )
+                            Text("Performance")
+                            HStack(spacing: 10) {
+                                VStack(spacing: 2) {
+                                    Slider(
+                                        value: Binding(
+                                            get: { Double(model.nice) },
+                                            set: { model.nice = Int($0.rounded()) }
+                                        ),
+                                        in: 0...20,
+                                        step: 1
+                                    )
+                                    HStack {
+                                        Text("Encode faster")
+                                        Spacer()
+                                        Text("Mac smoother")
+                                    }
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                }
+                                Text(model.nice.formatted())
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 20, alignment: .trailing)
+                            }
                         }
                     }
                     .padding(.top, 6)
@@ -2175,6 +2257,15 @@ struct StitchView: View {
         return "\(model.bytesLabel(abs(difference))) (\(percent.formatted(.number.precision(.fractionLength(1))))%)"
     }
 
+    private var partialSize: Int64? {
+        guard let partial = model.combinePartialURL,
+              let attributes = try? FileManager.default.attributesOfItem(
+                atPath: partial.path
+              ),
+              let size = attributes[.size] as? NSNumber else { return nil }
+        return size.int64Value
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
@@ -2302,6 +2393,33 @@ struct StitchView: View {
                             } else {
                                 ProgressView(value: model.jobProgress)
                                     .progressViewStyle(.linear)
+                            }
+                        }
+
+                        if let partial = model.combinePartialURL {
+                            Divider()
+                            HStack(alignment: .center, spacing: 12) {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("An earlier combine left an incomplete file.")
+                                        .font(.callout)
+                                    Text(
+                                        partial.lastPathComponent
+                                            + (partialSize.map {
+                                                " · \(model.bytesLabel($0))"
+                                            } ?? "")
+                                    )
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                }
+                                Spacer()
+                                Button("Show in Finder") {
+                                    model.revealCombinePartial()
+                                }
+                                Button("Move to Trash and Retry", role: .destructive) {
+                                    model.discardCombinePartialAndRetry()
+                                }
+                                .buttonStyle(.borderedProminent)
                             }
                         }
 

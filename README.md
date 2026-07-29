@@ -221,6 +221,10 @@ source size, estimated output size and size change, and estimated encode time.
 Encode progress and ETA then update while the job runs. The verified output
 size replaces the estimate when the job finishes.
 
+If a combine is interrupted, the app reports its partial output before scanning
+the inputs again. It can reveal that file in Finder or move it to Trash and
+retry. It never removes the partial without the user's action.
+
 For mixed HDR and SDR inputs, the default creates separately named `-sdr` and
 `-hdr` outputs so each group keeps an appropriate dynamic range. Select
 `--mixed-dynamic-range sdr` to request one BT.709 SDR output using Hable

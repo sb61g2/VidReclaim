@@ -42,6 +42,7 @@ from vidreclaim.stitch import (
     canvas_dimensions,
     estimate_stitch,
     natural_key,
+    partial_output_path,
     stitch,
 )
 from vidreclaim.space import SpaceNode, scan_space, write_space_json
@@ -298,6 +299,24 @@ class StitchTests(unittest.TestCase):
         self.assertGreater(estimate.projected_output_bytes, 0)
         self.assertGreater(estimate.projected_encode_seconds, 0)
         self.assertEqual((1920, 1080), (estimate.width, estimate.height))
+
+    def test_stale_partial_is_reported_before_scanning_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "combined.mkv"
+            partial = partial_output_path(output)
+            partial.write_bytes(b"incomplete")
+            with mock.patch("vidreclaim.stitch.expand_inputs") as expand:
+                with self.assertRaisesRegex(
+                    CommandError,
+                    "Stale partial stitch exists",
+                ):
+                    stitch(
+                        [root],
+                        output,
+                        settings=StitchSettings(),
+                    )
+            expand.assert_not_called()
 
     def test_mixed_dynamic_range_splits_into_named_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
