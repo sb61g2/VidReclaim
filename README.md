@@ -1,10 +1,11 @@
 # vidreclaim
 
 `vidreclaim` is a cautious, sample-driven batch transcoder for a Mac video
-archive. It recursively finds video files and `VIDEO_TS` folders, tries short
-HEVC encodes from several points in each title, and schedules a full encode
-only when the trial clears both a visual-fidelity gate and a storage-savings
-gate.
+archive. It recursively finds video files and `VIDEO_TS` folders, chooses an
+adaptive HEVC plan, and schedules a full encode only when the estimated reclaim
+clears both percentage and absolute storage-savings gates. The default fast
+path uses stream metadata; optional thorough analysis adds short trial encodes,
+XPSNR measurements, and side-by-side review images.
 
 It is intended for personal, casual-viewing libraries—not masters or archival
 preservation.
@@ -15,9 +16,9 @@ The self-contained installer adds `/Applications/VidReclaim.app`, a native
 SwiftUI control center for the full toolkit. It provides Mac file and save
 pickers, clearly explained source-handling modes, a destructive-action
 confirmation for rolling deletion, live whole-job and current-file progress,
-speed and ETA, safe cancellation, and a persistent activity log. Its four
-sections cover compression, ordered clip stitching, disk-usage mapping, and
-job activity.
+speed and ETA, safe cancellation, and a persistent activity log. Its
+Transmission-inspired queue can pause, resume, skip, cancel, and reorder
+individual videos. Sessions survive app restarts and reboots.
 
 The app uses the same installed command-line engine described below. The
 side-by-side screenshot reviewer and interactive treemap open locally in the
@@ -27,8 +28,11 @@ default browser, where their draggable and drill-down interfaces work best.
 
 - Recursively scans common video formats without treating the VOB pieces in a
   `VIDEO_TS` folder as independent videos.
-- Samples the beginning, middle, and end-ish portions of every title.
-- Measures the decoded trial against the exact source frames with FFmpeg's
+- Probes unchanged regular files in parallel and caches the results, while
+  rejecting files smaller than the absolute reclaim threshold before probing.
+- Uses a fast metadata-driven quality and resolution decision by default.
+- Can optionally sample the beginning, middle, and end-ish portions of each
+  title and measure decoded trials against exact source frames with FFmpeg's
   XPSNR filter and loopback decoder.
 - Tests native resolution and, for UHD sources, a 1080-class candidate. A
   genuinely sharp 4K source stays 4K when the scaled trial loses visible
@@ -44,9 +48,12 @@ default browser, where their draggable and drill-down interfaces work best.
   dominant feature; episodic discs keep the cluster of similarly long titles.
 - Verifies duration, stream counts, decodability, and the *actual* savings
   before an output is accepted.
-- Tracks per-job and whole-batch progress, speed, and ETA in the terminal and
-  in `.vidreclaim/progress.json`.
-- Can open a local side-by-side review gallery before the full run.
+- Tracks per-item and whole-queue progress, speed, and a continuously corrected
+  ETA in an atomic session file.
+- Can optionally open a local side-by-side review gallery before the full run.
+- Persists queue order and item state. After a reboot, completed videos remain
+  complete and the interrupted video restarts from its beginning; partially
+  written MKV/HEVC output is not unsafely appended.
 - Never touches a source by default.
 
 ## Install from source
@@ -85,25 +92,62 @@ notarization; this personal build deliberately does not claim either.
 
 ## Recommended first run
 
-Create a plan. This probes and makes short sample encodes, but does not run any
-full encode or modify a source:
+Create a fast metadata plan. This does not run any full encode or modify a
+source:
 
 ```bash
-python3 -m vidreclaim plan "/Volumes/Media"
+vidreclaim queue-start "/Volumes/Media" --plan-only
 ```
 
-Run the qualifying jobs with a before/after spot check:
+Start a persistent queue using the fast defaults:
 
 ```bash
-python3 -m vidreclaim run "/Volumes/Media" --review
+vidreclaim queue-start "/Volumes/Media"
+```
+
+Add `--thorough-analysis --review` when you specifically want trial encodes,
+XPSNR scoring, and the before/after gallery:
+
+```bash
+vidreclaim queue-start "/Volumes/Media" --thorough-analysis --review
 ```
 
 The browser UI is served only on `127.0.0.1`. Each proposed job has up to three
 draggable source/new comparisons and an Encode checkbox. Submitting the page
 continues only with the checked jobs.
 
-Outputs go under `ROOT/.vidreclaim/output/`. The plan, results, review decision,
-and live progress files live under `ROOT/.vidreclaim/`.
+Outputs go under `ROOT/.vidreclaim/output/`. Queue sessions live under
+`~/Library/Application Support/VidReclaim/Sessions/`; probe metadata is cached
+under `~/Library/Caches/VidReclaim/`.
+
+## Queue controls and reboot resumption
+
+The native Queue screen is the easiest way to manage work. The same controls
+are automation-friendly:
+
+```bash
+vidreclaim queue-control SESSION.json pause --item ITEM_ID
+vidreclaim queue-control SESSION.json resume --item ITEM_ID
+vidreclaim queue-control SESSION.json skip --item ITEM_ID
+vidreclaim queue-control SESSION.json cancel --item ITEM_ID
+vidreclaim queue-control SESSION.json move-up --item ITEM_ID
+vidreclaim queue-resume SESSION.json
+```
+
+Pause/resume uses macOS process suspension, so the encoder keeps its exact
+place while the computer remains on. After a reboot, the session, completed
+items, decisions, and order are restored; only an interrupted current encode
+starts over because appending to a partial MKV is not safely supported.
+
+## x265 versus the M4 hardware encoder
+
+In plain English, VideoToolbox usually finishes about **4–8 times sooner** than
+x265 Medium on an M4, but often needs **15–35% more space** for roughly similar
+casual-viewing quality. x265 is the patient, storage-efficient choice;
+VideoToolbox is the “finish tonight” choice. These are useful starting ranges,
+not promises: source complexity, resolution, grain, and x265 preset matter.
+VidReclaim replaces the initial estimate with measured speed as each real
+encode progresses.
 
 ## Stitching clips
 

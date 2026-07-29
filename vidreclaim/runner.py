@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import selectors
 import signal
 import shutil
 import subprocess
@@ -19,6 +20,13 @@ from .util import CommandError, run
 
 
 ProgressCallback = Callable[[float, float | None], None]
+ControlCallback = Callable[[], str]
+
+
+class EncodeControl(CommandError):
+    def __init__(self, action: str) -> None:
+        self.action = action
+        super().__init__(f"encode {action} by user")
 
 
 def _stream_command(
@@ -26,6 +34,7 @@ def _stream_command(
     *,
     nice: int,
     on_line: Callable[[str], None],
+    control: ControlCallback | None = None,
 ) -> None:
     command = list(args)
     if nice and os.uname().sysname == "Darwin":
@@ -36,21 +45,52 @@ def _stream_command(
         bufsize=1, start_new_session=True,
     )
     assert process.stdout is not None
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    stopped = False
+
+    def end_process(sig: signal.Signals) -> None:
+        try:
+            if stopped:
+                os.killpg(process.pid, signal.SIGCONT)
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            return
+
     try:
-        for line in process.stdout:
-            tail.append(line.rstrip())
-            on_line(line)
+        while process.poll() is None:
+            action = control() if control else "run"
+            if action in {"cancel", "skip"}:
+                end_process(signal.SIGTERM)
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    end_process(signal.SIGKILL)
+                    process.wait()
+                raise EncodeControl(action)
+            if action == "pause" and not stopped:
+                os.killpg(process.pid, signal.SIGSTOP)
+                stopped = True
+            elif action != "pause" and stopped:
+                os.killpg(process.pid, signal.SIGCONT)
+                stopped = False
+
+            for key, _ in selector.select(timeout=0.35):
+                line = key.fileobj.readline()
+                if line:
+                    tail.append(line.rstrip())
+                    on_line(line)
         return_code = process.wait()
     except BaseException:
         # The GUI interrupts the Python coordinator. Propagate that interrupt
         # to the isolated encoder process group so ffmpeg/HandBrake cannot be
         # orphaned in the background.
         try:
-            os.killpg(process.pid, signal.SIGINT)
+            end_process(signal.SIGINT)
             process.wait(timeout=3)
         except (ProcessLookupError, subprocess.TimeoutExpired):
             try:
-                os.killpg(process.pid, signal.SIGTERM)
+                end_process(signal.SIGTERM)
             except ProcessLookupError:
                 pass
             try:
@@ -62,6 +102,9 @@ def _stream_command(
                     pass
                 process.wait()
         raise
+    finally:
+        selector.close()
+        process.stdout.close()
     if return_code:
         raise CommandError(
             f"{command[0]} failed ({return_code}):\n" + "\n".join(tail)
@@ -107,6 +150,7 @@ def _encode_file(
     profile: Profile,
     nice: int,
     progress: ProgressCallback | None,
+    control: ControlCallback | None,
 ) -> None:
     assert plan.candidate is not None
     media = plan.media
@@ -137,7 +181,7 @@ def _encode_file(
                 return
             progress(seconds / max(plan.media.duration, 0.001), latest_speed)
 
-    _stream_command(args, nice=nice, on_line=parse_line)
+    _stream_command(args, nice=nice, on_line=parse_line, control=control)
 
 
 def _encode_dvd(
@@ -148,6 +192,7 @@ def _encode_dvd(
     profile: Profile,
     nice: int,
     progress: ProgressCallback | None,
+    control: ControlCallback | None,
 ) -> None:
     media = plan.media
     encoder = "x265_10bit" if media.bit_depth > 8 or media.hdr else "x265"
@@ -192,7 +237,7 @@ def _encode_dvd(
         except (json.JSONDecodeError, TypeError, ValueError):
             return
 
-    _stream_command(args, nice=nice, on_line=parse_line)
+    _stream_command(args, nice=nice, on_line=parse_line, control=control)
 
 
 def verify_output(plan: Plan, output: Path, *, deep: bool = False) -> None:
@@ -245,6 +290,7 @@ def encode(
     deep_verify: bool = False,
     min_savings_pct: float | None = None,
     progress: ProgressCallback | None = None,
+    control: ControlCallback | None = None,
 ) -> EncodeResult:
     if plan.status != "encode" or plan.candidate is None:
         raise ValueError("Only an encode plan can be run")
@@ -260,12 +306,13 @@ def encode(
         if plan.media.source.kind == "dvd":
             _encode_dvd(
                 plan, temporary, preset=preset, profile=profile, nice=nice,
-                progress=progress,
+                progress=progress, control=control,
             )
         else:
             _encode_file(
                 plan, temporary, encoder=encoder, preset=preset,
                 profile=profile, nice=nice, progress=progress,
+                control=control,
             )
         if progress:
             progress(1.0, None)
@@ -278,6 +325,9 @@ def encode(
                 f"actual savings {savings:.1f}% did not meet {required:.1f}% threshold"
             )
         temporary.replace(destination)
+    except EncodeControl:
+        temporary.unlink(missing_ok=True)
+        raise
     except BaseException:
         # Keep the partial file for diagnosis; it is never mistaken for a
         # completed result and a later run will call attention to it.

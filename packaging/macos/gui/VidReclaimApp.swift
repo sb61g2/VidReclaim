@@ -5,7 +5,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     case compress = "Compress"
     case stitch = "Stitch"
     case space = "Space Map"
-    case activity = "Activity"
+    case activity = "Queue"
 
     var id: String { rawValue }
 
@@ -14,8 +14,62 @@ enum SidebarSection: String, CaseIterable, Identifiable {
         case .compress: return "film.stack"
         case .stitch: return "rectangle.3.group"
         case .space: return "square.3.layers.3d"
-        case .activity: return "waveform.path.ecg"
+        case .activity: return "list.bullet.rectangle"
         }
+    }
+}
+
+struct QueueItem: Codable, Identifiable {
+    let id: String
+    let order: Int
+    let name: String
+    let path: String
+    let status: String
+    let progress: Double
+    let speedX: Double?
+    let etaSeconds: Double?
+    let duration: Double?
+    let sourceBytes: Int64?
+    let projectedBytes: Int64?
+    let projectedSavingsPct: Double?
+    let output: String?
+    let message: String
+
+    enum CodingKeys: String, CodingKey {
+        case id, order, name, path, status, progress, duration, output, message
+        case speedX = "speed_x"
+        case etaSeconds = "eta_seconds"
+        case sourceBytes = "source_bytes"
+        case projectedBytes = "projected_bytes"
+        case projectedSavingsPct = "projected_savings_pct"
+    }
+
+    var isActive: Bool {
+        ["encoding", "verifying", "paused"].contains(status)
+    }
+
+    var isTerminal: Bool {
+        ["complete", "skipped", "cancelled", "error"].contains(status)
+    }
+}
+
+struct QueueSession: Codable {
+    let id: String
+    let name: String
+    let root: String
+    let sessionPath: String
+    let status: String
+    let phase: String
+    let items: [QueueItem]
+    let overallFraction: Double
+    let etaSeconds: Double?
+    let summary: String
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, root, status, phase, items, summary
+        case sessionPath = "session_path"
+        case overallFraction = "overall_fraction"
+        case etaSeconds = "eta_seconds"
     }
 }
 
@@ -62,9 +116,13 @@ final class AppModel: ObservableObject {
     @Published var sampleSeconds = 10.0
     @Published var nice = 10
     @Published var preserveDVDExtras = false
-    @Published var visualReview = true
+    @Published var visualReview = false
+    @Published var thoroughAnalysis = false
     @Published var deepVerify = false
     @Published var sourcePolicy: SourcePolicy = .keep
+    @Published var queueSession: QueueSession?
+    @Published var currentSessionURL: URL?
+    @Published var selectedQueueItemID: String?
 
     @Published var stitchInputs: [URL] = []
     @Published var stitchOutput: URL?
@@ -81,7 +139,10 @@ final class AppModel: ObservableObject {
     private var outputPipe: Pipe?
     private var pendingOutput = ""
     private var jobTitle = ""
+    private var runningQueue = false
     private let logURL: URL
+    private let sessionsURL: URL
+    private var queueTimer: Timer?
 
     init() {
         let base = FileManager.default.urls(
@@ -90,8 +151,19 @@ final class AppModel: ObservableObject {
         logURL = base
             .appendingPathComponent("Logs", isDirectory: true)
             .appendingPathComponent("VidReclaim.log")
+        let support = FileManager.default.urls(
+            for: .applicationSupportDirectory, in: .userDomainMask
+        ).first ?? base.appendingPathComponent("Application Support", isDirectory: true)
+        sessionsURL = support
+            .appendingPathComponent("VidReclaim", isDirectory: true)
+            .appendingPathComponent("Sessions", isDirectory: true)
         if let existing = try? String(contentsOf: logURL, encoding: .utf8) {
             log = String(existing.suffix(120_000))
+        }
+        loadLatestQueueSession()
+        queueTimer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: true) {
+            [weak self] _ in
+            Task { @MainActor in self?.loadQueueSession() }
         }
     }
 
@@ -165,16 +237,17 @@ final class AppModel: ObservableObject {
 
     func runPlan() {
         guard let root = compressionSource else { return }
-        run(
-            arguments: ["plan", root.path] + analysisArguments(),
-            title: "Planning \(root.lastPathComponent)",
-            section: .compress
+        try? FileManager.default.createDirectory(
+            at: sessionsURL, withIntermediateDirectories: true
         )
-    }
-
-    func runCompression() {
-        guard let root = compressionSource else { return }
-        var arguments = ["run", root.path] + analysisArguments()
+        let session = sessionsURL.appendingPathComponent(
+            "\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString.prefix(8)).json"
+        )
+        currentSessionURL = session
+        UserDefaults.standard.set(session.path, forKey: "VidReclaimCurrentSession")
+        var arguments = [
+            "queue-start", root.path, "--session", session.path, "--plan-only",
+        ] + analysisArguments()
         if visualReview { arguments.append("--review") }
         if deepVerify { arguments.append("--deep-verify") }
         switch sourcePolicy {
@@ -187,8 +260,38 @@ final class AppModel: ObservableObject {
         }
         run(
             arguments: arguments,
-            title: "Compressing \(root.lastPathComponent)",
-            section: .compress
+            title: "Planning \(root.lastPathComponent)",
+            section: .activity
+        )
+    }
+
+    func runCompression() {
+        guard let root = compressionSource else { return }
+        try? FileManager.default.createDirectory(
+            at: sessionsURL, withIntermediateDirectories: true
+        )
+        let session = sessionsURL.appendingPathComponent(
+            "\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString.prefix(8)).json"
+        )
+        currentSessionURL = session
+        UserDefaults.standard.set(session.path, forKey: "VidReclaimCurrentSession")
+        var arguments = [
+            "queue-start", root.path, "--session", session.path,
+        ] + analysisArguments()
+        if visualReview { arguments.append("--review") }
+        if deepVerify { arguments.append("--deep-verify") }
+        switch sourcePolicy {
+        case .keep:
+            break
+        case .archive:
+            arguments.append("--replace")
+        case .delete:
+            arguments += ["--delete-source-as-you-go", "--yes"]
+        }
+        run(
+            arguments: arguments,
+            title: "Queueing \(root.lastPathComponent)",
+            section: .activity
         )
     }
 
@@ -204,7 +307,118 @@ final class AppModel: ObservableObject {
             "--nice", String(nice),
         ]
         if preserveDVDExtras { arguments.append("--keep-dvd-extras") }
+        if thoroughAnalysis || visualReview {
+            arguments.append("--thorough-analysis")
+        }
         return arguments
+    }
+
+    func resumeQueue() {
+        guard let session = currentSessionURL else { return }
+        run(
+            arguments: ["queue-resume", session.path],
+            title: "Resuming \(queueSession?.name ?? "queue")",
+            section: .activity
+        )
+    }
+
+    func queueControl(_ action: String, itemID: String? = nil) {
+        guard let executable = cliPath, let session = currentSessionURL else { return }
+        let control = Process()
+        control.executableURL = URL(fileURLWithPath: executable)
+        var arguments = ["queue-control", session.path, action]
+        if let itemID {
+            arguments += ["--item", itemID]
+        }
+        control.arguments = arguments
+        control.standardOutput = FileHandle.nullDevice
+        control.standardError = FileHandle.nullDevice
+        control.terminationHandler = { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.loadQueueSession()
+                if action == "resume", self?.isRunning == false {
+                    self?.resumeQueue()
+                }
+            }
+        }
+        do {
+            try control.run()
+        } catch {
+            appendLog("Could not send queue command: \(error.localizedDescription)\n")
+        }
+    }
+
+    func moveQueueItem(_ id: String, by offset: Int) {
+        queueControl(offset < 0 ? "move-up" : "move-down", itemID: id)
+    }
+
+    private func loadLatestQueueSession() {
+        if let saved = UserDefaults.standard.string(forKey: "VidReclaimCurrentSession") {
+            let url = URL(fileURLWithPath: saved)
+            if FileManager.default.fileExists(atPath: url.path) {
+                currentSessionURL = url
+                loadQueueSession()
+                return
+            }
+        }
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: sessionsURL,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+        let latest = urls
+            .filter { $0.pathExtension == "json" }
+            .max {
+                let left = (try? $0.resourceValues(
+                    forKeys: [.contentModificationDateKey]
+                ).contentModificationDate) ?? .distantPast
+                let right = (try? $1.resourceValues(
+                    forKeys: [.contentModificationDateKey]
+                ).contentModificationDate) ?? .distantPast
+                return left < right
+            }
+        if let latest {
+            currentSessionURL = latest
+            UserDefaults.standard.set(latest.path, forKey: "VidReclaimCurrentSession")
+            loadQueueSession()
+        }
+    }
+
+    private func loadQueueSession() {
+        guard let url = currentSessionURL,
+              let data = try? Data(contentsOf: url),
+              let session = try? JSONDecoder().decode(QueueSession.self, from: data)
+        else { return }
+        queueSession = session
+        overallProgress = session.overallFraction
+        phase = session.phase
+        eta = durationLabel(session.etaSeconds)
+        if let active = session.items.first(where: { $0.isActive }) {
+            jobName = active.name
+            jobProgress = active.progress
+            speed = active.speedX.map { String(format: "%.2f×", $0) } ?? ""
+        } else {
+            jobName = session.summary
+            jobProgress = 0
+            speed = ""
+        }
+        lastSummary = session.summary
+    }
+
+    func durationLabel(_ seconds: Double?) -> String {
+        guard let seconds, seconds.isFinite else { return "—" }
+        let total = max(0, Int(seconds.rounded()))
+        return String(
+            format: "%d:%02d:%02d",
+            total / 3600, (total % 3600) / 60, total % 60
+        )
+    }
+
+    func bytesLabel(_ bytes: Int64?) -> String {
+        guard let bytes else { return "—" }
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: bytes)
     }
 
     func runStitch() {
@@ -245,6 +459,11 @@ final class AppModel: ObservableObject {
     }
 
     func cancel() {
+        if runningQueue, currentSessionURL != nil {
+            queueControl("cancel")
+            phase = "Cancelling queue"
+            return
+        }
         guard let process, process.isRunning else { return }
         appendLog("\nCancellation requested. Finishing the current safe interruption point…\n")
         phase = "Cancelling"
@@ -295,6 +514,7 @@ final class AppModel: ObservableObject {
         outputPipe = pipe
         pendingOutput = ""
         jobTitle = title
+        runningQueue = arguments.first?.hasPrefix("queue-") == true
         isRunning = true
         phase = title
         jobName = ""
@@ -326,21 +546,26 @@ final class AppModel: ObservableObject {
                 let succeeded = completed.terminationStatus == 0
                 self.lastExitSuccessful = succeeded
                 self.isRunning = false
-                self.phase = succeeded ? "Complete" : (
-                    completed.terminationStatus == 130 ? "Cancelled" : "Needs attention"
-                )
-                if succeeded {
-                    self.overallProgress = 1
-                    self.jobProgress = 1
-                    self.eta = "Done"
+                if self.runningQueue {
+                    self.loadQueueSession()
                 } else {
-                    self.eta = "—"
+                    self.phase = succeeded ? "Complete" : (
+                        completed.terminationStatus == 130 ? "Cancelled" : "Needs attention"
+                    )
+                    if succeeded {
+                        self.overallProgress = 1
+                        self.jobProgress = 1
+                        self.eta = "Done"
+                    } else {
+                        self.eta = "—"
+                    }
                 }
                 self.appendLog(
                     "\n\(succeeded ? "Completed successfully." : "Exited with status \(completed.terminationStatus).")\n"
                 )
                 self.process = nil
                 self.outputPipe = nil
+                self.runningQueue = false
             }
         }
 
@@ -350,6 +575,7 @@ final class AppModel: ObservableObject {
             pipe.fileHandleForReading.readabilityHandler = nil
             process = nil
             outputPipe = nil
+            runningQueue = false
             isRunning = false
             phase = "Could not start"
             lastExitSuccessful = false
@@ -598,10 +824,21 @@ struct CompressView: View {
                             Text("Encoder")
                             Picker("Encoder", selection: $model.compressionEncoder) {
                                 Text("Smaller files (x265)").tag("x265")
-                                Text("Faster on M4").tag("videotoolbox")
+                                Text("Faster on M4 (hardware)").tag("videotoolbox")
                             }
                             .labelsHidden()
                             .pickerStyle(.segmented)
+                        }
+                        GridRow {
+                            Color.clear.frame(width: 1, height: 1)
+                            Text(
+                                model.compressionEncoder == "videotoolbox"
+                                ? "Usually finishes about 4–8× sooner than x265 Medium on an M4, while often using 15–35% more space at similar casual-viewing quality."
+                                : "Usually takes about 4–8× longer than the M4 hardware encoder, but often produces files 15–35% smaller at similar casual-viewing quality."
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                         }
                         if model.compressionEncoder == "x265" {
                             GridRow {
@@ -648,12 +885,23 @@ struct CompressView: View {
                     .padding(.top, 6)
                 }
 
-                GroupBox("Review and disc handling") {
+                GroupBox("Fast scan, optional review, and disc handling") {
                     VStack(alignment: .leading, spacing: 9) {
                         Toggle(
-                            "Open a side-by-side visual spot check before full encoding",
+                            "Thorough visual analysis (trial encodes and XPSNR)",
+                            isOn: $model.thoroughAnalysis
+                        )
+                        Toggle(
+                            "Generate an optional side-by-side visual spot check",
                             isOn: $model.visualReview
                         )
+                        Text(
+                            model.visualReview
+                            ? "SBS review enables thorough analysis automatically and takes longer."
+                            : "Fast mode trusts VidReclaim’s metadata intelligence, parallelizes probes, and reuses cached results. No trial clips or screenshots are made."
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                         Toggle("Decode every output frame during verification", isOn: $model.deepVerify)
                         Toggle(
                             "Preserve DVD trailers, menus, and extras",
@@ -667,19 +915,21 @@ struct CompressView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         }
-                        DisclosureGroup("Sampling details") {
-                            HStack {
-                                Stepper(
-                                    "\(model.sampleCount) samples per title",
-                                    value: $model.sampleCount, in: 1...3
-                                )
-                                Spacer()
-                                Stepper(
-                                    "\(model.sampleSeconds, specifier: "%.0f") seconds each",
-                                    value: $model.sampleSeconds, in: 4...30, step: 1
-                                )
+                        if model.thoroughAnalysis || model.visualReview {
+                            DisclosureGroup("Sampling details") {
+                                HStack {
+                                    Stepper(
+                                        "\(model.sampleCount) samples per title",
+                                        value: $model.sampleCount, in: 1...3
+                                    )
+                                    Spacer()
+                                    Stepper(
+                                        "\(model.sampleSeconds, specifier: "%.0f") seconds each",
+                                        value: $model.sampleSeconds, in: 4...30, step: 1
+                                    )
+                                }
+                                .padding(.top, 6)
                             }
-                            .padding(.top, 6)
                         }
                     }
                     .padding(.top, 6)
@@ -710,7 +960,7 @@ struct CompressView: View {
                             .foregroundStyle(.secondary)
                             .lineLimit(2)
                     }
-                    Button("Review & Start") {
+                    Button(model.visualReview ? "Review & Start Queue" : "Start Queue") {
                         if model.sourcePolicy == .delete {
                             confirmDeletion = true
                         } else {
@@ -926,75 +1176,248 @@ struct SpaceMapView: View {
 
 struct ActivityView: View {
     @ObservedObject var model: AppModel
+    @State private var showLog = false
+
+    private var orderedItems: [QueueItem] {
+        (model.queueSession?.items ?? []).sorted { $0.order < $1.order }
+    }
+
+    private var selectedItem: QueueItem? {
+        orderedItems.first { $0.id == model.selectedQueueItemID }
+    }
+
+    private func statusIcon(_ status: String) -> String {
+        switch status {
+        case "complete": return "checkmark.circle.fill"
+        case "encoding": return "arrow.up.circle.fill"
+        case "verifying": return "checkmark.shield.fill"
+        case "paused": return "pause.circle.fill"
+        case "skipped": return "forward.end.circle"
+        case "cancelled": return "xmark.circle.fill"
+        case "error": return "exclamationmark.triangle.fill"
+        case "probing", "analyzing": return "magnifyingglass.circle"
+        default: return "clock"
+        }
+    }
+
+    private func statusColor(_ status: String) -> Color {
+        switch status {
+        case "complete": return .green
+        case "encoding", "verifying": return .accentColor
+        case "paused": return .orange
+        case "cancelled", "error": return .red
+        default: return .secondary
+        }
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 14) {
             HStack {
                 SectionHeading(
-                    title: "Activity",
-                    subtitle: "Live output, accurate after-sampling estimates, current speed, and safe cancellation."
+                    title: "Queue",
+                    subtitle: "Transmission-style controls with persistent, reboot-resumable sessions."
                 )
                 Spacer()
                 Label(model.engineStatus, systemImage: model.cliPath == nil ? "xmark.circle" : "checkmark.circle")
                     .foregroundStyle(model.cliPath == nil ? Color.red : Color.green)
             }
-            GroupBox {
-                VStack(alignment: .leading, spacing: 10) {
+
+            if let session = model.queueSession {
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(session.name).font(.title3.bold())
+                                Text(session.root)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                            Spacer()
+                            VStack(alignment: .trailing, spacing: 2) {
+                                Text(model.eta).font(.title3.monospacedDigit())
+                                Text(model.speed.isEmpty ? "remaining" : "\(model.speed) · remaining")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        ProgressView(value: session.overallFraction) {
+                            Text(session.phase)
+                        } currentValueLabel: {
+                            Text("\(session.overallFraction * 100, specifier: "%.1f")%")
+                                .monospacedDigit()
+                        }
+                        HStack {
+                            Text(session.summary)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Button {
+                                model.queueControl("pause")
+                            } label: {
+                                Label("Pause All", systemImage: "pause.fill")
+                            }
+                            Button {
+                                model.queueControl("resume")
+                            } label: {
+                                Label("Resume All", systemImage: "play.fill")
+                            }
+                            Button(role: .destructive) {
+                                model.queueControl("cancel")
+                            } label: {
+                                Label("Cancel All", systemImage: "xmark")
+                            }
+                            if !model.isRunning
+                                && !["complete", "attention", "running"].contains(session.status) {
+                                Button("Resume Session") { model.resumeQueue() }
+                                    .buttonStyle(.borderedProminent)
+                            }
+                        }
+                    }
+                    .padding(.top, 4)
+                }
+
+                HStack(spacing: 8) {
+                    Text("\(orderedItems.count) videos").font(.headline)
+                    Spacer()
+                    if let item = selectedItem {
+                        Button {
+                            model.queueControl("pause", itemID: item.id)
+                        } label: {
+                            Label("Pause", systemImage: "pause")
+                        }
+                        .disabled(!["ready", "encoding"].contains(item.status))
+                        Button {
+                            model.queueControl("resume", itemID: item.id)
+                        } label: {
+                            Label("Resume", systemImage: "play")
+                        }
+                        .disabled(!["paused", "cancelled", "error"].contains(item.status))
+                        Button {
+                            model.queueControl("skip", itemID: item.id)
+                        } label: {
+                            Label("Skip", systemImage: "forward.end")
+                        }
+                        .disabled(item.isTerminal)
+                        Button(role: .destructive) {
+                            model.queueControl("cancel", itemID: item.id)
+                        } label: {
+                            Label("Cancel", systemImage: "xmark")
+                        }
+                        .disabled(item.isTerminal)
+                        Divider().frame(height: 18)
+                        Button {
+                            model.moveQueueItem(item.id, by: -1)
+                        } label: {
+                            Image(systemName: "arrow.up")
+                        }
+                        .help("Move earlier")
+                        .disabled(item.order == orderedItems.first?.order)
+                        Button {
+                            model.moveQueueItem(item.id, by: 1)
+                        } label: {
+                            Image(systemName: "arrow.down")
+                        }
+                        .help("Move later")
+                        .disabled(item.order == orderedItems.last?.order)
+                    }
+                }
+
+                List(selection: $model.selectedQueueItemID) {
+                    ForEach(orderedItems) { item in
+                        HStack(spacing: 12) {
+                            Image(systemName: statusIcon(item.status))
+                                .font(.title3)
+                                .foregroundStyle(statusColor(item.status))
+                                .frame(width: 24)
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack {
+                                    Text(item.name).fontWeight(.semibold).lineLimit(1)
+                                    Text(item.status.capitalized)
+                                        .font(.caption2.bold())
+                                        .foregroundStyle(statusColor(item.status))
+                                }
+                                Text(item.path)
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                                    .lineLimit(1)
+                                if ["encoding", "verifying", "paused"].contains(item.status) {
+                                    ProgressView(value: item.progress)
+                                        .progressViewStyle(.linear)
+                                } else {
+                                    Text(item.message)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
+                            Spacer(minLength: 10)
+                            VStack(alignment: .trailing, spacing: 3) {
+                                if let savings = item.projectedSavingsPct {
+                                    Text("~\(savings, specifier: "%.0f")% smaller")
+                                        .monospacedDigit()
+                                }
+                                Text(
+                                    "\(model.bytesLabel(item.sourceBytes)) → \(model.bytesLabel(item.projectedBytes))"
+                                )
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                if item.etaSeconds != nil && !item.isTerminal {
+                                    Text("ETA \(model.durationLabel(item.etaSeconds))")
+                                        .font(.caption.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .frame(width: 175, alignment: .trailing)
+                        }
+                        .padding(.vertical, 5)
+                        .tag(item.id)
+                    }
+                }
+                .overlay {
+                    if orderedItems.isEmpty {
+                        ContentUnavailableView(
+                            session.status == "scanning" ? "Scanning quickly…" : "Queue is empty",
+                            systemImage: "list.bullet.rectangle",
+                            description: Text("Videos appear as their metadata is discovered.")
+                        )
+                    }
+                }
+                .frame(minHeight: 260)
+            } else {
+                ContentUnavailableView(
+                    "No queue session yet",
+                    systemImage: "list.bullet.rectangle",
+                    description: Text("Choose media in Compress, then start a queue.")
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+
+            DisclosureGroup("Worker log", isExpanded: $showLog) {
+                VStack(spacing: 8) {
                     HStack {
-                        VStack(alignment: .leading) {
-                            Text(model.phase).font(.title3.bold())
-                            Text(model.jobName.isEmpty ? "No active item" : model.jobName)
-                                .foregroundStyle(.secondary).lineLimit(1)
-                        }
                         Spacer()
-                        VStack(alignment: .trailing) {
-                            Text(model.eta).font(.title3.monospacedDigit())
-                            Text(model.speed.isEmpty ? "ETA" : "\(model.speed) · ETA")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
+                        Button("Reveal") { model.revealLog() }
+                        Button("Copy") { model.copyLog() }
+                        Button("Clear") { model.clearLog() }
                     }
-                    ProgressView(value: model.overallProgress) {
-                        Text("Whole job")
-                    } currentValueLabel: {
-                        Text("\(model.overallProgress * 100, specifier: "%.1f")%")
-                            .monospacedDigit()
+                    ScrollView {
+                        Text(model.log.isEmpty ? "Activity will appear here." : model.log)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                            .padding(10)
                     }
-                    ProgressView(value: model.jobProgress) {
-                        Text("Current item")
-                    } currentValueLabel: {
-                        Text("\(model.jobProgress * 100, specifier: "%.1f")%")
-                            .monospacedDigit()
-                    }
-                }
-                .padding(.top, 4)
-            }
-            HStack {
-                Text("Persistent log").font(.headline)
-                Spacer()
-                Button("Reveal") { model.revealLog() }
-                Button("Copy") { model.copyLog() }
-                Button("Clear") { model.clearLog() }
-                Button("Stop", role: .destructive) { model.cancel() }
-                    .disabled(!model.isRunning)
-            }
-            ScrollViewReader { proxy in
-                ScrollView {
-                    Text(model.log.isEmpty ? "Activity will appear here." : model.log)
-                        .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .topLeading)
-                        .padding(12)
-                        .id("log-end")
-                }
-                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
-                .overlay(RoundedRectangle(cornerRadius: 8).stroke(.separator))
-                .onChange(of: model.log) {
-                    proxy.scrollTo("log-end", anchor: .bottom)
+                    .frame(height: 130)
+                    .background(
+                        Color(nsColor: .textBackgroundColor),
+                        in: RoundedRectangle(cornerRadius: 8)
+                    )
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(.separator))
                 }
             }
         }
         .padding(28)
-        .frame(maxWidth: 1050, maxHeight: .infinity, alignment: .topLeading)
+        .frame(maxWidth: 1150, maxHeight: .infinity, alignment: .topLeading)
     }
 }
 

@@ -11,9 +11,15 @@ from . import __version__
 from .discovery import discover
 from .dvd import probe_dvd
 from .model import PROFILES, MediaInfo, Plan
-from .planner import analyze
+from .planner import analyze, analyze_fast
 from .progress import ProgressReporter
 from .probe import probe_file
+from .queueing import (
+    control_session,
+    create_session,
+    new_session_path,
+    run_session,
+)
 from .review import review_in_browser
 from .runner import (
     archive_and_replace_file,
@@ -69,6 +75,17 @@ def _add_analysis_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--dvd-min-title-minutes", type=float, default=10,
         help="minimum DVD main-content title length (default: 10)",
+    )
+    parser.add_argument(
+        "--thorough-analysis", action="store_true",
+        help=(
+            "trial-encode samples and measure XPSNR; slower and normally "
+            "unnecessary (automatically enabled by --review)"
+        ),
+    )
+    parser.add_argument(
+        "--scan-workers", type=int, default=6,
+        help="parallel metadata probes for queue scans (default: 6)",
     )
 
 
@@ -135,6 +152,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="write the report without opening a browser",
     )
     space_parser.set_defaults(handler=command_space)
+
+    queue_start = subparsers.add_parser(
+        "queue-start",
+        help="create a persistent, controllable queue and run it",
+    )
+    queue_start.add_argument("root", type=Path)
+    queue_start.add_argument("--session", type=Path)
+    _add_analysis_options(queue_start)
+    queue_start.add_argument("--output-dir", type=Path)
+    queue_start.add_argument("--replace", action="store_true")
+    queue_start.add_argument("--delete-source-as-you-go", action="store_true")
+    queue_start.add_argument("--yes", action="store_true")
+    queue_start.add_argument("--review", action="store_true")
+    queue_start.add_argument("--deep-verify", action="store_true")
+    queue_start.add_argument(
+        "--plan-only",
+        action="store_true",
+        help="prepare the persistent queue but wait for queue-resume to encode",
+    )
+    queue_start.set_defaults(handler=command_queue_start)
+
+    queue_resume = subparsers.add_parser(
+        "queue-resume",
+        help="resume a persistent queue after quit, interruption, or reboot",
+    )
+    queue_resume.add_argument("session", type=Path)
+    queue_resume.set_defaults(handler=command_queue_resume)
+
+    queue_control = subparsers.add_parser(
+        "queue-control",
+        help="pause, resume, cancel, skip, or reorder queue items",
+    )
+    queue_control.add_argument("session", type=Path)
+    queue_control.add_argument(
+        "action",
+        choices=("pause", "resume", "cancel", "skip", "move-up", "move-down"),
+    )
+    queue_control.add_argument("--item")
+    queue_control.set_defaults(handler=command_queue_control)
 
     for name, help_text in (
         ("plan", "scan, sample, and write a no-change encode plan"),
@@ -249,6 +305,82 @@ def command_space(args: argparse.Namespace) -> int:
         return 1
 
 
+def _queue_settings(args: argparse.Namespace, root: Path) -> dict[str, Any]:
+    state_base = root.parent if root.is_file() else root
+    output_root = (
+        args.output_dir.expanduser().resolve()
+        if args.output_dir else state_base / ".vidreclaim" / "output"
+    )
+    return {
+        "profile": args.profile,
+        "min_savings_pct": args.min_savings,
+        "min_reclaim_mb": args.min_reclaim_mb,
+        "sample_seconds": args.sample_seconds,
+        "samples": args.samples,
+        "encoder": args.encoder,
+        "preset": args.preset,
+        "nice": args.nice,
+        "keep_dvd_extras": args.keep_dvd_extras,
+        "dvd_min_title_minutes": args.dvd_min_title_minutes,
+        "thorough_analysis": bool(args.thorough_analysis or args.review),
+        "scan_workers": args.scan_workers,
+        "visual_review": args.review,
+        "deep_verify": args.deep_verify,
+        "replace": args.replace,
+        "delete_source_as_you_go": args.delete_source_as_you_go,
+        "plan_only": args.plan_only,
+        "output_dir": str(output_root),
+    }
+
+
+def command_queue_start(args: argparse.Namespace) -> int:
+    root = args.root.expanduser().resolve()
+    if args.delete_source_as_you_go and not args.yes:
+        print(
+            "--delete-source-as-you-go is irreversible and requires --yes.",
+            file=sys.stderr,
+        )
+        return 2
+    session = (args.session or new_session_path()).expanduser().resolve()
+    try:
+        create_session(
+            session,
+            root=root,
+            settings=_queue_settings(args, root),
+        )
+        print(f"Queue session: {session}", flush=True)
+        return run_session(session)
+    except (CommandError, OSError) as error:
+        print(f"Queue ERROR: {error}", file=sys.stderr)
+        return 1
+
+
+def command_queue_resume(args: argparse.Namespace) -> int:
+    try:
+        print(f"Queue session: {args.session.expanduser().resolve()}", flush=True)
+        return run_session(args.session)
+    except (CommandError, OSError) as error:
+        print(f"Queue resume ERROR: {error}", file=sys.stderr)
+        return 1
+
+
+def command_queue_control(args: argparse.Namespace) -> int:
+    try:
+        data = control_session(
+            args.session,
+            action=args.action,
+            item_id=args.item,
+        )
+        print(
+            f"Queue control: {args.action}; session is {data['status']}",
+            flush=True,
+        )
+        return 0
+    except (CommandError, OSError) as error:
+        print(f"Queue control ERROR: {error}", file=sys.stderr)
+        return 1
+
+
 def _paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
     root = args.root.expanduser().resolve()
     state_base = root.parent if root.is_file() else root
@@ -325,17 +457,28 @@ def _make_plans(
             def report_sample(done: int, total: int, detail: str) -> None:
                 print(f"  sample {done}/{total}: {detail}", flush=True)
 
-            plan = analyze(
-                media, profile=profile, min_savings_pct=args.min_savings,
-                min_reclaim_bytes=round(args.min_reclaim_mb * 1024 * 1024),
-                sample_seconds=args.sample_seconds, sample_count=args.samples,
-                encoder=args.encoder, preset=args.preset, nice=args.nice,
-                work_dir=(
-                    review_session_dir / "clips" / str(index - 1)
-                    if review_session_dir is not None else None
-                ),
-                sample_progress=report_sample,
-            )
+            common = {
+                "profile": profile,
+                "min_savings_pct": args.min_savings,
+                "min_reclaim_bytes": round(args.min_reclaim_mb * 1024 * 1024),
+                "encoder": args.encoder,
+                "preset": args.preset,
+            }
+            if args.thorough_analysis or review_session_dir is not None:
+                plan = analyze(
+                    media,
+                    **common,
+                    sample_seconds=args.sample_seconds,
+                    sample_count=args.samples,
+                    nice=args.nice,
+                    work_dir=(
+                        review_session_dir / "clips" / str(index - 1)
+                        if review_session_dir is not None else None
+                    ),
+                    sample_progress=report_sample,
+                )
+            else:
+                plan = analyze_fast(media, **common)
         except (CommandError, OSError) as error:
             plan = Plan(media, "error", str(error))
         if plan.status == "encode":

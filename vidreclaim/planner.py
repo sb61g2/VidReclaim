@@ -62,6 +62,126 @@ def candidate_dimensions(media: MediaInfo) -> list[tuple[int, int]]:
     return dimensions
 
 
+def _estimated_encode_fps(
+    media: MediaInfo,
+    *,
+    encoder: Encoder,
+    preset: str,
+) -> float:
+    """Conservative M4-oriented estimate, replaced by observed speed at runtime."""
+    megapixels = max(0.25, media.megapixels)
+    if encoder == "videotoolbox":
+        return 310 / (megapixels ** 0.78)
+    preset_factor = {
+        "ultrafast": 3.2,
+        "superfast": 2.5,
+        "veryfast": 1.9,
+        "faster": 1.45,
+        "fast": 1.2,
+        "medium": 1.0,
+        "slow": 0.62,
+    }.get(preset, 1.0)
+    return 150 * preset_factor / (megapixels ** 0.92)
+
+
+def analyze_fast(
+    media: MediaInfo,
+    *,
+    profile: Profile,
+    min_savings_pct: float | None = None,
+    min_reclaim_bytes: int = 100 * 1024 * 1024,
+    encoder: Encoder = "x265",
+    preset: str = "medium",
+) -> Plan:
+    """Plan from stream metadata without trial encodes.
+
+    The real output is still verified and must clear the actual savings gate.
+    This deliberately favors keeping native resolution when UHD metadata
+    suggests a sharp or HDR source.
+    """
+    required_pct = profile.min_savings_pct if min_savings_pct is None else min_savings_pct
+    if media.duration < 5:
+        return Plan(media, "skip", "shorter than 5 seconds")
+
+    dimensions = candidate_dimensions(media)
+    if len(dimensions) > 1:
+        modern = media.codec in {"hevc", "h265", "av1", "vp9"}
+        crisp_threshold = 0.052 if modern else 0.072
+        preserve_native = (
+            media.hdr
+            or media.bit_depth > 8
+            or media.bpp_per_frame >= crisp_threshold
+            or media.video_bit_rate >= 14_000_000
+        )
+        if preserve_native:
+            dimensions = dimensions[:1]
+
+    base_bpp = {
+        "conservative": 0.066,
+        "balanced": 0.052,
+        "compact": 0.042,
+    }[profile.name]
+    candidates: list[Candidate] = []
+    encode_fps = _estimated_encode_fps(
+        media, encoder=encoder, preset=preset,
+    )
+    for width, height in dimensions:
+        resolution_factor = 1.45 if height <= 576 else (1.15 if height <= 720 else 1.0)
+        target_video_rate = round(
+            width * height * max(media.fps, 23.976) * base_bpp * resolution_factor
+        )
+        # Avoid predicting that a constant-quality encode will inflate already
+        # efficient material. Such files should simply be skipped.
+        target_video_rate = min(target_video_rate, media.video_bit_rate)
+        projected_rate = target_video_rate + media.nonvideo_bit_rate
+        projected_bytes = math.ceil(projected_rate * media.duration / 8 * 1.02)
+        savings_pct = (
+            (media.size_bytes - projected_bytes) / media.size_bytes * 100
+        )
+        reclaim = media.size_bytes - projected_bytes
+        accepted = savings_pct >= required_pct and reclaim >= min_reclaim_bytes
+        failures: list[str] = []
+        if savings_pct < required_pct:
+            failures.append(
+                f"estimated savings {savings_pct:.1f}% < {required_pct:.1f}%"
+            )
+        if reclaim < min_reclaim_bytes:
+            failures.append("estimated absolute reclaim below threshold")
+        candidate = Candidate(
+            width=width,
+            height=height,
+            crf=base_crf(height) + profile.crf_offset,
+            projected_bytes=projected_bytes,
+            projected_encode_seconds=(
+                media.duration * media.fps / max(encode_fps, 1.0)
+            ),
+            savings_pct=savings_pct,
+            accepted=accepted,
+            reason="accepted by fast metadata analysis" if accepted else "; ".join(failures),
+        )
+        candidates.append(candidate)
+
+    accepted = [candidate for candidate in candidates if candidate.accepted]
+    if not accepted:
+        details = ", ".join(
+            f"{candidate.resolution}: {candidate.reason}" for candidate in candidates
+        )
+        return Plan(
+            media,
+            "skip",
+            f"fast analysis found no worthwhile candidate ({details})",
+            candidates=candidates,
+        )
+    chosen = min(accepted, key=lambda candidate: candidate.projected_bytes)
+    return Plan(
+        media,
+        "encode",
+        f"fast metadata estimate: {chosen.savings_pct:.1f}% reclaim",
+        candidate=chosen,
+        candidates=candidates,
+    )
+
+
 def _video_filter(media: MediaInfo, width: int, height: int) -> str | None:
     filters: list[str] = []
     if media.field_order not in {"progressive", "unknown", ""}:

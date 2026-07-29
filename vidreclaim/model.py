@@ -51,6 +51,35 @@ class MediaInfo:
         pixels_per_second = self.width * self.height * self.fps
         return self.video_bit_rate / pixels_per_second if pixels_per_second else 0.0
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "MediaInfo":
+        source_data = data["source"]
+        return cls(
+            source=Source(
+                Path(source_data["path"]),
+                kind=source_data.get("kind", "file"),
+                dvd_title=source_data.get("dvd_title"),
+                display_name=source_data.get("display_name"),
+            ),
+            size_bytes=int(data["size_bytes"]),
+            duration=float(data["duration"]),
+            bit_rate=int(data["bit_rate"]),
+            video_bit_rate=int(data["video_bit_rate"]),
+            nonvideo_bit_rate=int(data["nonvideo_bit_rate"]),
+            codec=str(data["codec"]),
+            profile=str(data.get("profile", "")),
+            width=int(data["width"]),
+            height=int(data["height"]),
+            fps=float(data["fps"]),
+            pix_fmt=str(data.get("pix_fmt", "")),
+            bit_depth=int(data.get("bit_depth", 8)),
+            field_order=str(data.get("field_order", "unknown")),
+            audio_streams=int(data.get("audio_streams", 0)),
+            subtitle_streams=int(data.get("subtitle_streams", 0)),
+            hdr=bool(data.get("hdr", False)),
+            video_stream_index=int(data.get("video_stream_index", 0)),
+        )
+
 
 @dataclass(frozen=True)
 class Profile:
@@ -87,6 +116,10 @@ class Candidate:
     def resolution(self) -> str:
         return f"{self.width}x{self.height}"
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Candidate":
+        return cls(**data)
+
 
 @dataclass
 class Plan:
@@ -104,3 +137,23 @@ class Plan:
         if self.output is not None:
             data["output"] = str(self.output)
         return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Plan":
+        candidate_data = data.get("candidate")
+        return cls(
+            media=MediaInfo.from_dict(data["media"]),
+            status=data["status"],
+            reason=data["reason"],
+            candidate=(
+                Candidate.from_dict(candidate_data) if candidate_data else None
+            ),
+            candidates=[
+                Candidate.from_dict(candidate)
+                for candidate in data.get("candidates", [])
+            ],
+            sample_offsets=[
+                float(offset) for offset in data.get("sample_offsets", [])
+            ],
+            output=Path(data["output"]) if data.get("output") else None,
+        )

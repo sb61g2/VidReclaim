@@ -1,16 +1,28 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 from vidreclaim.discovery import discover
 from vidreclaim.dvd import DvdTitle, _extract_json, select_main_titles
-from vidreclaim.model import Candidate, MediaInfo, Plan, Source
-from vidreclaim.planner import base_crf, candidate_dimensions, sample_offsets
+from vidreclaim.model import Candidate, MediaInfo, Plan, PROFILES, Source
+from vidreclaim.planner import (
+    analyze_fast,
+    base_crf,
+    candidate_dimensions,
+    sample_offsets,
+)
+from vidreclaim.queueing import (
+    SessionStore,
+    _normalize_interrupted,
+    control_session,
+    create_session,
+)
 from vidreclaim.review import _render_html
-from vidreclaim.runner import output_path
+from vidreclaim.runner import EncodeControl, _stream_command, output_path
 from vidreclaim.runner import (
     EncodeResult,
     delete_verified_dvd_source,
@@ -91,6 +103,31 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(20, base_crf(480))
         self.assertEqual(22, base_crf(1080))
         self.assertEqual(24, base_crf(2160))
+
+    def test_fast_analysis_preserves_crisp_4k(self) -> None:
+        info = media(Path("/tmp/crisp.mkv"))
+        info.video_bit_rate = 20_000_000
+        info.bit_rate = 20_222_222
+        info.size_bytes = round(info.bit_rate * info.duration / 8)
+        plan = analyze_fast(
+            info,
+            profile=PROFILES["balanced"],
+            min_reclaim_bytes=100 * 1024 * 1024,
+        )
+        self.assertEqual("encode", plan.status)
+        self.assertEqual((3840, 2160), (plan.candidate.width, plan.candidate.height))
+
+    def test_plan_round_trips_from_persistent_json(self) -> None:
+        info = media(Path("/tmp/movie.mkv"), 1920, 1080)
+        plan = analyze_fast(
+            info,
+            profile=PROFILES["balanced"],
+            min_reclaim_bytes=10,
+        )
+        restored = Plan.from_dict(plan.to_dict())
+        self.assertEqual(plan.media.source.path, restored.media.source.path)
+        self.assertEqual(plan.status, restored.status)
+        self.assertEqual(plan.candidate, restored.candidate)
 
 
 class DiscoveryAndOutputTests(unittest.TestCase):
@@ -187,6 +224,97 @@ class SpaceMapTests(unittest.TestCase):
         self.assertEqual(2, scanned.files)
         self.assertEqual(2, stats.files)
         self.assertEqual(10_100, scanned.size)
+
+
+class QueueTests(unittest.TestCase):
+    def settings(self, root: Path) -> dict[str, object]:
+        return {
+            "profile": "balanced",
+            "min_savings_pct": 20,
+            "min_reclaim_mb": 100,
+            "sample_seconds": 10,
+            "samples": 3,
+            "encoder": "x265",
+            "preset": "medium",
+            "nice": 10,
+            "keep_dvd_extras": False,
+            "dvd_min_title_minutes": 10,
+            "thorough_analysis": False,
+            "scan_workers": 6,
+            "visual_review": False,
+            "deep_verify": False,
+            "replace": False,
+            "delete_source_as_you_go": False,
+            "output_dir": str(root / ".vidreclaim" / "output"),
+        }
+
+    def test_queue_control_pauses_resumes_and_reorders(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "session.json"
+            create_session(path, root=root, settings=self.settings(root))
+            store = SessionStore(path)
+
+            def add_items(data: dict[str, object]) -> None:
+                data["status"] = "queued"
+                data["items"] = [
+                    {"id": "a", "order": 0, "status": "ready"},
+                    {"id": "b", "order": 1, "status": "ready"},
+                ]
+
+            store.mutate(add_items)
+            control_session(path, action="pause", item_id="a")
+            self.assertEqual("paused", store.read()["items"][0]["status"])
+            control_session(path, action="resume", item_id="a")
+            self.assertEqual("ready", store.read()["items"][0]["status"])
+            control_session(path, action="move-down", item_id="a")
+            items = sorted(store.read()["items"], key=lambda item: item["order"])
+            self.assertEqual(["b", "a"], [item["id"] for item in items])
+
+    def test_interrupted_encode_becomes_resumable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "session.json"
+            create_session(path, root=root, settings=self.settings(root))
+            store = SessionStore(path)
+
+            def interrupt(data: dict[str, object]) -> None:
+                data["status"] = "running"
+                data["worker_pid"] = 999_999_999
+                data["items"] = [{
+                    "id": "a",
+                    "order": 0,
+                    "status": "encoding",
+                    "requested_action": None,
+                    "progress": 0.7,
+                    "message": "Encoding",
+                    "plan": None,
+                }]
+
+            store.mutate(interrupt)
+            _normalize_interrupted(store)
+            item = store.read()["items"][0]
+            self.assertEqual("ready", item["status"])
+            self.assertEqual(0.0, item["progress"])
+
+    def test_streamed_encoder_honors_cancel_control(self) -> None:
+        actions = iter(["run", "cancel"])
+
+        def control() -> str:
+            return next(actions, "cancel")
+
+        with self.assertRaises(EncodeControl):
+            _stream_command(
+                [
+                    sys.executable,
+                    "-u",
+                    "-c",
+                    "import time\nwhile True:\n print('tick', flush=True)\n time.sleep(.1)",
+                ],
+                nice=0,
+                on_line=lambda _: None,
+                control=control,
+            )
 
 
 if __name__ == "__main__":
