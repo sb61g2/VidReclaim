@@ -32,6 +32,36 @@ def copy_executable(source: Path, destination: Path) -> None:
     destination.chmod(0o755)
 
 
+def build_app_icon(source: Path, destination: Path, build_root: Path) -> None:
+    iconset = build_root / "VidReclaim.iconset"
+    iconset.mkdir(parents=True, exist_ok=True)
+    sizes = {
+        "icon_16x16.png": 16,
+        "icon_16x16@2x.png": 32,
+        "icon_32x32.png": 32,
+        "icon_32x32@2x.png": 64,
+        "icon_128x128.png": 128,
+        "icon_128x128@2x.png": 256,
+        "icon_256x256.png": 256,
+        "icon_256x256@2x.png": 512,
+        "icon_512x512.png": 512,
+        "icon_512x512@2x.png": 1024,
+    }
+    for name, size in sizes.items():
+        run([
+            "/usr/bin/sips",
+            "-z", str(size), str(size),
+            str(source),
+            "--out", str(iconset / name),
+        ])
+    run([
+        "/usr/bin/iconutil",
+        "-c", "icns",
+        str(iconset),
+        "-o", str(destination),
+    ])
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--version", default="0.1.0")
@@ -97,6 +127,11 @@ def main() -> int:
         (HERE / "gui" / "Info.plist.in").read_text(encoding="utf-8")
         .replace("@VERSION@", args.version),
         encoding="utf-8",
+    )
+    build_app_icon(
+        HERE / "gui" / "assets" / "VidReclaimIcon.png",
+        app_resources / "VidReclaim.icns",
+        build_root,
     )
     run([
         "/usr/bin/xcrun", "swiftc",

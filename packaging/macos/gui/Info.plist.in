@@ -10,6 +10,8 @@
     <string>VidReclaim</string>
     <key>CFBundleIdentifier</key>
     <string>io.vidreclaim.app</string>
+    <key>CFBundleIconFile</key>
+    <string>VidReclaim.icns</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
