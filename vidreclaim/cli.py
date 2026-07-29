@@ -198,6 +198,18 @@ def build_parser() -> argparse.ArgumentParser:
     queue_start.add_argument("--delete-source-as-you-go", action="store_true")
     queue_start.add_argument("--yes", action="store_true")
     queue_start.add_argument("--review", action="store_true")
+    queue_start.add_argument(
+        "--review-mode",
+        choices=("frames", "clips"),
+        default="frames",
+        help="use quick still frames or short encoded samples for review",
+    )
+    queue_start.add_argument(
+        "--review-interface",
+        choices=("browser", "native"),
+        default="browser",
+        help="open browser review or export review pairs for the native app",
+    )
     queue_start.add_argument("--deep-verify", action="store_true")
     queue_start.add_argument(
         "--plan-only",
@@ -265,6 +277,12 @@ def build_parser() -> argparse.ArgumentParser:
             subparser.add_argument(
                 "--review", action="store_true",
                 help="open a local before/after screenshot review before encoding",
+            )
+            subparser.add_argument(
+                "--review-mode",
+                choices=("frames", "clips"),
+                default="frames",
+                help="use quick still frames or short encoded samples for review",
             )
             subparser.add_argument(
                 "--deep-verify", action="store_true",
@@ -369,10 +387,17 @@ def _queue_settings(args: argparse.Namespace, root: Path) -> dict[str, Any]:
         "keep_dvd_extras": args.keep_dvd_extras,
         "dvd_min_title_minutes": args.dvd_min_title_minutes,
         "thorough_analysis": bool(
-            args.thorough_analysis or (args.review and not args.review_path)
+            args.thorough_analysis
+            or (
+                args.review
+                and args.review_mode == "clips"
+                and not args.review_path
+            )
         ),
         "scan_workers": args.scan_workers,
         "visual_review": args.review,
+        "review_mode": args.review_mode,
+        "review_interface": args.review_interface,
         "deep_verify": args.deep_verify,
         "replace": args.replace,
         "delete_source_as_you_go": args.delete_source_as_you_go,
@@ -519,7 +544,13 @@ def _make_plans(
                 "encoder": args.encoder,
                 "preset": args.preset,
             }
-            if args.thorough_analysis or review_session_dir is not None:
+            if (
+                args.thorough_analysis
+                or (
+                    review_session_dir is not None
+                    and args.review_mode == "clips"
+                )
+            ):
                 plan = analyze(
                     media,
                     **common,
@@ -640,6 +671,11 @@ def command_run(args: argparse.Namespace) -> int:
                 plans, session_dir=review_session,
                 decisions_path=state_base / ".vidreclaim" / "review-decisions.json",
                 sample_seconds=args.sample_seconds,
+                mode=args.review_mode,
+                sample_count=args.samples,
+                encoder=args.encoder,
+                preset=args.preset,
+                profile_name=args.profile,
             )
         except (CommandError, OSError) as error:
             print(f"Review ERROR: {error}", file=sys.stderr)

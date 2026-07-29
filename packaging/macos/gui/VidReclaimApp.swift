@@ -2,21 +2,24 @@ import AppKit
 import SwiftUI
 
 enum SidebarSection: String, CaseIterable, Identifiable {
-    case compress = "Compress"
-    case stitch = "Stitch"
-    case space = "Space Map"
-    case activity = "Queue"
+    case workspace = "Workspace"
+    case activity = "Activity"
 
     var id: String { rawValue }
 
     var icon: String {
         switch self {
-        case .compress: return "film.stack"
-        case .stitch: return "rectangle.3.group"
-        case .space: return "square.3.layers.3d"
+        case .workspace: return "rectangle.3.group.bubble.left"
         case .activity: return "list.bullet.rectangle"
         }
     }
+}
+
+enum WorkspaceOperation: String, CaseIterable, Identifiable {
+    case reclaim = "Reclaim Space"
+    case combine = "Combine Clips"
+
+    var id: String { rawValue }
 }
 
 struct OptionEstimate: Codable, Identifiable {
@@ -38,6 +41,14 @@ struct OptionEstimate: Codable, Identifiable {
         case savingsPct = "savings_pct"
         case encodeSeconds = "encode_seconds"
     }
+}
+
+struct ReviewPair: Codable, Identifiable {
+    let before: String
+    let after: String
+    let time: String
+
+    var id: String { "\(before)|\(after)" }
 }
 
 struct QueueItem: Codable, Identifiable {
@@ -64,6 +75,7 @@ struct QueueItem: Codable, Identifiable {
     let output: String?
     let message: String
     let whatIf: [OptionEstimate]?
+    let reviewPairs: [ReviewPair]?
 
     enum CodingKeys: String, CodingKey {
         case id, order, name, path, status, progress, duration, output, message
@@ -80,6 +92,7 @@ struct QueueItem: Codable, Identifiable {
         case relativeFolder = "relative_folder"
         case selected, processed
         case whatIf = "what_if"
+        case reviewPairs = "review_pairs"
     }
 
     var isActive: Bool {
@@ -213,7 +226,8 @@ enum SourcePolicy: String, CaseIterable, Identifiable {
 
 @MainActor
 final class AppModel: ObservableObject {
-    @Published var selection: SidebarSection = .compress
+    @Published var selection: SidebarSection = .workspace
+    @Published var workspaceOperation: WorkspaceOperation = .reclaim
     @Published var isRunning = false
     @Published var phase = "Ready"
     @Published var jobName = ""
@@ -235,12 +249,13 @@ final class AppModel: ObservableObject {
     @Published var sampleSeconds = 10.0
     @Published var nice = 10
     @Published var preserveDVDExtras = false
-    @Published var visualReview = false
+    @Published var reviewMode = "frames"
     @Published var thoroughAnalysis = false
     @Published var deepVerify = false
     @Published var sourcePolicy: SourcePolicy = .keep
     @Published var queueSession: QueueSession?
     @Published var currentSessionURL: URL?
+    @Published var workspaceSessionURL: URL?
     @Published var selectedQueueItemIDs = Set<String>()
 
     @Published var stitchInputs: [URL] = []
@@ -262,7 +277,7 @@ final class AppModel: ObservableObject {
     private var outputPipe: Pipe?
     private var pendingOutput = ""
     private var jobTitle = ""
-    private var runningQueue = false
+    @Published private(set) var runningQueue = false
     private var pendingSpaceJSONURL: URL?
     private let logURL: URL
     private let sessionsURL: URL
@@ -327,6 +342,9 @@ final class AppModel: ObservableObject {
         if panel.runModal() == .OK {
             for url in panel.urls where !stitchInputs.contains(url) {
                 stitchInputs.append(url)
+            }
+            if stitchOutput == nil {
+                stitchOutput = availableSuggestedStitchOutput()
             }
         }
     }
@@ -394,6 +412,33 @@ final class AppModel: ObservableObject {
         return "combined-video.mkv"
     }
 
+    var canStitchSelection: Bool {
+        stitchInputs.count >= 2
+            || stitchInputs.contains(where: \.hasDirectoryPath)
+    }
+
+    private func availableSuggestedStitchOutput() -> URL? {
+        guard let first = stitchInputs.first else { return nil }
+        let directory = first.deletingLastPathComponent()
+        let suggestion = URL(
+            fileURLWithPath: suggestedStitchFilename,
+            relativeTo: directory
+        ).standardizedFileURL
+        if !FileManager.default.fileExists(atPath: suggestion.path) {
+            return suggestion
+        }
+        let stem = suggestion.deletingPathExtension().lastPathComponent
+        let ext = suggestion.pathExtension
+        for suffix in 2...999 {
+            let name = "\(stem)-\(suffix).\(ext)"
+            let candidate = directory.appendingPathComponent(name)
+            if !FileManager.default.fileExists(atPath: candidate.path) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
     func addSpacePaths() {
         let panel = NSOpenPanel()
         panel.title = "Choose folders, disks, or volumes to map"
@@ -424,11 +469,11 @@ final class AppModel: ObservableObject {
             "\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString.prefix(8)).json"
         )
         currentSessionURL = session
+        workspaceSessionURL = session
         UserDefaults.standard.set(session.path, forKey: "VidReclaimCurrentSession")
         var arguments = [
             "queue-start", root.path, "--session", session.path, "--plan-only",
         ] + analysisArguments()
-        if visualReview { arguments.append("--review") }
         if deepVerify { arguments.append("--deep-verify") }
         switch sourcePolicy {
         case .keep:
@@ -441,7 +486,7 @@ final class AppModel: ObservableObject {
         run(
             arguments: arguments,
             title: "Planning \(root.lastPathComponent)",
-            section: .activity
+            section: .workspace
         )
     }
 
@@ -454,11 +499,11 @@ final class AppModel: ObservableObject {
             "\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString.prefix(8)).json"
         )
         currentSessionURL = session
+        workspaceSessionURL = session
         UserDefaults.standard.set(session.path, forKey: "VidReclaimCurrentSession")
         var arguments = [
             "queue-start", root.path, "--session", session.path,
         ] + analysisArguments()
-        if visualReview { arguments.append("--review") }
         if deepVerify { arguments.append("--deep-verify") }
         switch sourcePolicy {
         case .keep:
@@ -471,7 +516,7 @@ final class AppModel: ObservableObject {
         run(
             arguments: arguments,
             title: "Queueing \(root.lastPathComponent)",
-            section: .activity
+            section: .workspace
         )
     }
 
@@ -484,10 +529,11 @@ final class AppModel: ObservableObject {
             "--min-reclaim-mb", String(format: "%.0f", minimumReclaimMB),
             "--samples", String(sampleCount),
             "--sample-seconds", String(format: "%.1f", sampleSeconds),
+            "--review-mode", reviewMode,
             "--nice", String(nice),
         ]
         if preserveDVDExtras { arguments.append("--keep-dvd-extras") }
-        if thoroughAnalysis || visualReview {
+        if thoroughAnalysis {
             arguments.append("--thorough-analysis")
         }
         return arguments
@@ -498,7 +544,7 @@ final class AppModel: ObservableObject {
         run(
             arguments: ["queue-resume", session.path],
             title: "Resuming \(queueSession?.name ?? "queue")",
-            section: .activity
+            section: .workspace
         )
     }
 
@@ -644,11 +690,11 @@ final class AppModel: ObservableObject {
         run(
             arguments: arguments,
             title: "Stitching \(stitchInputs.count) clips",
-            section: .stitch
+            section: .workspace
         )
     }
 
-    func runSpaceMap(section: SidebarSection = .space) {
+    func runSpaceMap(section: SidebarSection = .workspace) {
         guard !spacePaths.isEmpty else { return }
         let reportDirectory = sessionsURL.deletingLastPathComponent()
             .appendingPathComponent("Space Scans", isDirectory: true)
@@ -720,28 +766,59 @@ final class AppModel: ObservableObject {
         ).filter(included.contains)
     }
 
+    private var selectedQueueRoot: URL? {
+        let videoURLs = selectedSpaceVideoPaths.map(URL.init(fileURLWithPath:))
+        guard !videoURLs.isEmpty else { return nil }
+        if let scannedRoot = spacePaths.first(where: { candidate in
+            let root = candidate.standardizedFileURL.path
+            let prefix = root.hasSuffix("/") ? root : root + "/"
+            return videoURLs.allSatisfy {
+                let path = $0.standardizedFileURL.path
+                return path == root || path.hasPrefix(prefix)
+            }
+        }) {
+            return scannedRoot
+        }
+        let components = videoURLs.map {
+            $0.standardizedFileURL.pathComponents
+        }
+        guard var common = components.first else { return nil }
+        for pathComponents in components.dropFirst() {
+            var length = 0
+            while length < min(common.count, pathComponents.count),
+                  common[length] == pathComponents[length] {
+                length += 1
+            }
+            common = Array(common.prefix(length))
+        }
+        let commonPath = NSString.path(withComponents: common)
+        guard commonPath != "/",
+              commonPath != "/Volumes",
+              !commonPath.isEmpty else { return nil }
+        return URL(fileURLWithPath: commonPath, isDirectory: true)
+    }
+
+    var canPrepareSelectedVideos: Bool {
+        !selectedSpaceVideoPaths.isEmpty && selectedQueueRoot != nil
+    }
+
+    var queueSelectionIssue: String? {
+        guard !selectedSpaceVideoPaths.isEmpty,
+              selectedQueueRoot == nil else { return nil }
+        return "Selections on different disks must be prepared as separate jobs."
+    }
+
     func queueSelectedSpaceFindings() {
         guard spaceScan != nil else { return }
         let videoPaths = selectedSpaceVideoPaths
-        let reviewPaths = visualReview
-            ? videoPaths : selectedReviewSpaceVideoPaths
+        let reviewPaths = selectedReviewSpaceVideoPaths
         guard !videoPaths.isEmpty else {
             appendLog("Choose at least one video or a folder containing videos.\n")
             return
         }
-        let videoURLs = videoPaths.map(URL.init(fileURLWithPath:))
-        let root = spacePaths.first { candidate in
-            let prefix = candidate.standardizedFileURL.path.hasSuffix("/")
-                ? candidate.standardizedFileURL.path
-                : candidate.standardizedFileURL.path + "/"
-            return videoURLs.allSatisfy {
-                $0.standardizedFileURL.path == candidate.standardizedFileURL.path
-                || $0.standardizedFileURL.path.hasPrefix(prefix)
-            }
-        }
-        guard let root else {
+        guard let root = selectedQueueRoot else {
             appendLog(
-                "Queue selections must be inside one scanned location so folder structure remains unambiguous.\n"
+                "Selections on different disks must be prepared as separate jobs.\n"
             )
             return
         }
@@ -753,12 +830,13 @@ final class AppModel: ObservableObject {
             "\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString.prefix(8)).json"
         )
         currentSessionURL = session
+        workspaceSessionURL = session
         UserDefaults.standard.set(session.path, forKey: "VidReclaimCurrentSession")
         var arguments = [
             "queue-start", root.path, "--session", session.path, "--plan-only",
         ] + videoPaths.flatMap { ["--include-path", $0] } + analysisArguments()
         if !reviewPaths.isEmpty {
-            arguments.append("--review")
+            arguments += ["--review", "--review-interface", "native"]
             arguments += reviewPaths.flatMap { ["--review-path", $0] }
         }
         if deepVerify { arguments.append("--deep-verify") }
@@ -773,7 +851,7 @@ final class AppModel: ObservableObject {
         run(
             arguments: arguments,
             title: "Preparing \(videoPaths.count) selected video\(videoPaths.count == 1 ? "" : "s")",
-            section: .activity
+            section: .workspace
         )
     }
 
@@ -1124,8 +1202,28 @@ struct RunningBanner: View {
                     .foregroundStyle(.secondary)
                 Button("Stop", role: .destructive) { model.cancel() }
             }
-            ProgressView(value: model.overallProgress)
-                .progressViewStyle(.linear)
+            if model.runningQueue, let session = model.queueSession {
+                let scanProgress = session.scanFraction ?? 0
+                let encodeProgress = session.encodeFraction
+                    ?? session.overallFraction
+                HStack(spacing: 14) {
+                    Text("Scan \(scanProgress * 100, specifier: "%.0f")%")
+                        .font(.caption.monospacedDigit())
+                        .frame(width: 72, alignment: .leading)
+                    ProgressView(value: scanProgress)
+                        .progressViewStyle(.linear)
+                    Text(
+                        "Encode \(encodeProgress * 100, specifier: "%.0f")%"
+                    )
+                    .font(.caption.monospacedDigit())
+                    .frame(width: 86, alignment: .leading)
+                    ProgressView(value: encodeProgress)
+                        .progressViewStyle(.linear)
+                }
+            } else {
+                ProgressView(value: model.overallProgress)
+                    .progressViewStyle(.linear)
+            }
         }
         .padding(12)
         .background(.thinMaterial)
@@ -1135,6 +1233,7 @@ struct RunningBanner: View {
 
 struct CompressionSourcePicker: View {
     @ObservedObject var model: AppModel
+    let onContinue: () -> Void
     @State private var searchText = ""
 
     private func flatten(
@@ -1150,9 +1249,13 @@ struct CompressionSourcePicker: View {
         }
     }
 
-    private var findings: [SpaceFindingRow] {
+    private var allFindings: [SpaceFindingRow] {
         guard let root = model.spaceScan?.root else { return [] }
-        let rows = flatten(root.children.sorted { $0.size > $1.size })
+        return flatten(root.children.sorted { $0.size > $1.size })
+    }
+
+    private var findings: [SpaceFindingRow] {
+        let rows = allFindings
         guard !searchText.isEmpty else { return rows }
         return rows.filter {
             $0.finding.name.localizedCaseInsensitiveContains(searchText)
@@ -1160,27 +1263,56 @@ struct CompressionSourcePicker: View {
         }
     }
 
+    private func descendantVideoIDs(_ item: SpaceFinding) -> Set<String> {
+        if item.kind == "video" { return [item.id] }
+        return Set(item.children.flatMap {
+            Array(descendantVideoIDs($0))
+        })
+    }
+
+    private func selectionIcon(
+        for item: SpaceFinding,
+        in selected: Set<String>
+    ) -> String {
+        let descendants = descendantVideoIDs(item)
+        guard !descendants.isEmpty else { return "square" }
+        let selectedCount = descendants.intersection(selected).count
+        if selectedCount == 0 { return "square" }
+        return selectedCount == descendants.count
+            ? "checkmark.square.fill" : "minus.square.fill"
+    }
+
     private func toggleAnalysis(_ item: SpaceFinding) {
-        if model.selectedSpaceFindingIDs.contains(item.id) {
-            model.selectedSpaceFindingIDs.remove(item.id)
-            model.selectedReviewSpaceFindingIDs.remove(item.id)
+        let descendants = descendantVideoIDs(item)
+        guard !descendants.isEmpty else { return }
+        if descendants.isSubset(of: model.selectedSpaceFindingIDs) {
+            model.selectedSpaceFindingIDs.subtract(descendants)
+            model.selectedReviewSpaceFindingIDs.subtract(descendants)
         } else {
-            model.selectedSpaceFindingIDs.insert(item.id)
+            model.selectedSpaceFindingIDs.formUnion(descendants)
         }
     }
 
     private func toggleReview(_ item: SpaceFinding) {
-        if model.selectedReviewSpaceFindingIDs.contains(item.id) {
-            model.selectedReviewSpaceFindingIDs.remove(item.id)
+        let descendants = descendantVideoIDs(item)
+        guard !descendants.isEmpty else { return }
+        if descendants.isSubset(of: model.selectedReviewSpaceFindingIDs) {
+            model.selectedReviewSpaceFindingIDs.subtract(descendants)
         } else {
-            model.selectedReviewSpaceFindingIDs.insert(item.id)
-            model.selectedSpaceFindingIDs.insert(item.id)
+            model.selectedReviewSpaceFindingIDs.formUnion(descendants)
+            model.selectedSpaceFindingIDs.formUnion(descendants)
         }
     }
 
     var body: some View {
-        GroupBox("1. Choose locations, then choose their contents") {
+        GroupBox("Library selection") {
             VStack(alignment: .leading, spacing: 12) {
+                Label(
+                    "Step 1 — Choose locations",
+                    systemImage: model.spaceScan == nil
+                        ? "1.circle.fill" : "checkmark.circle.fill"
+                )
+                .font(.headline)
                 HStack {
                     Button("Add Folders, Files, or Disks…") {
                         model.addSpacePaths()
@@ -1197,7 +1329,7 @@ struct CompressionSourcePicker: View {
                         model.spaceScan == nil
                             ? "Scan Locations" : "Scan Again"
                     ) {
-                        model.runSpaceMap(section: .compress)
+                        model.runSpaceMap(section: .workspace)
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(model.spacePaths.isEmpty || model.isRunning)
@@ -1241,11 +1373,19 @@ struct CompressionSourcePicker: View {
                     }
                     .frame(minHeight: 135, maxHeight: 190)
                 } else {
+                    Label(
+                        "Step 2 — Choose content",
+                        systemImage: "2.circle.fill"
+                    )
+                    .font(.headline)
                     HStack {
                         TextField("Filter scanned contents", text: $searchText)
                             .textFieldStyle(.roundedBorder)
                             .frame(maxWidth: 320)
                         Spacer()
+                        Text("Size")
+                            .font(.caption.bold())
+                            .frame(width: 90, alignment: .trailing)
                         Text("Analyze")
                             .font(.caption.bold())
                             .frame(width: 58)
@@ -1286,27 +1426,28 @@ struct CompressionSourcePicker: View {
                                     toggleAnalysis(item)
                                 } label: {
                                     Image(
-                                        systemName: model.selectedSpaceFindingIDs
-                                            .contains(item.id)
-                                            ? "checkmark.square.fill" : "square"
+                                        systemName: selectionIcon(
+                                            for: item,
+                                            in: model.selectedSpaceFindingIDs
+                                        )
                                     )
                                 }
                                 .buttonStyle(.plain)
                                 .frame(width: 58)
-                                .disabled(!item.isQueueSelectable)
+                                .disabled(descendantVideoIDs(item).isEmpty)
                                 Button {
                                     toggleReview(item)
                                 } label: {
                                     Image(
-                                        systemName: model
-                                            .selectedReviewSpaceFindingIDs
-                                            .contains(item.id)
-                                            ? "checkmark.square.fill" : "square"
+                                        systemName: selectionIcon(
+                                            for: item,
+                                            in: model.selectedReviewSpaceFindingIDs
+                                        )
                                     )
                                 }
                                 .buttonStyle(.plain)
                                 .frame(width: 40)
-                                .disabled(!item.isQueueSelectable)
+                                .disabled(descendantVideoIDs(item).isEmpty)
                                 .help("Generate side-by-side samples")
                             }
                         }
@@ -1327,12 +1468,28 @@ struct CompressionSourcePicker: View {
                             .foregroundStyle(.secondary)
                         }
                         Spacer()
-                        Button("Select All Videos") {
-                            model.selectedSpaceFindingIDs = Set(
-                                findings
-                                    .filter { $0.finding.kind == "video" }
-                                    .map(\.finding.id)
+                        let everyVideoID = Set(
+                            allFindings
+                                .filter { $0.finding.kind == "video" }
+                                .map(\.finding.id)
+                        )
+                        let allSelected = !everyVideoID.isEmpty
+                            && everyVideoID.isSubset(
+                                of: model.selectedSpaceFindingIDs
                             )
+                        Button(allSelected ? "Deselect All" : "Select All") {
+                            if allSelected {
+                                model.selectedSpaceFindingIDs.subtract(
+                                    everyVideoID
+                                )
+                                model.selectedReviewSpaceFindingIDs.subtract(
+                                    everyVideoID
+                                )
+                            } else {
+                                model.selectedSpaceFindingIDs.formUnion(
+                                    everyVideoID
+                                )
+                            }
                         }
                         Button("Clear Content Selection") {
                             model.selectedSpaceFindingIDs.removeAll()
@@ -1340,8 +1497,28 @@ struct CompressionSourcePicker: View {
                         }
                         .disabled(model.selectedSpaceFindingIDs.isEmpty)
                     }
+
+                    HStack {
+                        Label(
+                            "Choose SBS only where a visual spot-check is useful.",
+                            systemImage: "rectangle.split.2x1"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Continue to Encode Settings") {
+                            onContinue()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!model.canPrepareSelectedVideos)
+                    }
                 }
 
+                if let issue = model.queueSelectionIssue {
+                    Label(issue, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
                 Text(
                     "You can change scan settings or locations and scan again after completion or cancellation. SBS is optional and runs only for checked content."
                 )
@@ -1366,19 +1543,228 @@ struct CompressionSourcePicker: View {
     }
 }
 
+struct ReviewFrameView: View {
+    let title: String
+    let path: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title)
+                .font(.caption.bold())
+                .foregroundStyle(.secondary)
+            if let image = NSImage(contentsOfFile: path) {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxWidth: 260, maxHeight: 160)
+                    .background(Color.black)
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+            } else {
+                ContentUnavailableView(
+                    "Frame unavailable",
+                    systemImage: "photo.badge.exclamationmark"
+                )
+                .frame(width: 220, height: 130)
+            }
+        }
+    }
+}
+
+struct NativeSBSReviewView: View {
+    @ObservedObject var model: AppModel
+    let item: QueueItem
+    @State private var isExpanded: Bool
+
+    init(
+        model: AppModel,
+        item: QueueItem,
+        initiallyExpanded: Bool
+    ) {
+        self.model = model
+        self.item = item
+        _isExpanded = State(initialValue: initiallyExpanded)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.name)
+                        .font(.headline)
+                    Text(item.path)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                if let savings = item.projectedSavingsPct {
+                    Text(
+                        "\(savings, specifier: "%.1f")% projected savings"
+                    )
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                }
+                Button(isExpanded ? "Hide Frames" : "Compare Frames") {
+                    withAnimation { isExpanded.toggle() }
+                }
+                Button {
+                    model.queueControl(
+                        item.isIncluded ? "exclude" : "include",
+                        itemID: item.id
+                    )
+                } label: {
+                    Label(
+                        item.isIncluded
+                            ? "Included" : "Excluded",
+                        systemImage: item.isIncluded
+                            ? "checkmark.circle.fill" : "circle"
+                    )
+                }
+                .buttonStyle(.bordered)
+                .tint(item.isIncluded ? Color.accentColor : Color.secondary)
+            }
+
+            if isExpanded {
+                ScrollView(.horizontal) {
+                    HStack(alignment: .top, spacing: 14) {
+                        ForEach(item.reviewPairs ?? []) { pair in
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(pair.time)
+                                    .font(.caption.monospacedDigit())
+                                HStack(spacing: 8) {
+                                    ReviewFrameView(
+                                        title: "Source",
+                                        path: pair.before
+                                    )
+                                    ReviewFrameView(
+                                        title: "Planned",
+                                        path: pair.after
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .background(
+            Color(nsColor: .controlBackgroundColor),
+            in: RoundedRectangle(cornerRadius: 10)
+        )
+    }
+}
+
+struct PreparedQueueView: View {
+    @ObservedObject var model: AppModel
+    let session: QueueSession
+    let onAdjust: () -> Void
+
+    private var reviewItems: [QueueItem] {
+        session.items.filter { !($0.reviewPairs ?? []).isEmpty }
+    }
+
+    private var includedCount: Int {
+        session.items.filter {
+            $0.isIncluded && !$0.isProcessed && $0.status != "skipped"
+        }.count
+    }
+
+    var body: some View {
+        GroupBox("Step 4 — Review and proceed") {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Label(session.summary, systemImage: "checkmark.circle.fill")
+                        .font(.headline)
+                    Spacer()
+                    Text("\(includedCount) included")
+                        .foregroundStyle(.secondary)
+                }
+
+                if !reviewItems.isEmpty {
+                    Text(
+                        "Compare the selected frames here. Exclude any video you do not want encoded."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    ForEach(
+                        Array(reviewItems.enumerated()),
+                        id: \.element.id
+                    ) { index, item in
+                        NativeSBSReviewView(
+                            model: model,
+                            item: item,
+                            initiallyExpanded: index == 0
+                        )
+                    }
+                } else {
+                    Label(
+                        "Analysis is ready. No side-by-side checks were requested.",
+                        systemImage: "bolt.fill"
+                    )
+                    .foregroundStyle(.secondary)
+                }
+
+                HStack {
+                    Button("Adjust Selection or Settings") {
+                        onAdjust()
+                    }
+                    Spacer()
+                    Button("Manage Detailed Queue") {
+                        model.selection = .activity
+                    }
+                    Button("Start Selected Encodes") {
+                        model.resumeQueue()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(
+                        includedCount == 0
+                        || model.isRunning
+                        || !["paused", "queued"].contains(session.status)
+                    )
+                }
+            }
+            .padding(.top, 6)
+        }
+    }
+}
+
 struct CompressView: View {
     @ObservedObject var model: AppModel
     @State private var confirmDeletion = false
 
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 22) {
-                SectionHeading(
-                    title: "Compress",
-                    subtitle: "Find wasteful encodes, preserve worthwhile detail, and skip files that will not reclaim enough space."
-                )
-                CompressionSourcePicker(model: model)
+    private var preparedSession: QueueSession? {
+        guard model.workspaceSessionURL == model.currentSessionURL,
+              let session = model.queueSession,
+              ["paused", "queued", "complete", "attention"].contains(
+                session.status
+              ) else { return nil }
+        return session
+    }
 
+    var body: some View {
+        ScrollViewReader { scrollProxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
+                SectionHeading(
+                    title: "Reclaim Space",
+                    subtitle: "Choose library content, analyze worthwhile savings, review selected frames, and start a resumable job."
+                )
+                CompressionSourcePicker(
+                    model: model,
+                    onContinue: {
+                        withAnimation {
+                            scrollProxy.scrollTo(
+                                "encode-settings",
+                                anchor: .top
+                            )
+                        }
+                    }
+                )
+                .id("library-selection")
+
+                Label("Step 3 — Choose encode settings", systemImage: "3.circle.fill")
+                    .font(.headline)
                 GroupBox("Quality and speed") {
                     Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 13) {
                         GridRow {
@@ -1433,6 +1819,7 @@ struct CompressView: View {
                     }
                     .padding(.top, 6)
                 }
+                .id("encode-settings")
 
                 GroupBox("Worthwhile-work threshold") {
                     Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 13) {
@@ -1462,14 +1849,15 @@ struct CompressView: View {
                             "Thorough visual analysis (trial encodes and XPSNR)",
                             isOn: $model.thoroughAnalysis
                         )
-                        Toggle(
-                            "Generate SBS for every selected video",
-                            isOn: $model.visualReview
-                        )
+                        Picker("SBS method", selection: $model.reviewMode) {
+                            Text("Still frames (fast)").tag("frames")
+                            Text("Short samples").tag("clips")
+                        }
+                        .pickerStyle(.segmented)
                         Text(
-                            model.visualReview
-                            ? "Every selected video will receive trial samples. Turn this off to use the per-file SBS checks above."
-                            : "Unchecked videos use fast metadata analysis. Only items checked in the SBS column receive trial clips and screenshots."
+                            model.reviewMode == "frames"
+                            ? "Encodes only a few selected frames. This quickly checks detail and scaling, but cannot reveal motion artifacts."
+                            : "Encodes short samples for a more representative check of motion and compression. This takes longer."
                         )
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -1486,7 +1874,8 @@ struct CompressView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         }
-                        if model.thoroughAnalysis || model.visualReview {
+                        if model.thoroughAnalysis
+                            || model.reviewMode == "clips" {
                             DisclosureGroup("Sampling details") {
                                 HStack {
                                     Stepper(
@@ -1535,8 +1924,7 @@ struct CompressView: View {
                             .lineLimit(2)
                     }
                     Button(
-                        model.visualReview
-                            || !model.selectedReviewSpaceVideoPaths.isEmpty
+                        !model.selectedReviewSpaceVideoPaths.isEmpty
                             ? "Analyze & Review Selection"
                             : "Analyze Selection"
                     ) {
@@ -1548,13 +1936,37 @@ struct CompressView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(
-                        model.selectedSpaceVideoPaths.isEmpty
+                        !model.canPrepareSelectedVideos
                         || model.isRunning
                     )
                 }
+
+                if let preparedSession {
+                    PreparedQueueView(
+                        model: model,
+                        session: preparedSession,
+                        onAdjust: {
+                            withAnimation {
+                                scrollProxy.scrollTo(
+                                    "library-selection",
+                                    anchor: .top
+                                )
+                            }
+                        }
+                    )
+                    .id("review-ready")
+                }
+                }
+                .padding(28)
+                .frame(maxWidth: 880, alignment: .leading)
             }
-            .padding(28)
-            .frame(maxWidth: 880, alignment: .leading)
+            .onChange(of: preparedSession?.id) { _, sessionID in
+                if sessionID != nil {
+                    withAnimation {
+                        scrollProxy.scrollTo("review-ready", anchor: .top)
+                    }
+                }
+            }
         }
         .alert("Permanently delete verified sources?", isPresented: $confirmDeletion) {
             Button("Cancel", role: .cancel) {}
@@ -1575,12 +1987,15 @@ struct StitchView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
             SectionHeading(
-                title: "Stitch",
+                title: "Combine Clips",
                 subtitle: "Join mixed clips in order. VidReclaim normalizes their size, frame rate, and audio, then adds chapter markers."
             )
             HStack {
                 Button("Add Clips or Folders…") { model.addStitchInputs() }
-                Button("Clear") { model.stitchInputs.removeAll() }
+                Button("Clear") {
+                    model.stitchInputs.removeAll()
+                    model.stitchOutput = nil
+                }
                     .disabled(model.stitchInputs.isEmpty || model.isRunning)
                 Spacer()
                 Text("\(model.stitchInputs.count) selected")
@@ -1687,10 +2102,10 @@ struct StitchView: View {
                 )
                 .font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Button("Stitch Video") { model.runStitch() }
+                Button("Combine Videos") { model.runStitch() }
                     .buttonStyle(.borderedProminent)
                     .disabled(
-                        model.stitchInputs.count < 2
+                        !model.canStitchSelection
                         || model.stitchOutput == nil
                         || model.isRunning
                     )
@@ -2764,7 +3179,9 @@ struct ActivityView: View {
                 ContentUnavailableView(
                     "No queue session yet",
                     systemImage: "list.bullet.rectangle",
-                    description: Text("Choose media in Compress, then start a queue.")
+                    description: Text(
+                        "Choose media in the Workspace, then prepare a queue."
+                    )
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -2801,6 +3218,47 @@ struct ActivityView: View {
     }
 }
 
+struct WorkspaceView: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("What would you like to do?")
+                    .font(.headline)
+                Picker(
+                    "Workspace operation",
+                    selection: $model.workspaceOperation
+                ) {
+                    ForEach(WorkspaceOperation.allCases) { operation in
+                        Text(operation.rawValue).tag(operation)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 360)
+                Spacer()
+                if model.queueSession != nil {
+                    Button("Manage Queue") {
+                        model.selection = .activity
+                    }
+                }
+            }
+            .padding(.horizontal, 28)
+            .padding(.vertical, 12)
+            .background(.bar)
+            Divider()
+
+            switch model.workspaceOperation {
+            case .reclaim:
+                CompressView(model: model)
+            case .combine:
+                StitchView(model: model)
+            }
+        }
+    }
+}
+
 struct ContentView: View {
     @ObservedObject var model: AppModel
 
@@ -2813,7 +3271,7 @@ struct ContentView: View {
             .safeAreaInset(edge: .bottom) {
                 VStack(alignment: .leading, spacing: 3) {
                     Label(model.engineStatus, systemImage: model.cliPath == nil ? "xmark.circle" : "checkmark.circle")
-                    Text("Personal media toolkit")
+                    Text("Local processing workspace")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 .padding(12)
@@ -2823,9 +3281,7 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 Group {
                     switch model.selection {
-                    case .compress: CompressView(model: model)
-                    case .stitch: StitchView(model: model)
-                    case .space: SpaceMapView(model: model)
+                    case .workspace: WorkspaceView(model: model)
                     case .activity: ActivityView(model: model)
                     }
                 }

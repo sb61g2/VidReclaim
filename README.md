@@ -13,20 +13,24 @@ preservation.
 ## Native Mac app
 
 The self-contained installer adds `/Applications/VidReclaim.app`, a native
-SwiftUI control center for the full toolkit. It provides Mac file and save
-pickers, clearly explained source-handling modes, a destructive-action
-confirmation for rolling deletion, live whole-job and current-file progress,
-speed and ETA, safe cancellation, and a persistent activity log. Its
-persistent queue can pause, resume, skip, cancel, and reorder individual
-videos. Separate bars report scan and analysis, total batch encoding, and the
-active file. Sessions survive app restarts and reboots.
+SwiftUI workspace. Library scanning, storage prioritization, hierarchical
+selection, encode settings, analysis, side-by-side review, and the decision to
+start encoding form one guided flow. Combining clips is available from the
+same workspace, while Activity holds advanced queue controls and saved jobs.
+The app provides clearly explained source-handling modes, a destructive-action
+confirmation for rolling deletion, live scan, batch, and current-file
+progress, speed and ETA, safe cancellation, and a persistent activity log.
+Sessions survive app restarts and reboots.
 
 The app uses the same installed command-line engine described below. Disk-usage
 findings stay in the native interface and can feed selected files or folders
 directly into a queue. Its unified picking flow first scans user-selected
 library locations, then lets the user independently choose which discovered
 contents to analyze and which smaller subset should receive side-by-side
-samples. The optional screenshot reviewer opens locally in the default browser.
+samples. Parent-folder checks select every descendant and show a mixed state
+when only some children are selected. The optional screenshot reviewer opens
+natively inside the app for workspace-created jobs; the CLI can still use its
+local browser review.
 
 ## What it does
 
@@ -56,8 +60,9 @@ samples. The optional screenshot reviewer opens locally in the default browser.
   separately, with speed and continuously corrected ETAs in an atomic session
   file.
 - Can optionally open a local side-by-side review gallery before the full run.
-- Generates side-by-side samples only for the specifically checked files or
-  folders, so the rest of a large selection stays on the fast metadata path.
+- Generates side-by-side comparisons only for the specifically checked files
+  or folders. Quick mode encodes a few individual frames; short-sample mode
+  spends more time to reveal motion and temporal-compression artifacts.
 - Persists queue order and item state. After a reboot, completed videos remain
   complete and the interrupted video restarts from its beginning; partially
   written MKV/HEVC output is not unsafely appended.
@@ -130,6 +135,10 @@ XPSNR scoring, and the before/after gallery:
 ```bash
 vidreclaim queue-start "/Volumes/Media" --thorough-analysis --review
 ```
+
+Side-by-side review uses quick still frames by default. Add
+`--review-mode clips` when motion artifacts are important enough to justify
+short trial encodes.
 
 The browser UI is served only on `127.0.0.1`. Each proposed job has up to three
 draggable source/new comparisons and an Encode checkbox. Submitting the page
@@ -220,7 +229,8 @@ vidreclaim space "$HOME/Movies" "$HOME/Downloads"
 ```
 
 The native app embeds the complete findings, supports filtering and size
-ordering, and lets a user select videos or whole directories for a new queue.
+ordering, and lets a user select videos or whole directories within the main
+library workflow.
 Exact video paths from those findings are passed to the planner, avoiding
 another full-tree discovery walk. Selections must belong to one scanned
 location per queue so source-relative output paths remain unambiguous.

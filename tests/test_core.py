@@ -230,6 +230,33 @@ class ReviewTests(unittest.TestCase):
             )
         self.assertEqual([1], [card["plan_index"] for card in cards])
 
+    def test_still_frame_review_uses_fast_selected_snapshots(self) -> None:
+        candidate = Candidate(1920, 1080, 22)
+        plan = Plan(
+            media(Path("/media/movie.mkv"), 1920, 1080),
+            "encode",
+            "test",
+            candidate=candidate,
+            candidates=[candidate],
+        )
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch("vidreclaim.review._snapshot") as snapshot,
+            mock.patch(
+                "vidreclaim.review._encode_review_frame",
+            ) as encode_frame,
+        ):
+            cards = build_review_assets(
+                [plan],
+                session_dir=Path(temporary),
+                sample_seconds=10,
+                mode="frames",
+                sample_count=2,
+            )
+        self.assertEqual(2, len(cards[0]["pairs"]))
+        self.assertEqual(2, encode_frame.call_count)
+        self.assertEqual(4, snapshot.call_count)
+
 
 class StitchTests(unittest.TestCase):
     def test_natural_order_places_clip_2_before_clip_10(self) -> None:

@@ -17,7 +17,7 @@ from .dvd import probe_dvd
 from .model import MediaInfo, Plan, PROFILES, Source
 from .planner import analyze, analyze_fast
 from .probe import probe_file
-from .review import review_in_browser
+from .review import build_review_assets, review_in_browser
 from .runner import (
     EncodeControl,
     archive_and_replace_file,
@@ -720,7 +720,11 @@ def _prepare_session(store: SessionStore) -> tuple[list[Plan], list[dict[str, An
         review_this_media = selected_for_review(media.source.path)
         media_settings = dict(settings)
         media_settings["thorough_analysis"] = bool(
-            settings.get("thorough_analysis", False) or review_this_media
+            settings.get("thorough_analysis", False)
+            or (
+                review_this_media
+                and settings.get("review_mode", "clips") == "clips"
+            )
         )
 
         def report_sample(done: int, total: int, detail: str) -> None:
@@ -790,28 +794,57 @@ def _prepare_session(store: SessionStore) -> tuple[list[Plan], list[dict[str, An
             })
 
         store.mutate(review_phase)
-        approved = review_in_browser(
-            plans,
-            session_dir=assets_dir,
-            decisions_path=store.path.with_suffix(".review.json"),
-            sample_seconds=settings["sample_seconds"],
-            plan_indices=review_plan_indices if targeted_review else None,
-        )
-        for index, plan in enumerate(plans):
-            if (
-                plan.status == "encode"
-                and (not targeted_review or index in review_plan_indices)
-                and index not in approved
-            ):
-                plan.status = "skip"
-                plan.reason = "skipped in visual review"
+        review_options = {
+            "session_dir": assets_dir,
+            "sample_seconds": settings["sample_seconds"],
+            "plan_indices": (
+                review_plan_indices if targeted_review else None
+            ),
+            "mode": settings.get("review_mode", "clips"),
+            "sample_count": settings.get("samples", 3),
+            "encoder": settings["encoder"],
+            "preset": settings["preset"],
+            "profile_name": settings["profile"],
+        }
+        if settings.get("review_interface") == "native":
+            cards = build_review_assets(plans, **review_options)
+            for card in cards:
+                plan = plans[int(card["plan_index"])]
+                pairs = [
+                    {
+                        "before": str(assets_dir / pair["before"]),
+                        "after": str(assets_dir / pair["after"]),
+                        "time": pair["time"],
+                    }
+                    for pair in card["pairs"]
+                ]
                 _update_item(
                     store,
                     _item_id(plan.media.source.key),
-                    status="skipped",
-                    message=plan.reason,
-                    plan=plan.to_dict(),
+                    review_pairs=pairs,
+                    message="Side-by-side review ready",
                 )
+        else:
+            approved = review_in_browser(
+                plans,
+                decisions_path=store.path.with_suffix(".review.json"),
+                **review_options,
+            )
+            for index, plan in enumerate(plans):
+                if (
+                    plan.status == "encode"
+                    and (not targeted_review or index in review_plan_indices)
+                    and index not in approved
+                ):
+                    plan.status = "skip"
+                    plan.reason = "skipped in visual review"
+                    _update_item(
+                        store,
+                        _item_id(plan.media.source.key),
+                        status="skipped",
+                        message=plan.reason,
+                        plan=plan.to_dict(),
+                    )
 
     def ready(data: dict[str, Any]) -> None:
         queued = sum(

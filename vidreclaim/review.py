@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Iterable
 
 from .dvd import handbrake_input_args
-from .model import Plan
+from .model import PROFILES, Plan
+from .planner import ffmpeg_video_args, sample_offsets
 from .util import CommandError, atomic_write_json, duration_text, human_bytes, run
 
 
@@ -45,12 +46,63 @@ def _dvd_reference_clip(plan: Plan, offset: float, seconds: float, output: Path)
     ])
 
 
+def _encode_review_frame(
+    plan: Plan,
+    at: float,
+    output: Path,
+    *,
+    encoder: str,
+    preset: str,
+    profile_name: str,
+) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if plan.candidate is None:
+        raise CommandError("Review frame has no encode candidate")
+    if plan.media.source.kind == "dvd":
+        run([
+            "HandBrakeCLI", *handbrake_input_args(plan.media.source),
+            "--output", str(output), "--format", "av_mkv",
+            "--start-at", f"seconds:{round(at)}",
+            "--stop-at", "seconds:1",
+            "--encoder", (
+                "x265_10bit"
+                if plan.media.bit_depth > 8 or plan.media.hdr else "x265"
+            ),
+            "--encoder-preset", preset,
+            "--quality", str(plan.candidate.crf),
+            "--audio", "none", "--subtitle", "none",
+            "--comb-detect", "--decomb",
+        ])
+        return
+    run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-ss", f"{max(0.0, at):.3f}",
+        "-i", str(plan.media.source.path),
+        "-map", f"0:{plan.media.video_stream_index}",
+        "-frames:v", "1", "-an", "-sn", "-dn",
+        *ffmpeg_video_args(
+            plan.media,
+            plan.candidate,
+            encoder=encoder,  # type: ignore[arg-type]
+            preset=preset,
+            profile=PROFILES[profile_name],
+        ),
+        "-map_metadata", "-1",
+        str(output),
+    ])
+
+
 def build_review_assets(
     plans: list[Plan],
     *,
     session_dir: Path,
     sample_seconds: float,
     plan_indices: set[int] | None = None,
+    mode: str = "clips",
+    sample_count: int = 3,
+    encoder: str = "x265",
+    preset: str = "medium",
+    profile_name: str = "balanced",
 ) -> list[dict[str, object]]:
     cards: list[dict[str, object]] = []
     for plan_index, plan in enumerate(plans):
@@ -63,31 +115,60 @@ def build_review_assets(
         except ValueError:
             continue
         pairs: list[dict[str, str]] = []
-        for sample_index, offset in enumerate(plan.sample_offsets[:3]):
-            clip = (
-                session_dir / "clips" / str(plan_index)
-                / f"candidate-{candidate_index}-sample-{sample_index}.mkv"
-            )
-            if not clip.exists():
-                raise CommandError(f"Review sample is missing: {clip}")
+        offsets = (
+            sample_offsets(plan.media.duration, 0.1, sample_count)
+            if mode == "frames"
+            else plan.sample_offsets[:3]
+        )
+        for sample_index, offset in enumerate(offsets):
             before = session_dir / "images" / f"{plan_index}-{sample_index}-before.jpg"
             after = session_dir / "images" / f"{plan_index}-{sample_index}-after.jpg"
-            middle = min(sample_seconds / 2, max(0.0, plan.media.duration - offset - 0.1))
+            middle = (
+                0.0 if mode == "frames"
+                else min(
+                    sample_seconds / 2,
+                    max(0.0, plan.media.duration - offset - 0.1),
+                )
+            )
             filters: list[str] = []
             if plan.media.field_order not in {"progressive", "unknown", ""}:
                 filters.append("bwdif=mode=send_frame:parity=auto:deint=interlaced")
             if plan.media.source.kind == "dvd":
-                reference_clip = (
-                    session_dir / "clips" / str(plan_index)
-                    / f"reference-{sample_index}.mkv"
+                reference = (
+                    session_dir / "frames" / str(plan_index)
+                    / f"source-{sample_index}.mkv"
                 )
-                _dvd_reference_clip(plan, offset, sample_seconds, reference_clip)
-                _snapshot(reference_clip, middle, before, [])
+                _dvd_reference_clip(
+                    plan,
+                    offset,
+                    1.0 if mode == "frames" else sample_seconds,
+                    reference,
+                )
+                _snapshot(reference, middle, before, [])
             else:
                 _snapshot(
                     plan.media.source.path, offset + middle, before, filters,
                     stream_index=plan.media.video_stream_index,
                 )
+            clip = (
+                session_dir / "clips" / str(plan_index)
+                / f"candidate-{candidate_index}-sample-{sample_index}.mkv"
+            )
+            if mode == "frames":
+                clip = (
+                    session_dir / "frames" / str(plan_index)
+                    / f"candidate-{sample_index}.mkv"
+                )
+                _encode_review_frame(
+                    plan,
+                    offset,
+                    clip,
+                    encoder=encoder,
+                    preset=preset,
+                    profile_name=profile_name,
+                )
+            elif not clip.exists():
+                raise CommandError(f"Review sample is missing: {clip}")
             _snapshot(clip, middle, after, [])
             pairs.append({
                 "before": str(before.relative_to(session_dir)),
@@ -238,12 +319,22 @@ def review_in_browser(
     decisions_path: Path,
     sample_seconds: float,
     plan_indices: set[int] | None = None,
+    mode: str = "clips",
+    sample_count: int = 3,
+    encoder: str = "x265",
+    preset: str = "medium",
+    profile_name: str = "balanced",
 ) -> set[int]:
     cards = build_review_assets(
         plans,
         session_dir=session_dir,
         sample_seconds=sample_seconds,
         plan_indices=plan_indices,
+        mode=mode,
+        sample_count=sample_count,
+        encoder=encoder,
+        preset=preset,
+        profile_name=profile_name,
     )
     if not cards:
         return set()
