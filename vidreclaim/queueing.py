@@ -30,7 +30,9 @@ from .runner import (
 from .util import CommandError, atomic_write_json
 
 
-TERMINAL_ITEM_STATES = {"complete", "skipped", "cancelled", "error"}
+TERMINAL_ITEM_STATES = {
+    "complete", "processed", "skipped", "cancelled", "error",
+}
 RUNNABLE_ITEM_STATES = {"ready"}
 
 
@@ -136,7 +138,7 @@ def create_session(
         raise CommandError(f"Root does not exist: {root}")
     now = time.time()
     data = {
-        "schema": 2,
+        "schema": 3,
         "id": uuid.uuid4().hex,
         "name": root.name or str(root),
         "root": str(root),
@@ -162,6 +164,142 @@ def _cache_path() -> Path:
     return Path.home() / "Library" / "Caches" / "VidReclaim" / "probes.json"
 
 
+def _processed_catalog_path() -> Path:
+    override = os.environ.get("VIDRECLAIM_CATALOG_PATH")
+    if override:
+        return Path(override).expanduser().resolve()
+    return (
+        Path.home()
+        / "Library"
+        / "Application Support"
+        / "VidReclaim"
+        / "processed-media.json"
+    )
+
+
+def _load_processed_catalog() -> dict[str, Any]:
+    try:
+        data = json.loads(
+            _processed_catalog_path().read_text(encoding="utf-8"),
+        )
+        return data if data.get("schema") == 1 else {"schema": 1, "entries": {}}
+    except (OSError, json.JSONDecodeError):
+        return {"schema": 1, "entries": {}}
+
+
+def _catalog_key(root: Path, source: Source) -> str:
+    identity = f"{root.resolve()}|{source.key}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _processed_record(
+    root: Path,
+    source: Source,
+    catalog: dict[str, Any],
+) -> dict[str, Any] | None:
+    entries = catalog.get("entries", {})
+    record = entries.get(_catalog_key(root, source))
+    matched_output = False
+    if not record:
+        output_key = catalog.get("outputs", {}).get(
+            str(source.path.resolve()),
+        )
+        record = entries.get(output_key) if output_key else None
+        matched_output = record is not None
+    if not record:
+        return None
+    try:
+        signature = _source_signature(source)
+    except OSError:
+        return None
+    fields = (
+        ("output_signature", "final_source_signature")
+        if matched_output else
+        ("source_signature", "final_source_signature")
+    )
+    valid_signatures = {
+        record.get(field) for field in fields if record.get(field)
+    }
+    if signature not in valid_signatures:
+        return None
+    output = record.get("output")
+    if output and not Path(output).exists():
+        return None
+    return record
+
+
+def _save_processed_record(
+    root: Path,
+    source: Source,
+    *,
+    item: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    path = _processed_catalog_path()
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            catalog = _load_processed_catalog()
+            final_signature = None
+            try:
+                final_signature = _source_signature(source)
+            except OSError:
+                pass
+            entry_key = _catalog_key(root, source)
+            output = result.get("output")
+            output_signature = None
+            if output:
+                try:
+                    output_signature = _source_signature(Source(Path(output)))
+                except OSError:
+                    pass
+            catalog.setdefault("entries", {})[entry_key] = {
+                "root": str(root.resolve()),
+                "source_path": str(source.path),
+                "source_kind": source.kind,
+                "dvd_title": source.dvd_title,
+                "source_signature": item.get("source_signature"),
+                "final_source_signature": final_signature,
+                "source_bytes": item.get("source_bytes"),
+                "output": output,
+                "output_signature": output_signature,
+                "output_bytes": result.get("output_bytes"),
+                "actual_savings_pct": result.get("actual_savings_pct"),
+                "encode_elapsed_seconds": result.get("encode_elapsed_seconds"),
+                "completed_at_unix": result.get("completed_at_unix"),
+            }
+            if output:
+                catalog.setdefault("outputs", {})[
+                    str(Path(output).resolve())
+                ] = entry_key
+            atomic_write_json(path, catalog)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _mark_item_from_processed_record(
+    item: dict[str, Any],
+    record: dict[str, Any],
+) -> None:
+    item.update({
+        "status": "processed",
+        "selected": False,
+        "processed": True,
+        "progress": 1.0,
+        "message": "Already processed; hidden by default",
+        "source_bytes": record.get("source_bytes") or item.get("source_bytes"),
+        "output": record.get("output"),
+        "output_bytes": record.get("output_bytes"),
+        "actual_savings_pct": record.get("actual_savings_pct"),
+        "encode_elapsed_seconds": (
+            record.get("encode_elapsed_seconds") or 0.0
+        ),
+        "completed_at_unix": record.get("completed_at_unix"),
+    })
+
+
 def _load_probe_cache() -> dict[str, Any]:
     try:
         data = json.loads(_cache_path().read_text(encoding="utf-8"))
@@ -183,24 +321,65 @@ def _probe_cached(source: Source, cache: dict[str, Any]) -> MediaInfo:
     return probe_file(source)
 
 
-def _new_item(source: Source, order: int, status: str = "probing") -> dict[str, Any]:
+def _relative_item_location(root: Path, source: Source) -> tuple[str, str]:
+    resolved_root = root.resolve()
+    source_path = source.path.resolve()
+    if source.kind == "dvd":
+        display_path = source_path.parent
+        base = resolved_root.parent if resolved_root.is_file() else resolved_root
+    else:
+        display_path = source_path
+        base = resolved_root.parent if resolved_root.is_file() else resolved_root
+    try:
+        relative = display_path.relative_to(base)
+    except ValueError:
+        relative = Path(display_path.name)
+    if source.kind == "dvd" and source.dvd_title is not None:
+        relative = relative / f"Title {source.dvd_title:02d}"
+    folder = relative.parent
+    folder_text = "" if str(folder) == "." else folder.as_posix()
+    return relative.as_posix(), folder_text
+
+
+def _new_item(
+    source: Source,
+    order: int,
+    *,
+    root: Path,
+    status: str = "probing",
+) -> dict[str, Any]:
+    relative_path, relative_folder = _relative_item_location(root, source)
+    try:
+        signature = _source_signature(source)
+    except OSError:
+        signature = None
     return {
         "id": _item_id(source.key),
         "order": order,
         "name": source.display_name or source.path.name,
         "path": str(source.path),
+        "relative_path": relative_path,
+        "relative_folder": relative_folder,
+        "source_signature": signature,
         "source": _source_dict(source),
         "status": status,
+        "selected": True,
+        "processed": False,
         "requested_action": None,
         "progress": 0.0,
         "speed_x": None,
         "eta_seconds": None,
+        "projected_encode_seconds": None,
+        "encode_elapsed_seconds": 0.0,
+        "encode_started_at_unix": None,
         "duration": None,
         "source_bytes": (
             source.path.stat().st_size if source.kind == "file" else None
         ),
         "projected_bytes": None,
         "projected_savings_pct": None,
+        "output_bytes": None,
+        "actual_savings_pct": None,
         "output": None,
         "message": "Reading stream metadata",
         "plan": None,
@@ -314,17 +493,44 @@ def _prepare_session(store: SessionStore) -> tuple[list[Plan], list[dict[str, An
     settings = session["settings"]
     root = Path(session["root"])
     output_root = Path(settings["output_dir"])
-    sources = list(discover(root))
+    include_paths = [
+        Path(value).expanduser().resolve()
+        for value in settings.get("include_paths", [])
+    ]
+    if include_paths:
+        sources_by_key: dict[str, Source] = {}
+        for include_path in include_paths:
+            try:
+                include_path.relative_to(root.resolve())
+            except ValueError as error:
+                raise CommandError(
+                    f"Selected path is outside the queue root: {include_path}",
+                ) from error
+            for source in discover(include_path):
+                sources_by_key.setdefault(source.key, source)
+        sources = list(sources_by_key.values())
+    else:
+        sources = list(discover(root))
     min_reclaim_bytes = round(settings["min_reclaim_mb"] * 1024 * 1024)
+    processed_catalog = _load_processed_catalog()
+    processed_source_keys: set[str] = set()
     items: list[dict[str, Any]] = []
     for order, source in enumerate(sources):
-        item = _new_item(source, order)
-        if (
+        item = _new_item(source, order, root=root)
+        record = (
+            _processed_record(root, source, processed_catalog)
+            if source.kind == "file" else None
+        )
+        if record:
+            _mark_item_from_processed_record(item, record)
+            processed_source_keys.add(source.key)
+        elif (
             source.kind == "file"
             and source.path.stat().st_size <= min_reclaim_bytes
         ):
             item.update({
                 "status": "skipped",
+                "selected": False,
                 "message": "File is smaller than the minimum reclaim threshold",
             })
         items.append(item)
@@ -344,7 +550,11 @@ def _prepare_session(store: SessionStore) -> tuple[list[Plan], list[dict[str, An
     cache = _load_probe_cache()
     file_sources = [
         source for source in sources
-        if source.kind == "file" and source.path.stat().st_size > min_reclaim_bytes
+        if (
+            source.kind == "file"
+            and source.key not in processed_source_keys
+            and source.path.stat().st_size > min_reclaim_bytes
+        )
     ]
     media_by_key: dict[str, MediaInfo] = {}
     workers = max(1, min(int(settings.get("scan_workers", 6)), 12))
@@ -396,7 +606,7 @@ def _prepare_session(store: SessionStore) -> tuple[list[Plan], list[dict[str, An
                     title.index for title in all_titles if title.index not in chosen
                 ],
             })
-            dvd_media.extend(selected)
+            unprocessed_media: list[MediaInfo] = []
 
             def expand_dvd(data: dict[str, Any]) -> None:
                 index = next(
@@ -411,18 +621,31 @@ def _prepare_session(store: SessionStore) -> tuple[list[Plan], list[dict[str, An
                 base_order = data["items"][index]["order"]
                 replacements = []
                 for offset, media in enumerate(selected):
-                    item = _new_item(media.source, base_order + offset, "analyzing")
-                    item.update({
-                        "duration": media.duration,
-                        "source_bytes": media.size_bytes,
-                        "message": "Choosing resolution and quality",
-                    })
+                    item = _new_item(
+                        media.source,
+                        base_order + offset,
+                        root=root,
+                        status="analyzing",
+                    )
+                    record = _processed_record(
+                        root, media.source, processed_catalog,
+                    )
+                    if record:
+                        _mark_item_from_processed_record(item, record)
+                    else:
+                        unprocessed_media.append(media)
+                        item.update({
+                            "duration": media.duration,
+                            "source_bytes": media.size_bytes,
+                            "message": "Choosing resolution and quality",
+                        })
                     replacements.append(item)
                 data["items"][index:index + 1] = replacements
                 for order, item in enumerate(data["items"]):
                     item["order"] = order
 
             store.mutate(expand_dvd)
+            dvd_media.extend(unprocessed_media)
         except (CommandError, OSError) as error:
             _update_item(
                 store, placeholder_id, status="error", message=str(error),
@@ -471,6 +694,7 @@ def _prepare_session(store: SessionStore) -> tuple[list[Plan], list[dict[str, An
                 store,
                 item_id,
                 status=item_status,
+                selected=item_status == "ready",
                 progress=0.0,
                 message=plan.reason,
                 projected_bytes=(
@@ -480,6 +704,9 @@ def _prepare_session(store: SessionStore) -> tuple[list[Plan], list[dict[str, An
                     candidate.savings_pct if candidate else None
                 ),
                 eta_seconds=(
+                    candidate.projected_encode_seconds if candidate else None
+                ),
+                projected_encode_seconds=(
                     candidate.projected_encode_seconds if candidate else None
                 ),
                 output=str(plan.output) if plan.output else None,
@@ -518,11 +745,14 @@ def _prepare_session(store: SessionStore) -> tuple[list[Plan], list[dict[str, An
                 )
 
     def ready(data: dict[str, Any]) -> None:
-        queued = sum(item["status"] == "ready" for item in data["items"])
+        queued = sum(
+            item["status"] == "ready" and item.get("selected", True)
+            for item in data["items"]
+        )
         eta = sum(
             float(item.get("eta_seconds") or 0)
             for item in data["items"]
-            if item["status"] == "ready"
+            if item["status"] == "ready" and item.get("selected", True)
         )
         data.update({
             "status": "queued",
@@ -541,7 +771,10 @@ def _session_progress(data: dict[str, Any]) -> tuple[float, float | None]:
     weights = [
         max(float(item.get("duration") or 0), 1.0)
         for item in items
-        if item["status"] not in {"skipped", "cancelled"}
+        if (
+            item.get("selected", True)
+            and item["status"] not in {"processed", "skipped", "cancelled"}
+        )
     ]
     if not weights:
         return 1.0, 0.0
@@ -549,7 +782,10 @@ def _session_progress(data: dict[str, Any]) -> tuple[float, float | None]:
     completed = 0.0
     eta = 0.0
     for item in items:
-        if item["status"] in {"skipped", "cancelled"}:
+        if (
+            not item.get("selected", True)
+            or item["status"] in {"processed", "skipped", "cancelled"}
+        ):
             continue
         weight = max(float(item.get("duration") or 0), 1.0)
         fraction = (
@@ -559,7 +795,10 @@ def _session_progress(data: dict[str, Any]) -> tuple[float, float | None]:
         completed += weight * fraction
         item_eta = item.get("eta_seconds")
         if item["status"] not in TERMINAL_ITEM_STATES and item_eta is not None:
-            eta += max(0.0, float(item_eta) * (1 - fraction))
+            remaining = float(item_eta)
+            if item["status"] not in {"encoding", "verifying", "paused"}:
+                remaining *= 1 - fraction
+            eta += max(0.0, remaining)
     return min(1.0, completed / total), eta
 
 
@@ -573,6 +812,7 @@ def _normalize_interrupted(store: SessionStore) -> None:
                     "status": "ready",
                     "requested_action": None,
                     "progress": 0.0,
+                    "encode_started_at_unix": None,
                     "message": "Interrupted item will restart from the beginning",
                 })
                 plan_data = item.get("plan")
@@ -616,7 +856,7 @@ def run_session(path: Path) -> int:
                 "phase": "Plan ready; start when convenient",
                 "worker_pid": None,
                 "summary": (
-                    f"{sum(item['status'] == 'ready' for item in data['items'])} "
+                    f"{sum(item['status'] == 'ready' and item.get('selected', True) for item in data['items'])} "
                     "item(s) ready to encode"
                 ),
             })
@@ -641,7 +881,10 @@ def run_session(path: Path) -> int:
         ready_items = sorted(
             (
                 item for item in session["items"]
-                if item["status"] in RUNNABLE_ITEM_STATES
+                if (
+                    item["status"] in RUNNABLE_ITEM_STATES
+                    and item.get("selected", True)
+                )
             ),
             key=lambda item: item["order"],
         )
@@ -652,12 +895,31 @@ def run_session(path: Path) -> int:
         plan = Plan.from_dict(item["plan"])
         label = item["name"]
         print(f"Queue: encoding {label}", flush=True)
+        elapsed_base = float(item.get("encode_elapsed_seconds") or 0.0)
+        active_since: float | None = time.monotonic()
+
+        def elapsed_now() -> float:
+            active = (
+                time.monotonic() - active_since
+                if active_since is not None else 0.0
+            )
+            return elapsed_base + active
+
+        def update_elapsed_clock(action: str) -> None:
+            nonlocal elapsed_base, active_since
+            if action == "pause" and active_since is not None:
+                elapsed_base += time.monotonic() - active_since
+                active_since = None
+            elif action == "run" and active_since is None:
+                active_since = time.monotonic()
+
         _update_item(
             store,
             item_id,
             status="encoding",
             requested_action=None,
             progress=0.0,
+            encode_started_at_unix=time.time(),
             message="Encoding",
         )
 
@@ -668,12 +930,14 @@ def run_session(path: Path) -> int:
                 if candidate["id"] == item_id
             )
             action = latest.get("requested_action") or "run"
+            update_elapsed_clock(action)
             desired_status = "paused" if action == "pause" else "encoding"
             if latest["status"] != desired_status and action in {"pause", "run"}:
                 _update_item(
                     store,
                     item_id,
                     status=desired_status,
+                    encode_elapsed_seconds=elapsed_now(),
                     message="Paused" if action == "pause" else "Encoding",
                 )
             return action
@@ -689,6 +953,7 @@ def run_session(path: Path) -> int:
                 progress=min(1.0, max(0.0, fraction)),
                 speed_x=speed,
                 eta_seconds=remaining,
+                encode_elapsed_seconds=elapsed_now(),
                 message="Verifying" if fraction >= 1 else "Encoding",
                 status="verifying" if fraction >= 1 else "encoding",
             )
@@ -730,6 +995,10 @@ def run_session(path: Path) -> int:
                 "output": str(result.output),
                 "actual_savings_pct": result.actual_savings_pct,
                 "output_bytes": result.output_bytes,
+                "processed": True,
+                "completed_at_unix": time.time(),
+                "encode_elapsed_seconds": elapsed_now(),
+                "encode_started_at_unix": None,
                 "requested_action": None,
                 "speed_x": None,
                 "eta_seconds": 0.0,
@@ -753,6 +1022,17 @@ def run_session(path: Path) -> int:
                 result_data["deleted_source"] = str(
                     delete_verified_file_source(result)
                 )
+            try:
+                _save_processed_record(
+                    root,
+                    plan.media.source,
+                    item=item,
+                    result=result_data,
+                )
+            except OSError as error:
+                result_data["message"] += (
+                    f"; processed-history update failed: {error}"
+                )
             _update_item(store, item_id, **result_data)
         except EncodeControl as controlled:
             _update_item(
@@ -763,6 +1043,8 @@ def run_session(path: Path) -> int:
                 progress=0.0,
                 speed_x=None,
                 eta_seconds=None,
+                encode_elapsed_seconds=elapsed_now(),
+                encode_started_at_unix=None,
                 message=(
                     "Skipped by user"
                     if controlled.action == "skip"
@@ -777,6 +1059,8 @@ def run_session(path: Path) -> int:
                 status="error",
                 requested_action=None,
                 speed_x=None,
+                encode_elapsed_seconds=elapsed_now(),
+                encode_started_at_unix=None,
                 message=str(error),
             )
 
@@ -827,10 +1111,19 @@ def run_session(path: Path) -> int:
                     )
 
     session = store.read()
-    paused = sum(item["status"] == "paused" for item in session["items"])
-    queued = sum(item["status"] == "ready" for item in session["items"])
+    paused = sum(
+        item["status"] == "paused" and item.get("selected", True)
+        for item in session["items"]
+    )
+    queued = sum(
+        item["status"] == "ready" and item.get("selected", True)
+        for item in session["items"]
+    )
     completed = sum(item["status"] == "complete" for item in session["items"])
-    errors = sum(item["status"] == "error" for item in session["items"])
+    errors = sum(
+        item["status"] == "error" and item.get("selected", True)
+        for item in session["items"]
+    )
     status = "paused" if paused or queued else ("complete" if not errors else "attention")
     phase = "Paused; resume when ready" if status == "paused" else (
         "Queue complete" if status == "complete" else "Completed with errors"
@@ -861,22 +1154,87 @@ def control_session(
     *,
     action: str,
     item_id: str | None = None,
+    item_ids: list[str] | None = None,
+    folder: str | None = None,
 ) -> dict[str, Any]:
     store = SessionStore(path)
 
     def change(data: dict[str, Any]) -> None:
         items = data["items"]
-        targets = (
-            [item for item in items if item["id"] == item_id]
-            if item_id else items
-        )
-        if item_id and not targets:
-            raise CommandError(f"Queue item not found: {item_id}")
+        requested_ids = set(item_ids or [])
+        if item_id:
+            requested_ids.add(item_id)
+
+        def in_folder(item: dict[str, Any]) -> bool:
+            if folder is None:
+                return True
+            normalized = folder.strip("/")
+            candidate = str(item.get("relative_folder") or "").strip("/")
+            return (
+                not normalized
+                or candidate == normalized
+                or candidate.startswith(normalized + "/")
+            )
+
+        targets = [
+            item for item in items
+            if (not requested_ids or item["id"] in requested_ids)
+            and in_folder(item)
+        ]
+        if (
+            not requested_ids
+            and folder is None
+            and action in {"pause", "resume", "cancel", "skip"}
+        ):
+            targets = [
+                item for item in targets if item.get("selected", True)
+            ]
+        missing = requested_ids - {item["id"] for item in targets}
+        if missing:
+            raise CommandError(
+                f"Queue item not found: {sorted(missing)[0]}",
+            )
+        if action == "clear-all":
+            if _pid_is_alive(data.get("worker_pid")) or any(
+                item["status"] in {"encoding", "verifying"}
+                for item in items
+            ):
+                raise CommandError(
+                    "Cancel the running queue before clearing it",
+                )
+            data["items"] = []
+            data.update({
+                "status": "empty",
+                "phase": "Queue cleared",
+                "summary": "Queue is empty",
+                "overall_fraction": 0.0,
+                "eta_seconds": 0.0,
+            })
+            return
+        if action in {"clear-completed", "clear-cancelled", "clear-finished"}:
+            removable = {
+                "clear-completed": {"complete", "processed"},
+                "clear-cancelled": {"cancelled"},
+                "clear-finished": TERMINAL_ITEM_STATES,
+            }[action]
+            data["items"] = [
+                item for item in items if item["status"] not in removable
+            ]
+            for order, item in enumerate(
+                sorted(data["items"], key=lambda value: value["order"]),
+            ):
+                item["order"] = order
+            data["summary"] = f"{len(data['items'])} item(s) remain"
+            return
         if action in {"move-up", "move-down"}:
-            if not item_id:
+            if len(requested_ids) != 1:
                 raise CommandError(f"{action} requires an item id")
             ordered = sorted(items, key=lambda item: item["order"])
-            index = next(i for i, item in enumerate(ordered) if item["id"] == item_id)
+            selected_id = next(iter(requested_ids))
+            index = next(
+                i for i, item in enumerate(ordered)
+                if item["id"] == selected_id
+            )
             other = index - 1 if action == "move-up" else index + 1
             if 0 <= other < len(ordered):
                 ordered[index]["order"], ordered[other]["order"] = (
@@ -884,6 +1242,18 @@ def control_session(
                     ordered[index]["order"],
                 )
             return
+        selection_states = {"ready", "paused", "cancelled", "error"}
+        if action == "only":
+            if not requested_ids:
+                raise CommandError("only requires at least one item id")
+            for item in items:
+                if item["status"] in selection_states:
+                    item["selected"] = item["id"] in requested_ids
+            targets = [item for item in items if item["id"] in requested_ids]
+        elif action in {"include", "exclude"}:
+            for item in targets:
+                if item["status"] in selection_states:
+                    item["selected"] = action == "include"
         for item in targets:
             status = item["status"]
             if action == "pause" and status in {"ready", "encoding"}:
@@ -897,9 +1267,10 @@ def control_session(
                         output = Path(plan_data["output"])
                         output.with_name(f".{output.stem}.part.mkv").unlink(
                             missing_ok=True
-                        )
+                    )
                 item["requested_action"] = None
                 item["status"] = "ready"
+                item["selected"] = True
                 item["progress"] = 0.0
                 item["message"] = "Ready to resume"
             elif action in {"skip", "cancel"} and status not in TERMINAL_ITEM_STATES:
@@ -913,5 +1284,30 @@ def control_session(
         if action == "resume":
             data["status"] = "queued"
             data["phase"] = "Ready to resume"
+        if action in {"include", "exclude", "only"}:
+            included = sum(
+                item.get("selected", True)
+                and item["status"] not in {"complete", "processed", "skipped"}
+                for item in items
+            )
+            data["summary"] = f"{included} item(s) included"
+            data["eta_seconds"] = sum(
+                float(
+                    item.get("eta_seconds")
+                    or item.get("projected_encode_seconds")
+                    or 0
+                )
+                for item in items
+                if (
+                    item.get("selected", True)
+                    and item["status"] not in TERMINAL_ITEM_STATES
+                )
+            )
+            if any(
+                item.get("selected", True) and item["status"] == "ready"
+                for item in items
+            ):
+                data["status"] = "queued"
+                data["phase"] = "Queue selection updated"
 
     return store.mutate(change)

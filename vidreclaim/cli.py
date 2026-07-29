@@ -30,7 +30,13 @@ from .runner import (
     output_path,
 )
 from .stitch import StitchSettings, stitch
-from .space import largest_nodes, open_space_report, scan_space, write_space_report
+from .space import (
+    largest_nodes,
+    open_space_report,
+    scan_space,
+    write_space_json,
+    write_space_report,
+)
 from .util import CommandError, atomic_write_json, duration_text, human_bytes, run
 
 
@@ -140,6 +146,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="HTML report path (default: a temporary report)",
     )
     space_parser.add_argument(
+        "--json-output", type=Path,
+        help="write the complete scan tree as structured JSON",
+    )
+    space_parser.add_argument(
         "--logical-size", action="store_true",
         help="use logical sizes instead of allocated disk blocks",
     )
@@ -159,6 +169,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     queue_start.add_argument("root", type=Path)
     queue_start.add_argument("--session", type=Path)
+    queue_start.add_argument(
+        "--include-path",
+        type=Path,
+        action="append",
+        default=[],
+        help="limit discovery to this file or directory; may be repeated",
+    )
     _add_analysis_options(queue_start)
     queue_start.add_argument("--output-dir", type=Path)
     queue_start.add_argument("--replace", action="store_true")
@@ -187,9 +204,17 @@ def build_parser() -> argparse.ArgumentParser:
     queue_control.add_argument("session", type=Path)
     queue_control.add_argument(
         "action",
-        choices=("pause", "resume", "cancel", "skip", "move-up", "move-down"),
+        choices=(
+            "pause", "resume", "cancel", "skip", "move-up", "move-down",
+            "include", "exclude", "only",
+            "clear-completed", "clear-cancelled", "clear-finished", "clear-all",
+        ),
     )
-    queue_control.add_argument("--item")
+    queue_control.add_argument("--item", action="append", default=[])
+    queue_control.add_argument(
+        "--folder",
+        help="apply the action to this relative folder and its descendants",
+    )
     queue_control.set_defaults(handler=command_queue_control)
 
     for name, help_text in (
@@ -292,6 +317,10 @@ def command_space(args: argparse.Namespace) -> int:
         report = write_space_report(
             root, output, allocated=not args.logical_size,
         )
+        if args.json_output:
+            write_space_json(
+                root, args.json_output, allocated=not args.logical_size,
+            )
         print(
             f"\nReport: {report}\n"
             f"Scanned {stats.files:,} files, {stats.directories:,} folders, "
@@ -330,6 +359,9 @@ def _queue_settings(args: argparse.Namespace, root: Path) -> dict[str, Any]:
         "delete_source_as_you_go": args.delete_source_as_you_go,
         "plan_only": args.plan_only,
         "output_dir": str(output_root),
+        "include_paths": [
+            str(path.expanduser().resolve()) for path in args.include_path
+        ],
     }
 
 
@@ -369,7 +401,8 @@ def command_queue_control(args: argparse.Namespace) -> int:
         data = control_session(
             args.session,
             action=args.action,
-            item_id=args.item,
+            item_ids=args.item,
+            folder=args.folder,
         )
         print(
             f"Queue control: {args.action}; session is {data['status']}",

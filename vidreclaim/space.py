@@ -23,10 +23,10 @@ class SpaceNode:
     errors: int = 0
     children: list["SpaceNode"] = field(default_factory=list)
 
-    def report(self, max_children: int = 160) -> dict[str, Any]:
+    def report(self, max_children: int | None = 160) -> dict[str, Any]:
         ordered = sorted(self.children, key=lambda item: item.size, reverse=True)
-        visible = ordered[:max_children]
-        hidden = ordered[max_children:]
+        visible = ordered if max_children is None else ordered[:max_children]
+        hidden = [] if max_children is None else ordered[max_children:]
         children = [child.report(max_children) for child in visible]
         if hidden:
             children.append({
@@ -251,6 +251,21 @@ def write_space_report(root: SpaceNode, output: Path, *, allocated: bool) -> Pat
     output = output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(_report_html(root.report(), allocated), encoding="utf-8")
+    return output
+
+
+def write_space_json(root: SpaceNode, output: Path, *, allocated: bool) -> Path:
+    output = output.expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    atomic = {
+        "schema": 1,
+        "allocated": allocated,
+        "root": root.report(max_children=None),
+    }
+    output.write_text(
+        json.dumps(atomic, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     return output
 
 

@@ -53,6 +53,14 @@ struct QueueItem: Codable, Identifiable {
     let sourceBytes: Int64?
     let projectedBytes: Int64?
     let projectedSavingsPct: Double?
+    let projectedEncodeSeconds: Double?
+    let outputBytes: Int64?
+    let actualSavingsPct: Double?
+    let encodeElapsedSeconds: Double?
+    let relativePath: String?
+    let relativeFolder: String?
+    let selected: Bool?
+    let processed: Bool?
     let output: String?
     let message: String
     let whatIf: [OptionEstimate]?
@@ -64,6 +72,13 @@ struct QueueItem: Codable, Identifiable {
         case sourceBytes = "source_bytes"
         case projectedBytes = "projected_bytes"
         case projectedSavingsPct = "projected_savings_pct"
+        case projectedEncodeSeconds = "projected_encode_seconds"
+        case outputBytes = "output_bytes"
+        case actualSavingsPct = "actual_savings_pct"
+        case encodeElapsedSeconds = "encode_elapsed_seconds"
+        case relativePath = "relative_path"
+        case relativeFolder = "relative_folder"
+        case selected, processed
         case whatIf = "what_if"
     }
 
@@ -72,8 +87,85 @@ struct QueueItem: Codable, Identifiable {
     }
 
     var isTerminal: Bool {
-        ["complete", "skipped", "cancelled", "error"].contains(status)
+        ["complete", "processed", "skipped", "cancelled", "error"].contains(status)
     }
+
+    var isProcessed: Bool {
+        processed ?? ["complete", "processed"].contains(status)
+    }
+
+    var isIncluded: Bool {
+        selected ?? !["processed", "skipped"].contains(status)
+    }
+
+    var canChangeInclusion: Bool {
+        ["ready", "paused", "cancelled", "error"].contains(status)
+    }
+
+    var projectedSavingsBytes: Int64 {
+        max(0, (sourceBytes ?? 0) - (projectedBytes ?? sourceBytes ?? 0))
+    }
+
+    var actualSavingsBytes: Int64 {
+        max(0, (sourceBytes ?? 0) - (outputBytes ?? sourceBytes ?? 0))
+    }
+}
+
+struct SpaceFinding: Codable, Identifiable {
+    let name: String
+    let path: String
+    let kind: String
+    let size: Int64
+    let files: Int
+    let errors: Int
+    let children: [SpaceFinding]
+
+    var id: String { "\(kind):\(path)" }
+
+    var isQueueSelectable: Bool {
+        kind == "directory" || kind == "video"
+    }
+
+    var videoPaths: [String] {
+        if kind == "video" { return [path] }
+        return children.flatMap(\.videoPaths)
+    }
+}
+
+struct SpaceScanResult: Codable {
+    let schema: Int
+    let allocated: Bool
+    let root: SpaceFinding
+}
+
+struct SpaceFindingRow: Identifiable {
+    let finding: SpaceFinding
+    let depth: Int
+
+    var id: String { finding.id }
+}
+
+enum QueueSortOption: String, CaseIterable, Identifiable {
+    case queue = "Queue order"
+    case savingsBytes = "Greatest space savings"
+    case savingsPercent = "Greatest percentage savings"
+    case sourceSize = "Largest source"
+    case encodeTime = "Longest encode"
+    case name = "Name"
+    case status = "Status"
+
+    var id: String { rawValue }
+}
+
+enum QueueStatusFilter: String, CaseIterable, Identifiable {
+    case all = "All statuses"
+    case included = "Included"
+    case active = "Active"
+    case attention = "Needs attention"
+    case excluded = "Excluded"
+    case processed = "Processed"
+
+    var id: String { rawValue }
 }
 
 struct QueueSession: Codable {
@@ -145,7 +237,7 @@ final class AppModel: ObservableObject {
     @Published var sourcePolicy: SourcePolicy = .keep
     @Published var queueSession: QueueSession?
     @Published var currentSessionURL: URL?
-    @Published var selectedQueueItemID: String?
+    @Published var selectedQueueItemIDs = Set<String>()
 
     @Published var stitchInputs: [URL] = []
     @Published var stitchOutput: URL?
@@ -157,12 +249,15 @@ final class AppModel: ObservableObject {
     @Published var spacePaths: [URL] = []
     @Published var useLogicalSizes = false
     @Published var crossFilesystems = false
+    @Published var spaceScan: SpaceScanResult?
+    @Published var selectedSpaceFindingIDs = Set<String>()
 
     private var process: Process?
     private var outputPipe: Pipe?
     private var pendingOutput = ""
     private var jobTitle = ""
     private var runningQueue = false
+    private var pendingSpaceJSONURL: URL?
     private let logURL: URL
     private let sessionsURL: URL
     private var queueTimer: Timer?
@@ -345,14 +440,22 @@ final class AppModel: ObservableObject {
         )
     }
 
-    func queueControl(_ action: String, itemID: String? = nil) {
+    func queueControl(
+        _ action: String,
+        itemID: String? = nil,
+        itemIDs: [String] = [],
+        folder: String? = nil
+    ) {
         guard let executable = cliPath, let session = currentSessionURL else { return }
         let control = Process()
         control.executableURL = URL(fileURLWithPath: executable)
         var arguments = ["queue-control", session.path, action]
-        if let itemID {
-            arguments += ["--item", itemID]
+        var ids = itemIDs
+        if let itemID { ids.append(itemID) }
+        for id in Set(ids) {
+            arguments += ["--item", id]
         }
+        if let folder { arguments += ["--folder", folder] }
         control.arguments = arguments
         control.standardOutput = FileHandle.nullDevice
         control.standardError = FileHandle.nullDevice
@@ -373,6 +476,23 @@ final class AppModel: ObservableObject {
 
     func moveQueueItem(_ id: String, by offset: Int) {
         queueControl(offset < 0 ? "move-up" : "move-down", itemID: id)
+    }
+
+    func openQueueSession() {
+        let panel = NSOpenPanel()
+        panel.title = "Open a saved queue"
+        panel.prompt = "Open Queue"
+        panel.directoryURL = sessionsURL
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url,
+              url.pathExtension.lowercased() == "json" else { return }
+        currentSessionURL = url
+        UserDefaults.standard.set(url.path, forKey: "VidReclaimCurrentSession")
+        selectedQueueItemIDs.removeAll()
+        loadQueueSession()
+        selection = .activity
     }
 
     private func loadLatestQueueSession() {
@@ -413,6 +533,9 @@ final class AppModel: ObservableObject {
               let session = try? JSONDecoder().decode(QueueSession.self, from: data)
         else { return }
         queueSession = session
+        selectedQueueItemIDs.formIntersection(
+            Set(session.items.map(\.id))
+        )
         overallProgress = session.overallFraction
         phase = session.phase
         eta = durationLabel(session.etaSeconds)
@@ -464,7 +587,18 @@ final class AppModel: ObservableObject {
 
     func runSpaceMap() {
         guard !spacePaths.isEmpty else { return }
-        var arguments = ["space"] + spacePaths.map(\.path)
+        let reportDirectory = sessionsURL.deletingLastPathComponent()
+            .appendingPathComponent("Space Scans", isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: reportDirectory, withIntermediateDirectories: true
+        )
+        let jsonURL = reportDirectory.appendingPathComponent(
+            "space-\(Int(Date().timeIntervalSince1970)).json"
+        )
+        pendingSpaceJSONURL = jsonURL
+        var arguments = ["space"] + spacePaths.map(\.path) + [
+            "--json-output", jsonURL.path, "--no-open",
+        ]
         if useLogicalSizes { arguments.append("--logical-size") }
         if crossFilesystems { arguments.append("--cross-filesystems") }
         run(
@@ -472,6 +606,86 @@ final class AppModel: ObservableObject {
             title: "Mapping disk usage",
             section: .space
         )
+    }
+
+    private func finding(
+        withID id: String,
+        in node: SpaceFinding
+    ) -> SpaceFinding? {
+        if node.id == id { return node }
+        for child in node.children {
+            if let match = finding(withID: id, in: child) { return match }
+        }
+        return nil
+    }
+
+    func queueSelectedSpaceFindings() {
+        guard let scan = spaceScan else { return }
+        let findings = selectedSpaceFindingIDs.compactMap {
+            finding(withID: $0, in: scan.root)
+        }
+        let videoPaths = Array(
+            Set(findings.flatMap(\.videoPaths))
+        ).sorted()
+        guard !videoPaths.isEmpty else {
+            appendLog("Choose at least one video or a folder containing videos.\n")
+            return
+        }
+        let videoURLs = videoPaths.map(URL.init(fileURLWithPath:))
+        let root = spacePaths.first { candidate in
+            let prefix = candidate.standardizedFileURL.path.hasSuffix("/")
+                ? candidate.standardizedFileURL.path
+                : candidate.standardizedFileURL.path + "/"
+            return videoURLs.allSatisfy {
+                $0.standardizedFileURL.path == candidate.standardizedFileURL.path
+                || $0.standardizedFileURL.path.hasPrefix(prefix)
+            }
+        }
+        guard let root else {
+            appendLog(
+                "Queue selections must be inside one scanned location so folder structure remains unambiguous.\n"
+            )
+            return
+        }
+        compressionSource = root
+        try? FileManager.default.createDirectory(
+            at: sessionsURL, withIntermediateDirectories: true
+        )
+        let session = sessionsURL.appendingPathComponent(
+            "\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString.prefix(8)).json"
+        )
+        currentSessionURL = session
+        UserDefaults.standard.set(session.path, forKey: "VidReclaimCurrentSession")
+        var arguments = [
+            "queue-start", root.path, "--session", session.path, "--plan-only",
+        ] + videoPaths.flatMap { ["--include-path", $0] } + analysisArguments()
+        if visualReview { arguments.append("--review") }
+        if deepVerify { arguments.append("--deep-verify") }
+        switch sourcePolicy {
+        case .keep:
+            break
+        case .archive:
+            arguments.append("--replace")
+        case .delete:
+            arguments += ["--delete-source-as-you-go", "--yes"]
+        }
+        run(
+            arguments: arguments,
+            title: "Preparing \(videoPaths.count) selected video\(videoPaths.count == 1 ? "" : "s")",
+            section: .activity
+        )
+    }
+
+    private func loadSpaceScan(_ url: URL) {
+        guard let data = try? Data(contentsOf: url),
+              let scan = try? JSONDecoder().decode(
+                SpaceScanResult.self, from: data
+              ) else {
+            appendLog("The disk scan finished, but its structured results could not be read.\n")
+            return
+        }
+        spaceScan = scan
+        selectedSpaceFindingIDs.removeAll()
     }
 
     func moveStitchInput(from index: Int, by offset: Int) {
@@ -583,6 +797,10 @@ final class AppModel: ObservableObject {
                         self.eta = "—"
                     }
                 }
+                if succeeded, let report = self.pendingSpaceJSONURL {
+                    self.loadSpaceScan(report)
+                }
+                self.pendingSpaceJSONURL = nil
                 self.appendLog(
                     "\n\(succeeded ? "Completed successfully." : "Exited with status \(completed.terminationStatus).")\n"
                 )
@@ -1127,73 +1345,236 @@ struct StitchView: View {
 
 struct SpaceMapView: View {
     @ObservedObject var model: AppModel
+    @State private var searchText = ""
+    @State private var largestFirst = true
+    @State private var queueCandidatesOnly = true
+
+    private func flatten(
+        _ findings: [SpaceFinding],
+        depth: Int = 0
+    ) -> [SpaceFindingRow] {
+        findings.flatMap { finding in
+            [SpaceFindingRow(finding: finding, depth: depth)]
+                + flatten(
+                    finding.children.sorted { $0.size > $1.size },
+                    depth: depth + 1
+                )
+        }
+    }
+
+    private var findings: [SpaceFindingRow] {
+        guard let root = model.spaceScan?.root else { return [] }
+        let rows = flatten(root.children.sorted { $0.size > $1.size })
+        let filtered = rows.filter { row in
+            let finding = row.finding
+            if queueCandidatesOnly
+                && finding.kind != "directory"
+                && finding.kind != "video" {
+                return false
+            }
+            guard !searchText.isEmpty else { return true }
+            return finding.name.localizedCaseInsensitiveContains(searchText)
+                || finding.path.localizedCaseInsensitiveContains(searchText)
+        }
+        return largestFirst
+            ? filtered.sorted { $0.finding.size > $1.finding.size }
+            : filtered
+    }
+
+    private var selectedVideoPaths: Set<String> {
+        guard let root = model.spaceScan?.root else { return [] }
+        func selectedPaths(_ node: SpaceFinding) -> [String] {
+            let own = model.selectedSpaceFindingIDs.contains(node.id)
+                ? node.videoPaths : []
+            return own + node.children.flatMap(selectedPaths)
+        }
+        return Set(selectedPaths(root))
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
             SectionHeading(
                 title: "Space Map",
-                subtitle: "Find the folders and files consuming the most space before deciding what to compress."
+                subtitle: "Find large media, select files or folders, and prepare a queue without scanning the whole library again."
             )
             HStack {
                 Button("Add Folders or Disks…") { model.addSpacePaths() }
-                Button("Clear") { model.spacePaths.removeAll() }
+                Button("Clear") {
+                    model.spacePaths.removeAll()
+                    model.spaceScan = nil
+                    model.selectedSpaceFindingIDs.removeAll()
+                }
                     .disabled(model.spacePaths.isEmpty || model.isRunning)
                 Spacer()
                 Text("\(model.spacePaths.count) location\(model.spacePaths.count == 1 ? "" : "s")")
                     .foregroundStyle(.secondary)
             }
-            List {
-                ForEach(model.spacePaths, id: \.self) { url in
-                    HStack {
-                        Image(systemName: "externaldrive")
-                        VStack(alignment: .leading) {
-                            Text(url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent)
-                            Text(url.path).font(.caption).foregroundStyle(.secondary)
+
+            if let scan = model.spaceScan {
+                HStack(spacing: 16) {
+                    Label(
+                        model.bytesLabel(scan.root.size),
+                        systemImage: "internaldrive"
+                    )
+                    Text("\(scan.root.files.formatted()) files")
+                    if scan.root.errors > 0 {
+                        Label(
+                            "\(scan.root.errors) unreadable",
+                            systemImage: "exclamationmark.triangle"
+                        )
+                        .foregroundStyle(.orange)
+                    }
+                    Spacer()
+                    TextField("Filter findings", text: $searchText)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 220)
+                    Toggle("Videos and folders", isOn: $queueCandidatesOnly)
+                        .toggleStyle(.checkbox)
+                    Toggle("Largest first", isOn: $largestFirst)
+                        .toggleStyle(.checkbox)
+                }
+
+                List {
+                    ForEach(findings) { row in
+                        let item = row.finding
+                        HStack(spacing: 10) {
+                            Button {
+                                if model.selectedSpaceFindingIDs.contains(item.id) {
+                                    model.selectedSpaceFindingIDs.remove(item.id)
+                                } else {
+                                    model.selectedSpaceFindingIDs.insert(item.id)
+                                }
+                            } label: {
+                                Image(
+                                    systemName: model.selectedSpaceFindingIDs.contains(item.id)
+                                        ? "checkmark.square.fill" : "square"
+                                )
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(!item.isQueueSelectable)
+                            Image(
+                                systemName: item.kind == "directory"
+                                    ? "folder.fill"
+                                    : (item.kind == "video" ? "film.fill" : "doc.fill")
+                            )
+                            .foregroundStyle(
+                                item.kind == "video" ? .orange : .secondary
+                            )
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(item.name).lineLimit(1)
+                                Text(item.path)
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                                    .lineLimit(1)
+                            }
+                            .padding(
+                                .leading,
+                                largestFirst ? 0 : CGFloat(row.depth * 12)
+                            )
+                            Spacer()
+                            if item.kind == "directory" {
+                                Text("\(item.files.formatted()) files")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Text(model.bytesLabel(item.size))
+                                .monospacedDigit()
+                                .frame(width: 100, alignment: .trailing)
                         }
-                        Spacer()
-                        Button(role: .destructive) {
-                            model.spacePaths.removeAll { $0 == url }
-                        } label: {
-                            Image(systemName: "xmark.circle")
-                        }
-                        .buttonStyle(.plain)
+                        .padding(.vertical, 3)
                     }
                 }
-            }
-            .overlay {
-                if model.spacePaths.isEmpty {
-                    ContentUnavailableView(
-                        "Choose what to map",
-                        systemImage: "square.3.layers.3d",
-                        description: Text("You can scan multiple folders, external disks, or mounted volumes together.")
-                    )
-                }
-            }
-            .frame(minHeight: 230)
+                .frame(minHeight: 320)
 
-            GroupBox("Scan behavior") {
+                HStack {
+                    Text(
+                        "\(selectedVideoPaths.count.formatted()) unique video\(selectedVideoPaths.count == 1 ? "" : "s") selected"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    Button("Clear Selection") {
+                        model.selectedSpaceFindingIDs.removeAll()
+                    }
+                    .disabled(model.selectedSpaceFindingIDs.isEmpty)
+                    Spacer()
+                    Button("Queue Selection") {
+                        model.queueSelectedSpaceFindings()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(selectedVideoPaths.isEmpty || model.isRunning)
+                }
+            } else {
+                List {
+                    ForEach(model.spacePaths, id: \.self) { url in
+                        HStack {
+                            Image(systemName: "externaldrive")
+                            VStack(alignment: .leading) {
+                                Text(
+                                    url.lastPathComponent.isEmpty
+                                        ? url.path : url.lastPathComponent
+                                )
+                                Text(url.path)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button(role: .destructive) {
+                                model.spacePaths.removeAll { $0 == url }
+                            } label: {
+                                Image(systemName: "xmark.circle")
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+                .overlay {
+                    if model.spacePaths.isEmpty {
+                        ContentUnavailableView(
+                            "Choose what to map",
+                            systemImage: "square.3.layers.3d",
+                            description: Text(
+                                "Scan folders, external disks, or mounted volumes."
+                            )
+                        )
+                    }
+                }
+                .frame(minHeight: 230)
+            }
+
+            DisclosureGroup("Scan behavior") {
                 VStack(alignment: .leading, spacing: 10) {
-                    Toggle("Show logical file sizes instead of allocated disk blocks", isOn: $model.useLogicalSizes)
-                    Toggle("Cross into other mounted filesystems below each root", isOn: $model.crossFilesystems)
+                    Toggle(
+                        "Show logical file sizes instead of allocated disk blocks",
+                        isOn: $model.useLogicalSizes
+                    )
+                    Toggle(
+                        "Cross into other mounted filesystems below each root",
+                        isOn: $model.crossFilesystems
+                    )
                     Label(
-                        "Hard links are counted once, symlinks are not followed, and video files are highlighted in orange.",
+                        "Hard links are counted once and symlinks are not followed.",
                         systemImage: "checkmark.shield"
                     )
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 }
                 .padding(.top, 6)
             }
+
             HStack {
-                Text("The interactive treemap opens in your browser when scanning finishes.")
-                    .font(.caption).foregroundStyle(.secondary)
+                Text("Results stay in the app and can feed a queue directly.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Spacer()
-                Button("Scan & Open Map") { model.runSpaceMap() }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(model.spacePaths.isEmpty || model.isRunning)
+                Button(model.spaceScan == nil ? "Scan" : "Scan Again") {
+                    model.runSpaceMap()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(model.spacePaths.isEmpty || model.isRunning)
             }
         }
         .padding(28)
-        .frame(maxWidth: 920, maxHeight: .infinity, alignment: .topLeading)
+        .frame(maxWidth: 1180, maxHeight: .infinity, alignment: .topLeading)
     }
 }
 
@@ -1307,22 +1688,205 @@ struct WhatIfView: View {
     }
 }
 
+struct QueueSummaryCard: View {
+    let title: String
+    let value: String
+    let detail: String
+    let systemImage: String
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: systemImage)
+                .font(.title2)
+                .foregroundStyle(Color.accentColor)
+                .frame(width: 28)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text(value)
+                    .font(.headline.monospacedDigit())
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .background(
+            Color(nsColor: .controlBackgroundColor),
+            in: RoundedRectangle(cornerRadius: 9)
+        )
+    }
+}
+
+struct QueueFolderSummary: Identifiable {
+    let path: String
+    let total: Int
+    let selectable: Int
+    let included: Int
+
+    var id: String { path }
+
+    var selectionIcon: String {
+        if selectable == 0 || included == 0 { return "square" }
+        return included == selectable
+            ? "checkmark.square.fill" : "minus.square.fill"
+    }
+}
+
 struct ActivityView: View {
     @ObservedObject var model: AppModel
     @State private var showLog = false
     @State private var whatIfItem: QueueItem?
+    @State private var searchText = ""
+    @State private var sortOption: QueueSortOption = .savingsBytes
+    @State private var statusFilter: QueueStatusFilter = .all
+    @State private var showProcessed = false
+    @State private var selectedFolder = ""
 
     private var orderedItems: [QueueItem] {
         (model.queueSession?.items ?? []).sorted { $0.order < $1.order }
     }
 
     private var selectedItem: QueueItem? {
-        orderedItems.first { $0.id == model.selectedQueueItemID }
+        guard model.selectedQueueItemIDs.count == 1,
+              let id = model.selectedQueueItemIDs.first else { return nil }
+        return orderedItems.first { $0.id == id }
+    }
+
+    private var selectedItems: [QueueItem] {
+        orderedItems.filter { model.selectedQueueItemIDs.contains($0.id) }
+    }
+
+    private func isInFolder(_ item: QueueItem, folder: String) -> Bool {
+        guard !folder.isEmpty else { return true }
+        let candidate = item.relativeFolder ?? ""
+        return candidate == folder || candidate.hasPrefix(folder + "/")
+    }
+
+    private var folderSummaries: [QueueFolderSummary] {
+        var counts: [String: (total: Int, selectable: Int, included: Int)] = [:]
+        for item in orderedItems {
+            let components = (item.relativeFolder ?? "")
+                .split(separator: "/").map(String.init)
+            var ancestors = [""]
+            if !components.isEmpty {
+                for count in 1...components.count {
+                    ancestors.append(
+                        components.prefix(count).joined(separator: "/")
+                    )
+                }
+            }
+            for folder in ancestors {
+                var current = counts[folder] ?? (0, 0, 0)
+                current.total += 1
+                if item.canChangeInclusion {
+                    current.selectable += 1
+                    if item.isIncluded { current.included += 1 }
+                }
+                counts[folder] = current
+            }
+        }
+        return counts.map { path, count in
+            QueueFolderSummary(
+                path: path,
+                total: count.total,
+                selectable: count.selectable,
+                included: count.included
+            )
+        }.sorted {
+            if $0.path.isEmpty { return true }
+            if $1.path.isEmpty { return false }
+            return $0.path.localizedStandardCompare($1.path)
+                == .orderedAscending
+        }
+    }
+
+    private var filteredItems: [QueueItem] {
+        let filtered = orderedItems.filter { item in
+            if !showProcessed
+                && statusFilter != .processed
+                && item.isProcessed {
+                return false
+            }
+            if !isInFolder(item, folder: selectedFolder) { return false }
+            if !searchText.isEmpty
+                && !item.name.localizedCaseInsensitiveContains(searchText)
+                && !item.path.localizedCaseInsensitiveContains(searchText)
+                && !(item.relativePath ?? "").localizedCaseInsensitiveContains(searchText) {
+                return false
+            }
+            switch statusFilter {
+            case .all:
+                return true
+            case .included:
+                return item.isIncluded && !item.isProcessed
+            case .active:
+                return item.isActive
+            case .attention:
+                return ["error", "cancelled"].contains(item.status)
+            case .excluded:
+                return !item.isIncluded && !item.isProcessed
+            case .processed:
+                return item.isProcessed
+            }
+        }
+        return filtered.sorted { left, right in
+            switch sortOption {
+            case .queue:
+                return left.order < right.order
+            case .savingsBytes:
+                return left.projectedSavingsBytes > right.projectedSavingsBytes
+            case .savingsPercent:
+                return (left.projectedSavingsPct ?? -1)
+                    > (right.projectedSavingsPct ?? -1)
+            case .sourceSize:
+                return (left.sourceBytes ?? 0) > (right.sourceBytes ?? 0)
+            case .encodeTime:
+                return (left.projectedEncodeSeconds ?? 0)
+                    > (right.projectedEncodeSeconds ?? 0)
+            case .name:
+                return left.name.localizedStandardCompare(right.name)
+                    == .orderedAscending
+            case .status:
+                return left.status.localizedStandardCompare(right.status)
+                    == .orderedAscending
+            }
+        }
+    }
+
+    private var includedItems: [QueueItem] {
+        orderedItems.filter { $0.isIncluded && !$0.isProcessed }
+    }
+
+    private var processedItems: [QueueItem] {
+        orderedItems.filter(\.isProcessed)
+    }
+
+    private var projectedSavings: Int64 {
+        includedItems.reduce(0) { $0 + $1.projectedSavingsBytes }
+    }
+
+    private var actualSavings: Int64 {
+        processedItems.reduce(0) { $0 + $1.actualSavingsBytes }
+    }
+
+    private var elapsedEncodeTime: Double {
+        orderedItems
+            .filter { $0.status != "processed" }
+            .reduce(0) { $0 + ($1.encodeElapsedSeconds ?? 0) }
+    }
+
+    private var projectedEncodeTime: Double {
+        includedItems.reduce(0) { $0 + ($1.projectedEncodeSeconds ?? 0) }
     }
 
     private func statusIcon(_ status: String) -> String {
         switch status {
         case "complete": return "checkmark.circle.fill"
+        case "processed": return "checkmark.seal.fill"
         case "encoding": return "arrow.up.circle.fill"
         case "verifying": return "checkmark.shield.fill"
         case "paused": return "pause.circle.fill"
@@ -1336,7 +1900,7 @@ struct ActivityView: View {
 
     private func statusColor(_ status: String) -> Color {
         switch status {
-        case "complete": return .green
+        case "complete", "processed": return .green
         case "encoding", "verifying": return .accentColor
         case "paused": return .orange
         case "cancelled", "error": return .red
@@ -1349,9 +1913,10 @@ struct ActivityView: View {
             HStack {
                 SectionHeading(
                     title: "Queue",
-                    subtitle: "Transmission-style controls with persistent, reboot-resumable sessions."
+                    subtitle: "Persistent per-video controls with reboot-resumable sessions."
                 )
                 Spacer()
+                Button("Open Saved Queue…") { model.openQueueSession() }
                 Label(model.engineStatus, systemImage: model.cliPath == nil ? "xmark.circle" : "checkmark.circle")
                     .foregroundStyle(model.cliPath == nil ? Color.red : Color.green)
             }
@@ -1410,34 +1975,134 @@ struct ActivityView: View {
                     .padding(.top, 4)
                 }
 
+                HStack(spacing: 10) {
+                    QueueSummaryCard(
+                        title: "Included",
+                        value: "\(includedItems.count.formatted()) videos",
+                        detail: model.bytesLabel(
+                            includedItems.reduce(0) { $0 + ($1.sourceBytes ?? 0) }
+                        ),
+                        systemImage: "checklist"
+                    )
+                    QueueSummaryCard(
+                        title: "Projected savings",
+                        value: model.bytesLabel(projectedSavings),
+                        detail: "Current selection",
+                        systemImage: "internaldrive"
+                    )
+                    QueueSummaryCard(
+                        title: "Saved so far",
+                        value: model.bytesLabel(actualSavings),
+                        detail: "\(processedItems.count.formatted()) processed",
+                        systemImage: "arrow.down.circle"
+                    )
+                    QueueSummaryCard(
+                        title: "Encode time",
+                        value: model.durationLabel(elapsedEncodeTime),
+                        detail: "~\(model.durationLabel(projectedEncodeTime)) selected",
+                        systemImage: "clock"
+                    )
+                }
+
                 HStack(spacing: 8) {
-                    Text("\(orderedItems.count) videos").font(.headline)
+                    Text(
+                        "\(filteredItems.count.formatted()) of \(orderedItems.count.formatted()) videos"
+                    )
+                    .font(.headline)
+                    TextField("Search name or path", text: $searchText)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(minWidth: 180, maxWidth: 260)
+                    Picker("Status", selection: $statusFilter) {
+                        ForEach(QueueStatusFilter.allCases) {
+                            Text($0.rawValue).tag($0)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 150)
+                    Picker("Sort", selection: $sortOption) {
+                        ForEach(QueueSortOption.allCases) {
+                            Text($0.rawValue).tag($0)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 210)
+                    Toggle("Show processed", isOn: $showProcessed)
+                        .toggleStyle(.checkbox)
                     Spacer()
+                }
+
+                HStack(spacing: 8) {
+                    Menu {
+                        Button("Include Selected Rows") {
+                            model.queueControl(
+                                "include", itemIDs: selectedItems.map(\.id)
+                            )
+                        }
+                        .disabled(selectedItems.isEmpty)
+                        Button("Exclude Selected Rows") {
+                            model.queueControl(
+                                "exclude", itemIDs: selectedItems.map(\.id)
+                            )
+                        }
+                        .disabled(selectedItems.isEmpty)
+                        Divider()
+                        Button("Include All Visible") {
+                            model.queueControl(
+                                "include", itemIDs: filteredItems.map(\.id)
+                            )
+                        }
+                        .disabled(filteredItems.isEmpty)
+                        Button("Exclude All Visible") {
+                            model.queueControl(
+                                "exclude", itemIDs: filteredItems.map(\.id)
+                            )
+                        }
+                        .disabled(filteredItems.isEmpty)
+                        Divider()
+                        Button("Include Only Selected Rows") {
+                            model.queueControl(
+                                "only", itemIDs: selectedItems.map(\.id)
+                            )
+                        }
+                        .disabled(selectedItems.isEmpty)
+                    } label: {
+                        Label("Selection", systemImage: "checkmark.square")
+                    }
+
+                    Button {
+                        model.queueControl(
+                            "pause", itemIDs: selectedItems.map(\.id)
+                        )
+                    } label: {
+                        Label("Pause", systemImage: "pause")
+                    }
+                    .disabled(selectedItems.isEmpty)
+                    Button {
+                        model.queueControl(
+                            "resume", itemIDs: selectedItems.map(\.id)
+                        )
+                    } label: {
+                        Label("Resume", systemImage: "play")
+                    }
+                    .disabled(selectedItems.isEmpty)
+                    Button {
+                        model.queueControl(
+                            "skip", itemIDs: selectedItems.map(\.id)
+                        )
+                    } label: {
+                        Label("Skip", systemImage: "forward.end")
+                    }
+                    .disabled(selectedItems.isEmpty)
+                    Button(role: .destructive) {
+                        model.queueControl(
+                            "cancel", itemIDs: selectedItems.map(\.id)
+                        )
+                    } label: {
+                        Label("Cancel", systemImage: "xmark")
+                    }
+                    .disabled(selectedItems.isEmpty)
+
                     if let item = selectedItem {
-                        Button {
-                            model.queueControl("pause", itemID: item.id)
-                        } label: {
-                            Label("Pause", systemImage: "pause")
-                        }
-                        .disabled(!["ready", "encoding"].contains(item.status))
-                        Button {
-                            model.queueControl("resume", itemID: item.id)
-                        } label: {
-                            Label("Resume", systemImage: "play")
-                        }
-                        .disabled(!["paused", "cancelled", "error"].contains(item.status))
-                        Button {
-                            model.queueControl("skip", itemID: item.id)
-                        } label: {
-                            Label("Skip", systemImage: "forward.end")
-                        }
-                        .disabled(item.isTerminal)
-                        Button(role: .destructive) {
-                            model.queueControl("cancel", itemID: item.id)
-                        } label: {
-                            Label("Cancel", systemImage: "xmark")
-                        }
-                        .disabled(item.isTerminal)
                         Divider().frame(height: 18)
                         Button {
                             model.moveQueueItem(item.id, by: -1)
@@ -1445,85 +2110,220 @@ struct ActivityView: View {
                             Image(systemName: "arrow.up")
                         }
                         .help("Move earlier")
-                        .disabled(item.order == orderedItems.first?.order)
+                        .disabled(
+                            sortOption != .queue
+                            || item.order == orderedItems.first?.order
+                        )
                         Button {
                             model.moveQueueItem(item.id, by: 1)
                         } label: {
                             Image(systemName: "arrow.down")
                         }
                         .help("Move later")
-                        .disabled(item.order == orderedItems.last?.order)
-                        Divider().frame(height: 18)
+                        .disabled(
+                            sortOption != .queue
+                            || item.order == orderedItems.last?.order
+                        )
                         Button {
                             whatIfItem = item
                         } label: {
-                            Label("Compare Options", systemImage: "chart.bar.xaxis")
+                            Label(
+                                "Compare Options",
+                                systemImage: "chart.bar.xaxis"
+                            )
                         }
                         .disabled((item.whatIf ?? []).isEmpty)
                     }
+                    Spacer()
+                    Menu {
+                        Button("Clear Completed") {
+                            model.queueControl("clear-completed")
+                            model.selectedQueueItemIDs.removeAll()
+                        }
+                        Button("Clear Cancelled") {
+                            model.queueControl("clear-cancelled")
+                            model.selectedQueueItemIDs.removeAll()
+                        }
+                        Button("Clear All Finished") {
+                            model.queueControl("clear-finished")
+                            model.selectedQueueItemIDs.removeAll()
+                        }
+                        Divider()
+                        Button("Clear Queue", role: .destructive) {
+                            model.queueControl("clear-all")
+                            model.selectedQueueItemIDs.removeAll()
+                        }
+                        .disabled(
+                            model.isRunning || session.status == "running"
+                        )
+                    } label: {
+                        Label("Clear", systemImage: "trash")
+                    }
                 }
 
-                List(selection: $model.selectedQueueItemID) {
-                    ForEach(orderedItems) { item in
-                        HStack(spacing: 12) {
-                            Image(systemName: statusIcon(item.status))
-                                .font(.title3)
-                                .foregroundStyle(statusColor(item.status))
-                                .frame(width: 24)
-                            VStack(alignment: .leading, spacing: 4) {
-                                HStack {
-                                    Text(item.name).fontWeight(.semibold).lineLimit(1)
-                                    Text(item.status.capitalized)
-                                        .font(.caption2.bold())
-                                        .foregroundStyle(statusColor(item.status))
+                HSplitView {
+                    List {
+                        ForEach(folderSummaries) { summary in
+                            let folder = summary.path
+                            HStack(spacing: 7) {
+                                Button {
+                                    let action = (
+                                        summary.selectable > 0
+                                        && summary.included == summary.selectable
+                                    ) ? "exclude" : "include"
+                                    model.queueControl(
+                                        action, folder: folder
+                                    )
+                                } label: {
+                                    Image(
+                                        systemName: summary.selectionIcon
+                                    )
                                 }
-                                Text(item.path)
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                                    .lineLimit(1)
-                                if ["encoding", "verifying", "paused"].contains(item.status) {
-                                    ProgressView(value: item.progress)
-                                        .progressViewStyle(.linear)
-                                } else {
-                                    Text(item.message)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
+                                .buttonStyle(.plain)
+                                .disabled(summary.selectable == 0)
+                                Button {
+                                    selectedFolder = folder
+                                } label: {
+                                    HStack {
+                                        Image(systemName: "folder")
+                                        Text(
+                                            folder.isEmpty
+                                                ? session.name
+                                                : URL(
+                                                    fileURLWithPath: folder
+                                                ).lastPathComponent
+                                        )
                                         .lineLimit(1)
+                                        Spacer()
+                                        Text(summary.total.formatted())
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    .contentShape(Rectangle())
                                 }
+                                .buttonStyle(.plain)
                             }
-                            Spacer(minLength: 10)
-                            VStack(alignment: .trailing, spacing: 3) {
-                                if let savings = item.projectedSavingsPct {
-                                    Text("~\(savings, specifier: "%.0f")% smaller")
-                                        .monospacedDigit()
-                                }
-                                Text(
-                                    "\(model.bytesLabel(item.sourceBytes)) → \(model.bytesLabel(item.projectedBytes))"
+                            .padding(
+                                .leading,
+                                CGFloat(
+                                    max(
+                                        0,
+                                        folder.split(separator: "/").count - 1
+                                    ) * 12
                                 )
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                if item.etaSeconds != nil && !item.isTerminal {
-                                    Text("ETA \(model.durationLabel(item.etaSeconds))")
+                            )
+                            .listRowBackground(
+                                selectedFolder == folder
+                                    ? Color.accentColor.opacity(0.16)
+                                    : Color.clear
+                            )
+                        }
+                    }
+                    .frame(minWidth: 190, idealWidth: 230, maxWidth: 300)
+
+                    List(selection: $model.selectedQueueItemIDs) {
+                        ForEach(filteredItems) { item in
+                            HStack(spacing: 10) {
+                                Button {
+                                    model.queueControl(
+                                        item.isIncluded ? "exclude" : "include",
+                                        itemID: item.id
+                                    )
+                                } label: {
+                                    Image(
+                                        systemName: item.isIncluded
+                                            ? "checkmark.square.fill" : "square"
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(!item.canChangeInclusion)
+                                Image(systemName: statusIcon(item.status))
+                                    .font(.title3)
+                                    .foregroundStyle(statusColor(item.status))
+                                    .frame(width: 22)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    HStack(spacing: 6) {
+                                        Text(item.name)
+                                            .fontWeight(.semibold)
+                                            .lineLimit(1)
+                                        if item.isProcessed {
+                                            Text("Processed")
+                                                .font(.caption2.bold())
+                                                .foregroundStyle(.green)
+                                        } else if !item.isIncluded {
+                                            Text("Excluded")
+                                                .font(.caption2.bold())
+                                                .foregroundStyle(.secondary)
+                                        } else {
+                                            Text(item.status.capitalized)
+                                                .font(.caption2.bold())
+                                                .foregroundStyle(
+                                                    statusColor(item.status)
+                                                )
+                                        }
+                                    }
+                                    Text(item.relativePath ?? item.path)
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                        .lineLimit(1)
+                                    if item.isActive {
+                                        ProgressView(value: item.progress)
+                                            .progressViewStyle(.linear)
+                                    } else {
+                                        Text(item.message)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                    }
+                                }
+                                Spacer(minLength: 8)
+                                VStack(alignment: .trailing, spacing: 2) {
+                                    if let savings = item.projectedSavingsPct {
+                                        Text(
+                                            "Save ~\(model.bytesLabel(item.projectedSavingsBytes)) · \(savings, specifier: "%.0f")%"
+                                        )
+                                        .monospacedDigit()
+                                    } else if item.isProcessed {
+                                        Text(
+                                            "Saved \(model.bytesLabel(item.actualSavingsBytes))"
+                                        )
+                                        .monospacedDigit()
+                                    }
+                                    Text(
+                                        "\(model.bytesLabel(item.sourceBytes)) → \(model.bytesLabel(item.projectedBytes ?? item.outputBytes))"
+                                    )
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    if !item.isTerminal {
+                                        Text(
+                                            "~\(model.durationLabel(item.projectedEncodeSeconds ?? item.etaSeconds))"
+                                        )
                                         .font(.caption.monospacedDigit())
                                         .foregroundStyle(.secondary)
+                                    }
                                 }
+                                .frame(width: 215, alignment: .trailing)
                             }
-                            .frame(width: 175, alignment: .trailing)
+                            .padding(.vertical, 4)
+                            .tag(item.id)
                         }
-                        .padding(.vertical, 5)
-                        .tag(item.id)
+                    }
+                    .overlay {
+                        if filteredItems.isEmpty {
+                            ContentUnavailableView(
+                                orderedItems.isEmpty
+                                    && session.status == "scanning"
+                                    ? "Scanning quickly…" : "No matching videos",
+                                systemImage: "line.3.horizontal.decrease.circle",
+                                description: Text(
+                                    showProcessed
+                                        ? "Adjust the folder, search, or status filter."
+                                        : "Processed items are hidden by default."
+                                )
+                            )
+                        }
                     }
                 }
-                .overlay {
-                    if orderedItems.isEmpty {
-                        ContentUnavailableView(
-                            session.status == "scanning" ? "Scanning quickly…" : "Queue is empty",
-                            systemImage: "list.bullet.rectangle",
-                            description: Text("Videos appear as their metadata is discovered.")
-                        )
-                    }
-                }
-                .frame(minHeight: 260)
+                .frame(minHeight: 310)
             } else {
                 ContentUnavailableView(
                     "No queue session yet",

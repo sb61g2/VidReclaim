@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from vidreclaim.discovery import discover
 from vidreclaim.dvd import DvdTitle, _extract_json, select_main_titles
@@ -17,7 +18,11 @@ from vidreclaim.planner import (
 )
 from vidreclaim.queueing import (
     SessionStore,
+    _load_processed_catalog,
     _normalize_interrupted,
+    _processed_record,
+    _save_processed_record,
+    _source_signature,
     _what_if_estimates,
     control_session,
     create_session,
@@ -30,7 +35,7 @@ from vidreclaim.runner import (
     delete_verified_file_source,
 )
 from vidreclaim.stitch import canvas_dimensions, natural_key
-from vidreclaim.space import scan_space
+from vidreclaim.space import SpaceNode, scan_space, write_space_json
 
 
 def dvd_title(index: int, minutes: float) -> DvdTitle:
@@ -226,6 +231,21 @@ class SpaceMapTests(unittest.TestCase):
         self.assertEqual(2, stats.files)
         self.assertEqual(10_100, scanned.size)
 
+    def test_structured_report_keeps_the_complete_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "space.json"
+            children = [
+                SpaceNode(f"movie-{index}.mkv", f"/media/{index}", "video", 1)
+                for index in range(200)
+            ]
+            root = SpaceNode(
+                "Scanned locations", "", "root",
+                size=200, files=200, children=children,
+            )
+            write_space_json(root, output, allocated=False)
+            report = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(200, len(report["root"]["children"]))
+
 
 class QueueTests(unittest.TestCase):
     def settings(self, root: Path) -> dict[str, object]:
@@ -271,6 +291,107 @@ class QueueTests(unittest.TestCase):
             control_session(path, action="move-down", item_id="a")
             items = sorted(store.read()["items"], key=lambda item: item["order"])
             self.assertEqual(["b", "a"], [item["id"] for item in items])
+
+    def test_folder_selection_only_mode_and_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "session.json"
+            create_session(path, root=root, settings=self.settings(root))
+            store = SessionStore(path)
+
+            def add_items(data: dict[str, object]) -> None:
+                data["status"] = "queued"
+                data["items"] = [
+                    {
+                        "id": "episode-a", "order": 0, "status": "ready",
+                        "relative_folder": "Shows/Season 1", "selected": True,
+                    },
+                    {
+                        "id": "episode-b", "order": 1, "status": "ready",
+                        "relative_folder": "Shows/Season 2", "selected": True,
+                    },
+                    {
+                        "id": "movie", "order": 2, "status": "ready",
+                        "relative_folder": "Movies", "selected": True,
+                    },
+                    {
+                        "id": "done", "order": 3, "status": "complete",
+                        "relative_folder": "Movies", "selected": True,
+                    },
+                ]
+
+            store.mutate(add_items)
+            control_session(path, action="exclude", folder="Shows")
+            selected = {
+                item["id"]: item.get("selected")
+                for item in store.read()["items"]
+            }
+            self.assertFalse(selected["episode-a"])
+            self.assertFalse(selected["episode-b"])
+            self.assertTrue(selected["movie"])
+
+            control_session(
+                path, action="only", item_ids=["episode-b", "movie"],
+            )
+            selected = {
+                item["id"]: item.get("selected")
+                for item in store.read()["items"]
+            }
+            self.assertFalse(selected["episode-a"])
+            self.assertTrue(selected["episode-b"])
+            self.assertTrue(selected["movie"])
+
+            control_session(path, action="cancel", item_ids=["movie"])
+            control_session(path, action="clear-cancelled")
+            self.assertNotIn(
+                "movie", {item["id"] for item in store.read()["items"]},
+            )
+            control_session(path, action="clear-completed")
+            self.assertNotIn(
+                "done", {item["id"] for item in store.read()["items"]},
+            )
+            control_session(path, action="clear-all")
+            self.assertEqual([], store.read()["items"])
+
+    def test_processed_catalog_requires_unchanged_media_and_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_path = root / "movie.mkv"
+            output = root / ".vidreclaim" / "output" / "movie.mkv"
+            source_path.write_bytes(b"source")
+            output.parent.mkdir(parents=True)
+            output.write_bytes(b"result")
+            source = Source(source_path)
+            catalog_path = root / "processed.json"
+            item = {
+                "source_signature": _source_signature(source),
+                "source_bytes": source_path.stat().st_size,
+            }
+            result = {
+                "output": str(output),
+                "output_bytes": output.stat().st_size,
+                "actual_savings_pct": 10.0,
+                "encode_elapsed_seconds": 12.0,
+                "completed_at_unix": 1.0,
+            }
+            with mock.patch.dict(
+                "os.environ",
+                {"VIDRECLAIM_CATALOG_PATH": str(catalog_path)},
+            ):
+                _save_processed_record(
+                    root, source, item=item, result=result,
+                )
+                catalog = _load_processed_catalog()
+                self.assertIsNotNone(
+                    _processed_record(root, source, catalog),
+                )
+                self.assertIsNotNone(
+                    _processed_record(root, Source(output), catalog),
+                )
+                source_path.write_bytes(b"changed source")
+                self.assertIsNone(
+                    _processed_record(root, source, catalog),
+                )
 
     def test_interrupted_encode_becomes_resumable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

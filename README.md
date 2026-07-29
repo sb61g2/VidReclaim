@@ -17,12 +17,13 @@ SwiftUI control center for the full toolkit. It provides Mac file and save
 pickers, clearly explained source-handling modes, a destructive-action
 confirmation for rolling deletion, live whole-job and current-file progress,
 speed and ETA, safe cancellation, and a persistent activity log. Its
-Transmission-inspired queue can pause, resume, skip, cancel, and reorder
-individual videos. Sessions survive app restarts and reboots.
+persistent queue can pause, resume, skip, cancel, and reorder individual
+videos. Sessions survive app restarts and reboots.
 
-The app uses the same installed command-line engine described below. The
-side-by-side screenshot reviewer and interactive treemap open locally in the
-default browser, where their draggable and drill-down interfaces work best.
+The app uses the same installed command-line engine described below. Disk-usage
+findings stay in the native interface and can feed selected files or folders
+directly into a queue. The optional side-by-side screenshot reviewer opens
+locally in the default browser.
 
 ## What it does
 
@@ -54,6 +55,14 @@ default browser, where their draggable and drill-down interfaces work best.
 - Persists queue order and item state. After a reboot, completed videos remain
   complete and the interrupted video restarts from its beginning; partially
   written MKV/HEVC output is not unsafely appended.
+- Keeps source-relative folder paths, supports folder-wide inclusion changes,
+  multi-row selection, search, status filters, and sorting by projected raw or
+  percentage savings, source size, encode time, name, status, or queue order.
+- Tracks completed outputs in a persistent media catalog. Unchanged sources and
+  known outputs are marked processed and hidden by default on later scans,
+  preventing accidental repeated encodes.
+- Shows live selected-job totals for projected reclaim, verified space saved,
+  elapsed encode time, and estimated selected encode time.
 - Offers an instant per-video “Compare Options” table for Conservative,
   Balanced, and Compact quality across x265 Very Fast/Medium/Slow and M4
   hardware encoding. It estimates resolution, output size, savings, and total
@@ -120,9 +129,9 @@ The browser UI is served only on `127.0.0.1`. Each proposed job has up to three
 draggable source/new comparisons and an Encode checkbox. Submitting the page
 continues only with the checked jobs.
 
-Outputs go under `ROOT/.vidreclaim/output/`. Queue sessions live under
-`~/Library/Application Support/VidReclaim/Sessions/`; probe metadata is cached
-under `~/Library/Caches/VidReclaim/`.
+Outputs go under `ROOT/.vidreclaim/output/`. Queue sessions and processed-media
+history live under `~/Library/Application Support/VidReclaim/`; probe metadata
+is cached under `~/Library/Caches/VidReclaim/`.
 
 ## Queue controls and reboot resumption
 
@@ -135,13 +144,19 @@ vidreclaim queue-control SESSION.json resume --item ITEM_ID
 vidreclaim queue-control SESSION.json skip --item ITEM_ID
 vidreclaim queue-control SESSION.json cancel --item ITEM_ID
 vidreclaim queue-control SESSION.json move-up --item ITEM_ID
+vidreclaim queue-control SESSION.json exclude --folder "TV/Season 1"
+vidreclaim queue-control SESSION.json include --folder "TV"
+vidreclaim queue-control SESSION.json clear-completed
+vidreclaim queue-control SESSION.json clear-cancelled
+vidreclaim queue-control SESSION.json clear-all
 vidreclaim queue-resume SESSION.json
 ```
 
 Pause/resume uses macOS process suspension, so the encoder keeps its exact
 place while the computer remains on. After a reboot, the session, completed
-items, decisions, and order are restored; only an interrupted current encode
-starts over because appending to a partial MKV is not safely supported.
+items, decisions, inclusion flags, and order are restored; only an interrupted
+current encode starts over because appending to a partial MKV is not safely
+supported. A saved queue can be reopened without scanning its source tree.
 
 ## x265 versus the M4 hardware encoder
 
@@ -187,20 +202,25 @@ explicit tone-mapping choice.
 
 ## Finding what uses the space
 
-Scan a folder, disk, or mounted volume and open an interactive WinDirStat-style
-treemap:
+Scan a folder, disk, or mounted volume:
 
 ```bash
 vidreclaim space "/Volumes/Media"
 vidreclaim space "$HOME/Movies" "$HOME/Downloads"
 ```
 
+The native app embeds the complete findings, supports filtering and size
+ordering, and lets a user select videos or whole directories for a new queue.
+Exact video paths from those findings are passed to the planner, avoiding
+another full-tree discovery walk. Selections must belong to one scanned
+location per queue so source-relative output paths remain unambiguous.
+
 The scan reports allocated disk blocks by default, de-duplicates hard links,
 does not follow symlinks, and stays on each starting filesystem unless
-`--cross-filesystems` is supplied. The browser report highlights video files,
-supports directory drill-down and breadcrumbs, and lists the largest items at
-each level. Use `--logical-size` when apparent file length is more useful than
-allocated space, or `--output report.html --no-open` for automation.
+`--cross-filesystems` is supplied. The command can still produce an HTML
+treemap with `--output`, and `--json-output` writes the complete structured
+tree for automation. Use `--logical-size` when apparent file length is more
+useful than allocated space.
 
 APFS clone sharing and purgeable system storage cannot be measured exactly
 through normal file metadata, so totals may differ somewhat from Disk Utility.
