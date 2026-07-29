@@ -121,6 +121,15 @@ def analyze_fast(
         "balanced": 0.052,
         "compact": 0.042,
     }[profile.name]
+    encoder_size_factor = 1.25 if encoder == "videotoolbox" else {
+        "ultrafast": 1.18,
+        "superfast": 1.14,
+        "veryfast": 1.11,
+        "faster": 1.07,
+        "fast": 1.03,
+        "medium": 1.0,
+        "slow": 0.94,
+    }.get(preset, 1.0)
     candidates: list[Candidate] = []
     encode_fps = _estimated_encode_fps(
         media, encoder=encoder, preset=preset,
@@ -128,7 +137,8 @@ def analyze_fast(
     for width, height in dimensions:
         resolution_factor = 1.45 if height <= 576 else (1.15 if height <= 720 else 1.0)
         target_video_rate = round(
-            width * height * max(media.fps, 23.976) * base_bpp * resolution_factor
+            width * height * max(media.fps, 23.976)
+            * base_bpp * resolution_factor * encoder_size_factor
         )
         # Avoid predicting that a constant-quality encode will inflate already
         # efficient material. Such files should simply be skipped.

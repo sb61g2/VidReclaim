@@ -204,6 +204,7 @@ def _new_item(source: Source, order: int, status: str = "probing") -> dict[str, 
         "output": None,
         "message": "Reading stream metadata",
         "plan": None,
+        "what_if": [],
     }
 
 
@@ -259,6 +260,53 @@ def _plan_media(
         work_dir=work_dir,
         sample_progress=sample_progress,
     )
+
+
+def _what_if_estimates(
+    media: MediaInfo,
+    settings: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Instant option comparisons from already-collected metadata."""
+    variants = [
+        ("x265", "veryfast", "x265 · Very Fast"),
+        ("x265", "medium", "x265 · Medium"),
+        ("x265", "slow", "x265 · Slow"),
+        ("videotoolbox", "medium", "M4 hardware"),
+    ]
+    estimates: list[dict[str, Any]] = []
+    for profile_name in ("conservative", "balanced", "compact"):
+        for encoder, preset, encoder_label in variants:
+            plan = analyze_fast(
+                media,
+                profile=PROFILES[profile_name],
+                min_savings_pct=-1000,
+                min_reclaim_bytes=-(10**18),
+                encoder=encoder,
+                preset=preset,
+            )
+            candidate = plan.candidate
+            if candidate is None:
+                continue
+            estimates.append({
+                "id": f"{profile_name}-{encoder}-{preset}",
+                "profile": profile_name,
+                "encoder": encoder,
+                "preset": preset,
+                "encoder_label": encoder_label,
+                "resolution": candidate.resolution,
+                "projected_bytes": candidate.projected_bytes,
+                "savings_pct": candidate.savings_pct,
+                "encode_seconds": candidate.projected_encode_seconds,
+                "selected": (
+                    profile_name == settings["profile"]
+                    and encoder == settings["encoder"]
+                    and (
+                        encoder == "videotoolbox"
+                        or preset == settings["preset"]
+                    )
+                ),
+            })
+    return estimates
 
 
 def _prepare_session(store: SessionStore) -> tuple[list[Plan], list[dict[str, Any]]]:
@@ -436,6 +484,7 @@ def _prepare_session(store: SessionStore) -> tuple[list[Plan], list[dict[str, An
                 ),
                 output=str(plan.output) if plan.output else None,
                 plan=plan.to_dict(),
+                what_if=_what_if_estimates(media, settings),
             )
         except (CommandError, OSError) as error:
             _update_item(

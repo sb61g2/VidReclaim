@@ -18,6 +18,7 @@ from vidreclaim.planner import (
 from vidreclaim.queueing import (
     SessionStore,
     _normalize_interrupted,
+    _what_if_estimates,
     control_session,
     create_session,
 )
@@ -315,6 +316,32 @@ class QueueTests(unittest.TestCase):
                 on_line=lambda _: None,
                 control=control,
             )
+
+    def test_what_if_matrix_is_instant_and_marks_current_choice(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = self.settings(root)
+            info = media(root / "movie.mkv", 1920, 1080)
+            info.video_bit_rate = 8_000_000
+            info.bit_rate = 8_222_222
+            info.size_bytes = round(info.bit_rate * info.duration / 8)
+            estimates = _what_if_estimates(
+                info, settings,
+            )
+        self.assertEqual(12, len(estimates))
+        self.assertEqual(1, sum(item["selected"] for item in estimates))
+        balanced = {
+            item["encoder_label"]: item
+            for item in estimates if item["profile"] == "balanced"
+        }
+        self.assertLess(
+            balanced["M4 hardware"]["encode_seconds"],
+            balanced["x265 · Medium"]["encode_seconds"],
+        )
+        self.assertGreater(
+            balanced["M4 hardware"]["projected_bytes"],
+            balanced["x265 · Medium"]["projected_bytes"],
+        )
 
 
 if __name__ == "__main__":

@@ -19,6 +19,27 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     }
 }
 
+struct OptionEstimate: Codable, Identifiable {
+    let id: String
+    let profile: String
+    let encoder: String
+    let preset: String
+    let encoderLabel: String
+    let resolution: String
+    let projectedBytes: Int64
+    let savingsPct: Double
+    let encodeSeconds: Double
+    let selected: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case id, profile, encoder, preset, resolution, selected
+        case encoderLabel = "encoder_label"
+        case projectedBytes = "projected_bytes"
+        case savingsPct = "savings_pct"
+        case encodeSeconds = "encode_seconds"
+    }
+}
+
 struct QueueItem: Codable, Identifiable {
     let id: String
     let order: Int
@@ -34,6 +55,7 @@ struct QueueItem: Codable, Identifiable {
     let projectedSavingsPct: Double?
     let output: String?
     let message: String
+    let whatIf: [OptionEstimate]?
 
     enum CodingKeys: String, CodingKey {
         case id, order, name, path, status, progress, duration, output, message
@@ -42,6 +64,7 @@ struct QueueItem: Codable, Identifiable {
         case sourceBytes = "source_bytes"
         case projectedBytes = "projected_bytes"
         case projectedSavingsPct = "projected_savings_pct"
+        case whatIf = "what_if"
     }
 
     var isActive: Bool {
@@ -1174,9 +1197,120 @@ struct SpaceMapView: View {
     }
 }
 
+struct WhatIfView: View {
+    @ObservedObject var model: AppModel
+    let item: QueueItem
+    @Environment(\.dismiss) private var dismiss
+
+    private let profileOrder = ["conservative", "balanced", "compact"]
+
+    private var estimates: [OptionEstimate] {
+        (item.whatIf ?? []).sorted {
+            let leftProfile = profileOrder.firstIndex(of: $0.profile) ?? 99
+            let rightProfile = profileOrder.firstIndex(of: $1.profile) ?? 99
+            if leftProfile != rightProfile { return leftProfile < rightProfile }
+            let encoderOrder = [
+                "x265-veryfast": 0,
+                "x265-medium": 1,
+                "x265-slow": 2,
+                "videotoolbox-medium": 3,
+            ]
+            return encoderOrder["\($0.encoder)-\($0.preset)", default: 99]
+                < encoderOrder["\($1.encoder)-\($1.preset)", default: 99]
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Compare encode options").font(.title2.bold())
+                    Text(item.name).font(.headline)
+                    Text(
+                        "Instant metadata estimates—no additional probing, samples, or test encodes."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+
+            if estimates.isEmpty {
+                ContentUnavailableView(
+                    "Estimates unavailable",
+                    systemImage: "chart.bar.xaxis",
+                    description: Text(
+                        "This session predates the what-if estimator. Re-plan it to compare options."
+                    )
+                )
+            } else {
+                ScrollView {
+                    Grid(
+                        alignment: .leading,
+                        horizontalSpacing: 20,
+                        verticalSpacing: 8
+                    ) {
+                        GridRow {
+                            Text("Quality").fontWeight(.semibold)
+                            Text("Encoder").fontWeight(.semibold)
+                            Text("Resolution").fontWeight(.semibold)
+                            Text("Output size").fontWeight(.semibold)
+                            Text("Savings").fontWeight(.semibold)
+                            Text("Total time").fontWeight(.semibold)
+                        }
+                        Divider().gridCellColumns(6)
+                        ForEach(estimates) { estimate in
+                            GridRow {
+                                HStack(spacing: 5) {
+                                    Text(estimate.profile.capitalized)
+                                    if estimate.selected {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .foregroundStyle(.green)
+                                            .help("Current job setting")
+                                    }
+                                }
+                                Text(estimate.encoderLabel)
+                                Text(estimate.resolution).monospacedDigit()
+                                Text(model.bytesLabel(estimate.projectedBytes))
+                                    .monospacedDigit()
+                                Text("\(estimate.savingsPct, specifier: "%.1f")%")
+                                    .monospacedDigit()
+                                    .foregroundStyle(
+                                        estimate.savingsPct >= 0 ? Color.primary : Color.orange
+                                    )
+                                Text(model.durationLabel(estimate.encodeSeconds))
+                                    .monospacedDigit()
+                            }
+                            .padding(.vertical, 3)
+                        }
+                    }
+                    .padding(14)
+                }
+                .background(
+                    Color(nsColor: .textBackgroundColor),
+                    in: RoundedRectangle(cornerRadius: 10)
+                )
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(.separator))
+
+                Label(
+                    "These are planning estimates, not guarantees. Grain, motion, HDR, and source complexity can change actual size and speed; live ETA corrects itself during encoding.",
+                    systemImage: "info.circle"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+        }
+        .padding(24)
+        .frame(minWidth: 800, minHeight: 480)
+    }
+}
+
 struct ActivityView: View {
     @ObservedObject var model: AppModel
     @State private var showLog = false
+    @State private var whatIfItem: QueueItem?
 
     private var orderedItems: [QueueItem] {
         (model.queueSession?.items ?? []).sorted { $0.order < $1.order }
@@ -1319,6 +1453,13 @@ struct ActivityView: View {
                         }
                         .help("Move later")
                         .disabled(item.order == orderedItems.last?.order)
+                        Divider().frame(height: 18)
+                        Button {
+                            whatIfItem = item
+                        } label: {
+                            Label("Compare Options", systemImage: "chart.bar.xaxis")
+                        }
+                        .disabled((item.whatIf ?? []).isEmpty)
                     }
                 }
 
@@ -1418,6 +1559,9 @@ struct ActivityView: View {
         }
         .padding(28)
         .frame(maxWidth: 1150, maxHeight: .infinity, alignment: .topLeading)
+        .sheet(item: $whatIfItem) { item in
+            WhatIfView(model: model, item: item)
+        }
     }
 }
 

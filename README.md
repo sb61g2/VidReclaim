@@ -54,6 +54,10 @@ default browser, where their draggable and drill-down interfaces work best.
 - Persists queue order and item state. After a reboot, completed videos remain
   complete and the interrupted video restarts from its beginning; partially
   written MKV/HEVC output is not unsafely appended.
+- Offers an instant per-video “Compare Options” table for Conservative,
+  Balanced, and Compact quality across x265 Very Fast/Medium/Slow and M4
+  hardware encoding. It estimates resolution, output size, savings, and total
+  encode time without launching extra probes or trial encodes.
 - Never touches a source by default.
 
 ## Install from source
@@ -148,6 +152,12 @@ VideoToolbox is the “finish tonight” choice. These are useful starting range
 not promises: source complexity, resolution, grain, and x265 preset matter.
 VidReclaim replaces the initial estimate with measured speed as each real
 encode progresses.
+
+The Queue screen’s **Compare Options** button shows these tradeoffs for the
+selected video before or during a job. The matrix is calculated from metadata
+already collected during the normal scan, so opening it adds no analysis time.
+It is intentionally labeled as an estimate: grain, motion, HDR, and source
+complexity can move the actual result.
 
 ## Stitching clips
 

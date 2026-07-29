@@ -64,7 +64,7 @@ def build_app_icon(source: Path, destination: Path, build_root: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--version", default="0.2.0")
+    parser.add_argument("--version", default="0.3.0")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--output-dir", type=Path, default=ROOT / "outputs")
     parser.add_argument(
@@ -144,12 +144,19 @@ def main() -> int:
         str(HERE / "gui" / "VidReclaimApp.swift"),
         "-o", str(app_macos / "VidReclaim"),
     ])
+    # File-provider-backed build folders (including iCloud Documents) can attach
+    # Finder metadata that strict code-signing verification rejects. Remove it
+    # before signing, then verify the exact bundle that will enter the package.
+    run(["/usr/bin/xattr", "-cr", str(payload)])
     run(["/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(app)])
+    run([
+        "/usr/bin/codesign", "--verify", "--deep", "--strict", "--verbose=2",
+        str(app),
+    ])
     run([
         "/usr/bin/codesign", "--force", "--deep", "--sign", "-",
         str(install_root / "vidreclaim"),
     ])
-    run(["/usr/bin/xattr", "-cr", str(payload)])
     shutil.copytree(
         HERE / "scripts", scripts, dirs_exist_ok=True, copy_function=copy_plain,
     )
