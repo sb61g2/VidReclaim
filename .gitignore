@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.vidreclaim/
+.reclaim-originals/
+work/
+outputs/
+*.egg-info/
+dist/
+build/

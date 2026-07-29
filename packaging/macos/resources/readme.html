@@ -1,0 +1,17 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  body { font: 13px -apple-system, sans-serif; line-height: 1.45; color: #20242b; }
+  h2 { margin-bottom: 4px; }
+  code { font-family: ui-monospace, Menlo, monospace; background: #f0f2f5; padding: 2px 4px; }
+  .warn { border-left: 4px solid #e39b24; padding-left: 10px; }
+</style>
+<h2>What will be installed</h2>
+<p><code>/Applications/VidReclaim.app</code> is a native Mac interface for compression planning and jobs, clip stitching, disk maps, progress, and logs.</p>
+<p><code>/usr/local/bin/vidreclaim</code> provides the command-line tool.</p>
+<p>Documentation and an uninstaller are also included. The complete installation uses roughly 100 MB.</p>
+<h2>Safe defaults</h2>
+<p>Planning and visual review never modify source videos. Full runs write verified results to a staging folder unless you explicitly choose replacement or rolling deletion. DVD trailers, menus, and extras are excluded by default.</p>
+<p class="warn"><strong>Rolling deletion is irreversible.</strong> It requires both <code>--delete-source-as-you-go</code> and <code>--yes</code>.</p>
+<h2>Compatibility</h2>
+<p>This build targets Apple-silicon Macs running macOS 26 or later. The bundled codec tools were built against the macOS 26 SDK. The package payload is ad-hoc signed. The installer itself is not Developer ID signed or notarized.</p>

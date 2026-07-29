@@ -1,0 +1,10 @@
+#!/bin/sh
+
+# macOS 26+ may preserve Finder metadata through package payload sidecars.
+# Remove it from executable bundles so ad-hoc signature verification remains
+# clean. Provenance metadata may be protected; failure to remove that benign
+# attribute is intentionally ignored.
+/usr/bin/xattr -cr /Applications/VidReclaim.app >/dev/null 2>&1 || true
+/usr/bin/xattr -cr /usr/local/libexec/vidreclaim >/dev/null 2>&1 || true
+/usr/bin/codesign --force --deep --sign - /Applications/VidReclaim.app >/dev/null 2>&1 || true
+exit 0

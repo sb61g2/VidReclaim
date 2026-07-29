@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "VidReclaim uninstallation needs administrator access."
+  exec sudo "$0" "$@"
+fi
+
+echo "Removing VidReclaim application and command-line files."
+/bin/rm -rf /usr/local/libexec/vidreclaim
+/bin/rm -rf /Applications/VidReclaim.app
+/bin/rm -rf /usr/local/share/doc/vidreclaim
+/bin/rm -f /usr/local/bin/vidreclaim
+/bin/rm -f /usr/local/bin/vidreclaim-uninstall
+/usr/sbin/pkgutil --forget io.vidreclaim.pkg >/dev/null 2>&1 || true
+echo "VidReclaim has been removed. Your videos and job data were not touched."

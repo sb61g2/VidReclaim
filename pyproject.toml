@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vidreclaim"
+version = "0.1.0"
+description = "Sample-driven, space-saving video transcoding for macOS"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "vidreclaim contributors"}]
+dependencies = []
+
+[project.scripts]
+vidreclaim = "vidreclaim.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["vidreclaim*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
