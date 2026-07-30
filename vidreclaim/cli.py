@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 import sys
@@ -30,6 +31,8 @@ from .runner import (
     delete_verified_file_source,
     encode,
     output_path,
+    place_output_beside_source,
+    prune_working_tree,
 )
 from .stitch import StitchSettings, stitch
 from .space import (
@@ -269,11 +272,13 @@ def build_parser() -> argparse.ArgumentParser:
         "action",
         choices=(
             "pause", "resume", "cancel", "skip", "move-up", "move-down",
-            "include", "exclude", "only",
+            "include", "exclude", "only", "threshold",
             "clear-completed", "clear-cancelled", "clear-finished", "clear-all",
         ),
     )
     queue_control.add_argument("--item", action="append", default=[])
+    queue_control.add_argument("--min-savings", type=float)
+    queue_control.add_argument("--min-reclaim-mb", type=float)
     queue_control.add_argument(
         "--folder",
         help="apply the action to this relative folder and its descendants",
@@ -289,11 +294,11 @@ def build_parser() -> argparse.ArgumentParser:
         _add_analysis_options(subparser)
         subparser.add_argument(
             "--output-dir", type=Path,
-            help="output directory (default: ROOT/VidReclaim Output)",
+            help="working directory (default: ROOT/VidReclaim Working)",
         )
         subparser.add_argument(
             "--manifest", type=Path,
-            help="plan/result JSON path (default: ROOT/.vidreclaim/plan.json)",
+            help="plan/result JSON path (default: Application Support)",
         )
         if name == "run":
             source_group = subparser.add_mutually_exclusive_group()
@@ -517,6 +522,8 @@ def command_queue_control(args: argparse.Namespace) -> int:
             action=args.action,
             item_ids=args.item,
             folder=args.folder,
+            min_savings_pct=args.min_savings,
+            min_reclaim_mb=args.min_reclaim_mb,
         )
         print(
             f"Queue control: {args.action}; session is {data['status']}",
@@ -537,14 +544,22 @@ def _paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
     )
     manifest = (
         args.manifest.expanduser().resolve()
-        if args.manifest else state_base / ".vidreclaim" / "plan.json"
+        if args.manifest else _run_state_directory(root) / "plan.json"
     )
     return root, output_root, manifest
 
 
 def _default_output_root(root: Path) -> Path:
     base = root.parent if root.is_file() else root
-    return base / "VidReclaim Output"
+    return base / "VidReclaim Working"
+
+
+def _run_state_directory(root: Path) -> Path:
+    identity = hashlib.sha1(str(root).encode("utf-8")).hexdigest()[:12]
+    return (
+        Path.home() / "Library" / "Application Support"
+        / "VidReclaim" / "Runs" / identity
+    )
 
 
 def _collect_media(args: argparse.Namespace, root: Path) -> tuple[list[MediaInfo], list[dict[str, Any]]]:
@@ -729,8 +744,9 @@ def command_run(args: argparse.Namespace) -> int:
         )
         return 2
     state_base = root.parent if root.is_file() else root
+    run_state = _run_state_directory(root)
     review_session = (
-        state_base / ".vidreclaim" / f"review-{int(time.time())}"
+        run_state / f"review-{int(time.time())}"
         if args.review else None
     )
     plans, dvd_reports = _make_plans(
@@ -741,7 +757,7 @@ def command_run(args: argparse.Namespace) -> int:
         try:
             approved = review_in_browser(
                 plans, session_dir=review_session,
-                decisions_path=state_base / ".vidreclaim" / "review-decisions.json",
+                decisions_path=run_state / "review-decisions.json",
                 sample_seconds=args.sample_seconds,
                 mode=args.review_mode,
                 sample_count=args.samples,
@@ -774,7 +790,7 @@ def command_run(args: argparse.Namespace) -> int:
             (plan.media.source.display_name or plan.media.source.path.name, plan.media.duration)
             for plan in scheduled
         ],
-        progress_path=state_base / ".vidreclaim" / "progress.json",
+        progress_path=run_state / "progress.json",
         initial_eta_seconds=sum(
             plan.candidate.projected_encode_seconds
             for plan in scheduled if plan.candidate
@@ -819,19 +835,29 @@ def command_run(args: argparse.Namespace) -> int:
             )
             if args.replace and plan.media.source.kind == "file":
                 reporter.set_phase("archiving source")
+                staged_parent = result.output.parent
                 archived, final = archive_and_replace_file(
                     root, result,
-                    archive_root=state_base / ".reclaim-originals",
+                    archive_root=state_base / "VidReclaim Originals",
                 )
                 record.update({"archived": str(archived), "final": str(final)})
+                prune_working_tree(staged_parent, working_root=output_root)
                 print(f"  replaced; original archived at {archived}")
-            elif args.delete_source_as_you_go and plan.media.source.kind == "file":
-                reporter.set_phase("deleting source")
-                deleted = delete_verified_file_source(result)
-                record["deleted_source"] = str(deleted)
-                print(f"  deleted verified source: {deleted}")
-            elif plan.media.source.kind == "dvd":
-                successful_dvds.setdefault(plan.media.source.path, []).append(result.output)
+            else:
+                final = place_output_beside_source(
+                    result,
+                    working_root=output_root,
+                )
+                record["output"] = str(final)
+                if args.delete_source_as_you_go and plan.media.source.kind == "file":
+                    reporter.set_phase("deleting source")
+                    deleted = delete_verified_file_source(result)
+                    record["deleted_source"] = str(deleted)
+                    print(f"  deleted verified source: {deleted}")
+                elif plan.media.source.kind == "dvd":
+                    successful_dvds.setdefault(
+                        plan.media.source.path, []
+                    ).append(final)
             result_records.append(record)
             reporter.finish_job()
         except (CommandError, OSError) as error:
@@ -867,7 +893,7 @@ def command_run(args: argparse.Namespace) -> int:
                 else:
                     archived = archive_dvd(
                         root, video_ts,
-                        archive_root=state_base / ".reclaim-originals",
+                        archive_root=state_base / "VidReclaim Originals",
                     )
                     for record in result_records:
                         if str(record.get("source", "")).startswith(
@@ -894,7 +920,7 @@ def command_run(args: argparse.Namespace) -> int:
     print(f"\nFinished: {completed} complete, {errors} errors. Manifest: {manifest}")
     if args.replace:
         print(
-            "Originals remain recoverable under .reclaim-originals; "
+            "Originals remain recoverable under VidReclaim Originals; "
             "review outputs before deleting that archive."
         )
     elif args.delete_source_as_you_go:

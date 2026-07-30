@@ -30,15 +30,13 @@ vidreclaim doctor
 
 ## App
 
-- **Reclaim:** scan, select, analyze, review, and encode.
+- **Reclaim:** choose locations and prepare a queue.
 - **Combine:** join clips in order.
 - **Activity:** filter, sort, control, and resume queues.
 
-The Reclaim picker shows disk use, folder hierarchy, and the largest videos
-across all scanned subfolders.
-
-New outputs are written to the visible `VidReclaim Output` folder under the
-selected root. Sources are kept by default.
+Thresholds, sorting, selection, and folder controls are in the queue.
+Verified outputs return to their source folders. `VidReclaim Working` is
+temporary and removed when empty. Sources are kept by default.
 
 DVD menus, trailers, and extras are excluded by default. Enable DVD extras for
 unusual discs.
@@ -55,8 +53,10 @@ The setup installs the SSH worker, FFmpeg, and tray monitor. It can start with
 Windows. The tray can pause or cancel jobs, close only the monitor, or shut
 down VidReclaim and remote access.
 
-Remote transfers resume after interruption. CPU x265 is the default; NVIDIA
-NVENC is the faster option. DVD and Combine jobs run on the Mac.
+Remote transfers resume after interruption. Upcoming files upload while the
+current file encodes; the next encode can start during the prior download.
+CPU x265 is the default. NVIDIA NVENC is optional. DVD and Combine jobs run on
+the Mac.
 
 ## CLI
 

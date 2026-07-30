@@ -284,11 +284,11 @@ enum SourcePolicy: String, CaseIterable, Identifiable {
     var detail: String {
         switch self {
         case .keep:
-            return "Save to VidReclaim Output. Keep sources."
+            return "Keep source and add Reclaimed.mkv beside it."
         case .archive:
-            return "Replace verified files. Archive originals."
+            return "Replace source. Keep original in VidReclaim Originals."
         case .delete:
-            return "Replace verified files. Delete originals."
+            return "Add Reclaimed.mkv. Delete source after verification."
         }
     }
 }
@@ -542,7 +542,7 @@ final class AppModel: ObservableObject {
         let extensionPart = output.pathExtension.isEmpty
             ? "" : ".\(output.pathExtension)"
         return output.deletingLastPathComponent().appendingPathComponent(
-            ".\(output.deletingPathExtension().lastPathComponent).part\(extensionPart)"
+            "\(output.deletingPathExtension().lastPathComponent) Working\(extensionPart)"
         )
     }
 
@@ -570,7 +570,7 @@ final class AppModel: ObservableObject {
 
     func addSpacePaths() {
         let panel = NSOpenPanel()
-        panel.title = "Choose folders, disks, or volumes to map"
+        panel.title = "Choose videos, folders, or disks"
         panel.prompt = "Add"
         panel.canChooseFiles = true
         panel.canChooseDirectories = true
@@ -698,6 +698,73 @@ final class AppModel: ObservableObject {
         return arguments
     }
 
+    private var selectedLocationRoot: URL? {
+        guard !spacePaths.isEmpty else { return nil }
+        let roots = spacePaths.map {
+            $0.hasDirectoryPath ? $0.standardizedFileURL
+                : $0.deletingLastPathComponent().standardizedFileURL
+        }
+        guard var common = roots.first?.pathComponents else { return nil }
+        for components in roots.dropFirst().map(\.pathComponents) {
+            var length = 0
+            while length < min(common.count, components.count),
+                  common[length] == components[length] {
+                length += 1
+            }
+            common = Array(common.prefix(length))
+        }
+        let path = NSString.path(withComponents: common)
+        return path.isEmpty ? nil : URL(fileURLWithPath: path, isDirectory: true)
+    }
+
+    var canPrepareLocations: Bool {
+        !spacePaths.isEmpty
+            && selectedLocationRoot != nil
+            && (!remoteEnabled || (!remoteHost.isEmpty && !remoteUser.isEmpty))
+    }
+
+    func prepareLocations() {
+        guard let root = selectedLocationRoot,
+              let first = spacePaths.first else { return }
+        let outputBase = first.hasDirectoryPath
+            ? first : first.deletingLastPathComponent()
+        let output = outputBase.appendingPathComponent(
+            "VidReclaim Working", isDirectory: true
+        )
+        compressionSource = root
+        try? FileManager.default.createDirectory(
+            at: sessionsURL, withIntermediateDirectories: true
+        )
+        let session = sessionsURL.appendingPathComponent(
+            "\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString.prefix(8)).json"
+        )
+        currentSessionURL = session
+        workspaceSessionURL = session
+        UserDefaults.standard.set(session.path, forKey: "VidReclaimCurrentSession")
+        var arguments = [
+            "queue-start", root.path,
+            "--session", session.path,
+            "--plan-only",
+            "--output-dir", output.path,
+        ] + spacePaths.flatMap { ["--include-path", $0.path] }
+            + analysisArguments()
+        if deepVerify { arguments.append("--deep-verify") }
+        switch sourcePolicy {
+        case .keep:
+            break
+        case .archive:
+            arguments.append("--replace")
+        case .delete:
+            arguments += ["--delete-source-as-you-go", "--yes"]
+        }
+        selection = .activity
+        run(
+            arguments: arguments,
+            title: "Preparing queue",
+            section: .activity
+        )
+    }
+
     func testRemote() {
         guard !remoteHost.isEmpty, !remoteUser.isEmpty else {
             phase = "Enter a Windows host and user"
@@ -741,7 +808,9 @@ final class AppModel: ObservableObject {
         _ action: String,
         itemID: String? = nil,
         itemIDs: [String] = [],
-        folder: String? = nil
+        folder: String? = nil,
+        minimumSavings: Double? = nil,
+        minimumReclaimMB: Double? = nil
     ) {
         guard let executable = cliPath, let session = currentSessionURL else { return }
         let control = Process()
@@ -753,6 +822,15 @@ final class AppModel: ObservableObject {
             arguments += ["--item", id]
         }
         if let folder { arguments += ["--folder", folder] }
+        if let minimumSavings {
+            arguments += ["--min-savings", String(format: "%.1f", minimumSavings)]
+        }
+        if let minimumReclaimMB {
+            arguments += [
+                "--min-reclaim-mb",
+                String(format: "%.0f", minimumReclaimMB),
+            ]
+        }
         control.arguments = arguments
         let pipe = Pipe()
         control.standardOutput = pipe
@@ -781,6 +859,14 @@ final class AppModel: ObservableObject {
         } catch {
             appendLog("Could not send queue command: \(error.localizedDescription)\n")
         }
+    }
+
+    func applyQueueThresholds() {
+        queueControl(
+            "threshold",
+            minimumSavings: minimumSavings,
+            minimumReclaimMB: minimumReclaimMB
+        )
     }
 
     func moveQueueItem(_ id: String, by offset: Int) {
@@ -869,6 +955,21 @@ final class AppModel: ObservableObject {
             speed = ""
         }
         lastSummary = session.summary
+        if !runningQueue && session.status == "complete" {
+            let assets = url.deletingPathExtension()
+            try? FileManager.default.removeItem(at: assets)
+            try? FileManager.default.removeItem(
+                at: url.deletingPathExtension().appendingPathExtension("review.json")
+            )
+            try? FileManager.default.removeItem(
+                at: URL(fileURLWithPath: url.path + ".lock")
+            )
+            try? FileManager.default.removeItem(at: url)
+            currentSessionURL = nil
+            UserDefaults.standard.removeObject(
+                forKey: "VidReclaimCurrentSession"
+            )
+        }
     }
 
     func durationLabel(_ seconds: Double?) -> String {
@@ -1121,6 +1222,7 @@ final class AppModel: ObservableObject {
     }
 
     private func loadSpaceScan(_ url: URL) {
+        defer { try? FileManager.default.removeItem(at: url) }
         guard let data = try? Data(contentsOf: url),
               let scan = try? JSONDecoder().decode(
                 SpaceScanResult.self, from: data
@@ -1237,6 +1339,7 @@ final class AppModel: ObservableObject {
         newProcess.terminationHandler = { [weak self] completed in
             DispatchQueue.main.async {
                 guard let self else { return }
+                let finishedQueue = self.runningQueue
                 self.outputPipe?.fileHandleForReading.readabilityHandler = nil
                 if !self.pendingOutput.isEmpty {
                     self.handleLine(self.pendingOutput)
@@ -1271,6 +1374,9 @@ final class AppModel: ObservableObject {
                 self.appendLog(
                     "\n\(succeeded ? "Completed successfully." : "Exited with status \(completed.terminationStatus).")\n"
                 )
+                if succeeded && finishedQueue {
+                    self.clearLog()
+                }
                 self.process = nil
                 self.outputPipe = nil
                 self.runningQueue = false
@@ -2263,29 +2369,75 @@ struct PreparedQueueView: View {
     }
 }
 
+struct ReclaimLocationPicker: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        GroupBox("Videos") {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Button("Add…") { model.addSpacePaths() }
+                    Button("Clear") { model.spacePaths.removeAll() }
+                        .disabled(model.spacePaths.isEmpty || model.isRunning)
+                    Spacer()
+                }
+                List {
+                    ForEach(model.spacePaths, id: \.self) { url in
+                        HStack(spacing: 10) {
+                            Image(
+                                systemName: url.hasDirectoryPath
+                                    ? "folder.fill" : "film.fill"
+                            )
+                            .foregroundStyle(AppColors.secondaryText)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(
+                                    url.lastPathComponent.isEmpty
+                                        ? url.path : url.lastPathComponent
+                                )
+                                Text(url.path)
+                                    .font(.caption2)
+                                    .foregroundStyle(AppColors.secondaryText)
+                                    .lineLimit(1)
+                            }
+                            Spacer()
+                            Button {
+                                model.spacePaths.removeAll { $0 == url }
+                            } label: {
+                                Image(systemName: "minus.circle")
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+                .frame(minHeight: 120, maxHeight: 220)
+                .overlay {
+                    if model.spacePaths.isEmpty {
+                        ContentUnavailableView(
+                            "Choose videos or folders",
+                            systemImage: "folder.badge.plus"
+                        )
+                    }
+                }
+            }
+            .padding(.top, 4)
+        }
+    }
+}
+
 struct CompressView: View {
     @ObservedObject var model: AppModel
     @State private var confirmDeletion = false
-
-    private var preparedSession: QueueSession? {
-        guard model.workspaceSessionURL == model.currentSessionURL,
-              let session = model.queueSession,
-              ["paused", "queued", "complete", "attention"].contains(
-                session.status
-              ) else { return nil }
-        return session
-    }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
                 SectionHeading(
                     title: "Reclaim Space",
-                    subtitle: "Choose videos and prepare a queue."
+                    subtitle: "Choose videos, then prepare the queue."
                 )
-                CompressionSourcePicker(model: model)
+                ReclaimLocationPicker(model: model)
 
-                GroupBox {
+                DisclosureGroup("Encoding") {
                     Grid(
                         alignment: .leading,
                         horizontalSpacing: 18,
@@ -2338,8 +2490,8 @@ struct CompressView: View {
                                     "Mode",
                                     selection: $model.remoteEncoder
                                 ) {
-                                    Text("Smaller").tag("x265")
-                                    Text("Faster").tag("nvenc")
+                                    Text("CPU (smaller)").tag("x265")
+                                    Text("GPU (faster)").tag("nvenc")
                                 }
                                 .labelsHidden()
                                 .pickerStyle(.segmented)
@@ -2356,21 +2508,6 @@ struct CompressView: View {
                                 }
                                 .labelsHidden()
                                 .pickerStyle(.segmented)
-                            }
-                        }
-                        GridRow {
-                            Text("Minimum savings")
-                            HStack {
-                                Slider(
-                                    value: $model.minimumSavings,
-                                    in: 5...50,
-                                    step: 1
-                                )
-                                Text(
-                                    "\(model.minimumSavings, specifier: "%.0f")%"
-                                )
-                                .monospacedDigit()
-                                .frame(width: 42, alignment: .trailing)
                             }
                         }
                         GridRow {
@@ -2391,7 +2528,7 @@ struct CompressView: View {
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(model.sourcePolicy.detail)
                                 Label(
-                                    "Output: VidReclaim Output",
+                                    "Finished files return to their source folder",
                                     systemImage: "folder"
                                 )
                             }
@@ -2403,36 +2540,22 @@ struct CompressView: View {
                             )
                         }
                     }
-                    .padding(.top, 6)
-                } label: {
-                    Text("Options")
-                        .font(.headline)
+                    .padding(.top, 10)
                 }
 
                 HStack {
                     Spacer()
-                    Button(
-                        !model.selectedReviewSpaceVideoPaths.isEmpty
-                            ? "Prepare and Review"
-                            : "Prepare"
-                    ) {
+                    Button("Prepare") {
                         if model.sourcePolicy == .delete {
                             confirmDeletion = true
                         } else {
-                            model.queueSelectedSpaceFindings()
+                            model.prepareLocations()
                         }
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(
-                        !model.canPrepareSelectedVideos
+                        !model.canPrepareLocations
                         || model.isRunning
-                    )
-                }
-
-                if let preparedSession {
-                    PreparedQueueView(
-                        model: model,
-                        session: preparedSession
                     )
                 }
             }
@@ -2441,8 +2564,8 @@ struct CompressView: View {
         }
         .alert("Permanently delete verified sources?", isPresented: $confirmDeletion) {
             Button("Cancel", role: .cancel) {}
-            Button("Prepare Queue", role: .destructive) {
-                model.queueSelectedSpaceFindings()
+            Button("Prepare", role: .destructive) {
+                model.prepareLocations()
             }
         } message: {
             Text("Sources are deleted only after verification.")
@@ -3205,6 +3328,8 @@ struct QueueFolderSummary: Identifiable {
     let total: Int
     let selectable: Int
     let included: Int
+    let sourceBytes: Int64
+    let savingsBytes: Int64
 
     var id: String { path }
 
@@ -3224,6 +3349,7 @@ struct ActivityView: View {
     @State private var statusFilter: QueueStatusFilter = .included
     @State private var showProcessed = false
     @State private var selectedFolder = ""
+    @State private var expandedFolders: Set<String> = [""]
 
     private var orderedItems: [QueueItem] {
         (model.queueSession?.items ?? []).sorted { $0.order < $1.order }
@@ -3279,9 +3405,40 @@ struct ActivityView: View {
         return candidate == folder || candidate.hasPrefix(folder + "/")
     }
 
+    private func meetsThreshold(_ item: QueueItem) -> Bool {
+        guard !item.isProcessed,
+              let percent = item.projectedSavingsPct,
+              item.sourceBytes != nil,
+              item.projectedBytes != nil else { return true }
+        return percent >= model.minimumSavings
+            && item.projectedSavingsBytes
+                >= Int64(model.minimumReclaimMB * 1024 * 1024)
+    }
+
+    private func isEffectivelyIncluded(_ item: QueueItem) -> Bool {
+        item.isIncluded
+            || (
+                item.status == "ready"
+                && item.message == "Excluded"
+                && meetsThreshold(item)
+            )
+    }
+
+    private var thresholdItems: [QueueItem] {
+        orderedItems.filter(meetsThreshold)
+    }
+
     private var folderSummaries: [QueueFolderSummary] {
-        var counts: [String: (total: Int, selectable: Int, included: Int)] = [:]
-        for item in orderedItems {
+        var counts: [
+            String: (
+                total: Int,
+                selectable: Int,
+                included: Int,
+                sourceBytes: Int64,
+                savingsBytes: Int64
+            )
+        ] = [:]
+        for item in thresholdItems {
             let components = (item.relativeFolder ?? "")
                 .split(separator: "/").map(String.init)
             var ancestors = [""]
@@ -3293,8 +3450,10 @@ struct ActivityView: View {
                 }
             }
             for folder in ancestors {
-                var current = counts[folder] ?? (0, 0, 0)
+                var current = counts[folder] ?? (0, 0, 0, 0, 0)
                 current.total += 1
+                current.sourceBytes += item.sourceBytes ?? 0
+                current.savingsBytes += item.projectedSavingsBytes
                 if item.canChangeInclusion {
                     current.selectable += 1
                     if item.isIncluded { current.included += 1 }
@@ -3307,7 +3466,9 @@ struct ActivityView: View {
                 path: path,
                 total: count.total,
                 selectable: count.selectable,
-                included: count.included
+                included: count.included,
+                sourceBytes: count.sourceBytes,
+                savingsBytes: count.savingsBytes
             )
         }.sorted {
             if $0.path.isEmpty { return true }
@@ -3317,8 +3478,33 @@ struct ActivityView: View {
         }
     }
 
+    private func parentFolder(_ folder: String) -> String? {
+        guard !folder.isEmpty else { return nil }
+        let components = folder.split(separator: "/")
+        return components.count == 1
+            ? "" : components.dropLast().joined(separator: "/")
+    }
+
+    private func hasChildFolder(_ folder: String) -> Bool {
+        folderSummaries.contains { parentFolder($0.path) == folder }
+    }
+
+    private func ancestorsExpanded(_ folder: String) -> Bool {
+        var parent = parentFolder(folder)
+        while let current = parent {
+            if !expandedFolders.contains(current) { return false }
+            parent = parentFolder(current)
+        }
+        return true
+    }
+
+    private var visibleFolderSummaries: [QueueFolderSummary] {
+        folderSummaries.filter { $0.path.isEmpty || ancestorsExpanded($0.path) }
+    }
+
     private var filteredItems: [QueueItem] {
         let filtered = orderedItems.filter { item in
+            if !meetsThreshold(item) { return false }
             if !showProcessed
                 && statusFilter != .processed
                 && item.isProcessed {
@@ -3335,7 +3521,7 @@ struct ActivityView: View {
             case .all:
                 return true
             case .included:
-                return item.isIncluded && !item.isProcessed
+                return isEffectivelyIncluded(item) && !item.isProcessed
             case .active:
                 return item.isActive
             case .attention:
@@ -3608,6 +3794,56 @@ struct ActivityView: View {
                     )
                 }
 
+                GroupBox("Thresholds") {
+                    Grid(
+                        alignment: .leading,
+                        horizontalSpacing: 12,
+                        verticalSpacing: 8
+                    ) {
+                        GridRow {
+                            Text("Savings")
+                            Slider(
+                                value: $model.minimumSavings,
+                                in: 0...60,
+                                step: 1,
+                                onEditingChanged: { editing in
+                                    if !editing { model.applyQueueThresholds() }
+                                }
+                            )
+                            Text(
+                                "\(model.minimumSavings, specifier: "%.0f")%"
+                            )
+                            .monospacedDigit()
+                            .frame(width: 44, alignment: .trailing)
+                        }
+                        GridRow {
+                            Text("Space")
+                            Slider(
+                                value: $model.minimumReclaimMB,
+                                in: 0...2000,
+                                step: 25,
+                                onEditingChanged: { editing in
+                                    if !editing { model.applyQueueThresholds() }
+                                }
+                            )
+                            Text(
+                                model.minimumReclaimMB >= 1000
+                                    ? String(
+                                        format: "%.1f GB",
+                                        model.minimumReclaimMB / 1000
+                                    )
+                                    : String(
+                                        format: "%.0f MB",
+                                        model.minimumReclaimMB
+                                    )
+                            )
+                            .monospacedDigit()
+                            .frame(width: 64, alignment: .trailing)
+                        }
+                    }
+                    .padding(.top, 4)
+                }
+
                 HStack(spacing: 8) {
                     Text(
                         "\(filteredItems.count.formatted()) of \(orderedItems.count.formatted()) videos"
@@ -3636,6 +3872,26 @@ struct ActivityView: View {
                 }
 
                 HStack(spacing: 8) {
+                    Button("Select All") {
+                        model.queueControl(
+                            "include",
+                            itemIDs: filteredItems
+                                .filter(\.canChangeInclusion).map(\.id)
+                        )
+                    }
+                    .disabled(
+                        !filteredItems.contains(where: \.canChangeInclusion)
+                    )
+                    Button("Select None") {
+                        model.queueControl(
+                            "exclude",
+                            itemIDs: filteredItems
+                                .filter(\.canChangeInclusion).map(\.id)
+                        )
+                    }
+                    .disabled(
+                        !filteredItems.contains(where: \.canChangeInclusion)
+                    )
                     Menu {
                         Button("Include Selected Rows") {
                             model.queueControl(
@@ -3795,18 +4051,45 @@ struct ActivityView: View {
 
                 HSplitView {
                     List {
-                        ForEach(folderSummaries) { summary in
+                        ForEach(visibleFolderSummaries) { summary in
                             let folder = summary.path
                             let depth = folder.split(separator: "/").count
                             HStack(spacing: 7) {
+                                if hasChildFolder(folder) {
+                                    Button {
+                                        if expandedFolders.contains(folder) {
+                                            expandedFolders.remove(folder)
+                                        } else {
+                                            expandedFolders.insert(folder)
+                                        }
+                                    } label: {
+                                        Image(
+                                            systemName: expandedFolders
+                                                .contains(folder)
+                                                ? "minus.square"
+                                                : "plus.square"
+                                        )
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help(
+                                        expandedFolders.contains(folder)
+                                            ? "Collapse" : "Expand"
+                                    )
+                                } else {
+                                    Color.clear.frame(width: 13)
+                                }
                                 Button {
                                     let action = (
                                         summary.selectable > 0
                                         && summary.included == summary.selectable
                                     ) ? "exclude" : "include"
-                                    model.queueControl(
-                                        action, folder: folder
-                                    )
+                                    let ids = thresholdItems
+                                        .filter {
+                                            isInFolder($0, folder: folder)
+                                                && $0.canChangeInclusion
+                                        }
+                                        .map(\.id)
+                                    model.queueControl(action, itemIDs: ids)
                                 } label: {
                                     Image(
                                         systemName: summary.selectionIcon
@@ -3832,8 +4115,19 @@ struct ActivityView: View {
                                         )
                                         .lineLimit(1)
                                         Spacer()
-                                        Text(summary.total.formatted())
-                                            .foregroundStyle(AppColors.secondaryText)
+                                        VStack(alignment: .trailing, spacing: 1) {
+                                            Text(
+                                                "save "
+                                                + model.bytesLabel(
+                                                    summary.savingsBytes
+                                                )
+                                            )
+                                            Text(
+                                                "\(summary.total.formatted()) files"
+                                            )
+                                            .font(.caption2)
+                                        }
+                                        .foregroundStyle(AppColors.secondaryText)
                                     }
                                     .contentShape(Rectangle())
                                 }

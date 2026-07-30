@@ -44,7 +44,12 @@ from vidreclaim.remote import (
     remote_encode,
     remote_job_id,
 )
-from vidreclaim.runner import EncodeControl, _stream_command, output_path
+from vidreclaim.runner import (
+    EncodeControl,
+    _stream_command,
+    output_path,
+    place_output_beside_source,
+)
 from vidreclaim.runner import (
     EncodeResult,
     delete_verified_dvd_source,
@@ -192,13 +197,37 @@ class DiscoveryAndOutputTests(unittest.TestCase):
             source = root / "movie.mp4"
             source.write_bytes(b"video")
             self.assertEqual(
-                root / "VidReclaim Output",
+                root / "VidReclaim Working",
                 _default_output_root(root),
             )
             self.assertEqual(
-                root / "VidReclaim Output",
+                root / "VidReclaim Working",
                 _default_output_root(source),
             )
+
+    def test_verified_output_returns_beside_source_and_prunes_working(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "Library" / "movie.mp4"
+            source.parent.mkdir()
+            source.write_bytes(b"source")
+            working = root / "VidReclaim Working"
+            staged = working / "Library" / "movie.mkv"
+            staged.parent.mkdir(parents=True)
+            staged.write_bytes(b"encoded")
+            info = media(source, 1920, 1080)
+            plan = Plan(
+                info, "encode", "test",
+                candidate=Candidate(1920, 1080, 22),
+            )
+            result = EncodeResult(plan, staged, staged.stat().st_size, 50, True)
+            final = place_output_beside_source(
+                result,
+                working_root=working,
+            )
+            self.assertEqual(source.parent / "movie Reclaimed.mkv", final)
+            self.assertTrue(final.exists())
+            self.assertFalse(working.exists())
 
     def test_explicit_delete_helpers_are_narrowly_scoped(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -514,17 +543,53 @@ class QueueTests(unittest.TestCase):
             items = sorted(store.read()["items"], key=lambda item: item["order"])
             self.assertEqual(["b", "a"], [item["id"] for item in items])
 
+    def test_queue_thresholds_update_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "session.json"
+            create_session(path, root=root, settings=self.settings(root))
+            store = SessionStore(path)
+
+            def add_items(data: dict[str, object]) -> None:
+                data["status"] = "queued"
+                data["items"] = [
+                    {
+                        "id": "large", "order": 0, "status": "ready",
+                        "source_bytes": 1_000_000_000,
+                        "projected_bytes": 500_000_000,
+                        "projected_savings_pct": 50,
+                    },
+                    {
+                        "id": "small", "order": 1, "status": "ready",
+                        "source_bytes": 100_000_000,
+                        "projected_bytes": 80_000_000,
+                        "projected_savings_pct": 20,
+                    },
+                ]
+
+            store.mutate(add_items)
+            control_session(
+                path,
+                action="threshold",
+                min_savings_pct=30,
+                min_reclaim_mb=100,
+            )
+            items = store.read()["items"]
+            self.assertTrue(items[0]["selected"])
+            self.assertFalse(items[1]["selected"])
+
     def test_starting_a_plan_reactivates_cancelled_selected_items(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source_path = root / "movie.mp4"
             source_path.write_bytes(b"source")
-            output = root / ".vidreclaim" / "output" / "movie.mkv"
+            output = root / "VidReclaim Working" / "movie.mkv"
             output.parent.mkdir(parents=True)
             output.write_bytes(b"encoded")
             path = root / "session.json"
             settings = self.settings(root)
             settings["plan_only"] = True
+            settings["output_dir"] = str(root / "VidReclaim Working")
             create_session(path, root=root, settings=settings)
             store = SessionStore(path)
             source_media = media(source_path, 1920, 1080)
@@ -912,7 +977,7 @@ class RemoteEncodingTests(unittest.TestCase):
         ) as ssh:
             size, action = _remote_transfer_state(
                 config,
-                ".vidreclaim/jobs/test/source.mkv",
+                "VidReclaim Working/jobs/test/source.mkv",
             )
         self.assertEqual(12345, size)
         self.assertEqual("cancel", action)

@@ -124,6 +124,10 @@ if (-not $SkipTray) {
             Start-Sleep -Milliseconds 500
         }
     }
+    $legacyWorking = Join-Path $HOME ".vidreclaim"
+    if (Test-Path $legacyWorking) {
+        Remove-Item -Recurse -Force $legacyWorking
+    }
     $trayDestination = Join-Path $trayRoot "VidReclaimTray.ps1"
     Copy-Item -Force $traySource $trayDestination
     if (Test-Path $iconSource) {

@@ -19,7 +19,12 @@ from .model import MediaInfo, Plan, PROFILES, Source
 from .planner import analyze, analyze_fast
 from .probe import probe_file
 from .review import build_review_assets, review_in_browser
-from .remote import config_from_settings
+from .remote import (
+    RemoteEncodeControl,
+    config_from_settings,
+    remote_run_staged,
+    remote_stage,
+)
 from .runner import (
     EncodeControl,
     archive_and_replace_file,
@@ -28,6 +33,8 @@ from .runner import (
     delete_verified_file_source,
     encode,
     output_path,
+    place_output_beside_source,
+    prune_working_tree,
 )
 from .util import CommandError, atomic_write_json
 
@@ -564,7 +571,6 @@ def _prepare_session(store: SessionStore) -> tuple[list[Plan], list[dict[str, An
         sources = list(sources_by_key.values())
     else:
         sources = list(discover(root))
-    min_reclaim_bytes = round(settings["min_reclaim_mb"] * 1024 * 1024)
     processed_catalog = _load_processed_catalog()
     processed_source_keys: set[str] = set()
     items: list[dict[str, Any]] = []
@@ -577,15 +583,6 @@ def _prepare_session(store: SessionStore) -> tuple[list[Plan], list[dict[str, An
         if record:
             _mark_item_from_processed_record(item, record)
             processed_source_keys.add(source.key)
-        elif (
-            source.kind == "file"
-            and source.path.stat().st_size <= min_reclaim_bytes
-        ):
-            item.update({
-                "status": "skipped",
-                "selected": False,
-                "message": "File is smaller than the minimum reclaim threshold",
-            })
         items.append(item)
 
     def begin(data: dict[str, Any]) -> None:
@@ -608,7 +605,6 @@ def _prepare_session(store: SessionStore) -> tuple[list[Plan], list[dict[str, An
         if (
             source.kind == "file"
             and source.key not in processed_source_keys
-            and source.path.stat().st_size > min_reclaim_bytes
         )
     ]
     media_by_key: dict[str, MediaInfo] = {}
@@ -721,6 +717,8 @@ def _prepare_session(store: SessionStore) -> tuple[list[Plan], list[dict[str, An
         plan_index = len(plans)
         review_this_media = selected_for_review(media.source.path)
         media_settings = dict(settings)
+        media_settings["min_savings_pct"] = -1000
+        media_settings["min_reclaim_mb"] = -(10**12)
         media_settings["thorough_analysis"] = bool(
             settings.get("thorough_analysis", False)
             or (
@@ -754,6 +752,13 @@ def _prepare_session(store: SessionStore) -> tuple[list[Plan], list[dict[str, An
             if review_this_media:
                 review_plan_indices.add(plan_index)
             candidate = plan.candidate
+            meets_threshold = bool(
+                candidate
+                and candidate.savings_pct
+                    >= float(settings.get("min_savings_pct") or 0)
+                and media.size_bytes - candidate.projected_bytes
+                    >= round(float(settings.get("min_reclaim_mb") or 0) * 1024 * 1024)
+            )
             item_status = (
                 "ready" if plan.status == "encode"
                 else ("skipped" if plan.status == "skip" else plan.status)
@@ -762,9 +767,12 @@ def _prepare_session(store: SessionStore) -> tuple[list[Plan], list[dict[str, An
                 store,
                 item_id,
                 status=item_status,
-                selected=item_status == "ready",
+                selected=item_status == "ready" and meets_threshold,
                 progress=0.0,
-                message=plan.reason,
+                message=(
+                    plan.reason if meets_threshold or item_status != "ready"
+                    else "Excluded"
+                ),
                 projected_bytes=(
                     candidate.projected_bytes if candidate else None
                 ),
@@ -924,8 +932,12 @@ def _normalize_interrupted(store: SessionStore) -> None:
                 plan_data = item.get("plan")
                 if plan_data and plan_data.get("output"):
                     output = Path(plan_data["output"])
-                    partial = output.with_name(f".{output.stem}.part.mkv")
-                    partial.unlink(missing_ok=True)
+                    output.with_name(
+                        f"{output.stem} Working.mkv"
+                    ).unlink(missing_ok=True)
+                    output.with_name(
+                        f".{output.stem}.part.mkv"
+                    ).unlink(missing_ok=True)
         data["worker_pid"] = None
         if data["status"] in {"running", "interrupted"}:
             data["status"] = "queued"
@@ -936,22 +948,42 @@ def _normalize_interrupted(store: SessionStore) -> None:
     store.mutate(change)
 
 
-def _migrate_hidden_output_root(store: SessionStore) -> None:
+def _move_tree_contents(source: Path, destination: Path) -> None:
+    if not source.exists():
+        return
+    for path in sorted(source.rglob("*"), key=lambda value: len(value.parts)):
+        relative = path.relative_to(source)
+        target = destination / relative
+        if path.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            raise CommandError(f"Cannot migrate legacy file; target exists: {target}")
+        path.replace(target)
+
+
+def _migrate_hidden_library_state(store: SessionStore) -> None:
+    session = store.read()
+    root = Path(session["root"])
+    base = root.parent if root.is_file() else root
+    old_state = base / ".vidreclaim"
+    old_output = old_state / "output"
+    new_output = base / "VidReclaim Output"
+    if old_output.exists():
+        _move_tree_contents(old_output, new_output)
+
     def change(data: dict[str, Any]) -> None:
-        root = Path(data["root"])
-        base = root.parent if root.is_file() else root
-        old_root = (base / ".vidreclaim" / "output").resolve()
+        old_root = old_output.resolve()
         settings = data.get("settings", {})
         configured = Path(
             settings.get("output_dir") or old_root
         ).expanduser().resolve()
         if configured != old_root:
             return
-        new_root = (base / "VidReclaim Output").resolve()
+        new_root = new_output.resolve()
         settings["output_dir"] = str(new_root)
         for item in data.get("items", []):
-            if item.get("status") in {"complete", "processed"}:
-                continue
             output_text = item.get("output")
             if output_text:
                 try:
@@ -970,6 +1002,18 @@ def _migrate_hidden_output_root(store: SessionStore) -> None:
             plan["output"] = str(new_root / relative)
 
     store.mutate(change)
+    if old_state.exists():
+        shutil.rmtree(old_state)
+    old_originals = base / ".reclaim-originals"
+    new_originals = base / "VidReclaim Originals"
+    if old_originals.exists():
+        _move_tree_contents(old_originals, new_originals)
+        shutil.rmtree(old_originals, ignore_errors=True)
+
+
+def _migrate_hidden_output_root(store: SessionStore) -> None:
+    """Compatibility entry point for older callers."""
+    _migrate_hidden_library_state(store)
 
 
 def run_session(
@@ -978,7 +1022,7 @@ def run_session(
     start_encoding: bool | None = None,
 ) -> int:
     store = SessionStore(path)
-    _migrate_hidden_output_root(store)
+    _migrate_hidden_library_state(store)
     _normalize_interrupted(store)
     session = store.read()
     if start_encoding is None:
@@ -1032,6 +1076,9 @@ def run_session(
                     plan_data = item["plan"]
                     if item["status"] == "error" and plan_data.get("output"):
                         output = Path(plan_data["output"])
+                        output.with_name(
+                            f"{output.stem} Working.mkv"
+                        ).unlink(missing_ok=True)
                         output.with_name(
                             f".{output.stem}.part.mkv"
                         ).unlink(missing_ok=True)
@@ -1087,6 +1134,12 @@ def run_session(
 
     store.mutate(started)
     errors = 0
+    remote_config = config_from_settings(settings)
+    pipeline_executor = (
+        ThreadPoolExecutor(max_workers=2) if remote_config is not None else None
+    )
+    pipeline_futures: dict[str, Any] = {}
+    pipeline_launch_futures: dict[str, Any] = {}
     while True:
         session = store.read()
         ready_items = sorted(
@@ -1102,6 +1155,7 @@ def run_session(
         if not ready_items:
             break
         item = ready_items[0]
+        next_item = ready_items[1] if len(ready_items) > 1 else None
         item_id = item["id"]
         plan = Plan.from_dict(item["plan"])
         label = item["name"]
@@ -1196,6 +1250,103 @@ def run_session(
                     if match else (0.0 if transferring else None)
                 ),
             )
+            if (
+                message.startswith("Encoding on ")
+                and pipeline_executor is not None
+                and remote_config is not None
+                and next_item is not None
+                and next_item["id"] not in pipeline_futures
+            ):
+                next_id = next_item["id"]
+                next_plan = Plan.from_dict(next_item["plan"])
+                if next_plan.media.source.kind != "file":
+                    return
+
+                def next_control() -> str:
+                    latest_session = store.read()
+                    latest = next(
+                        candidate for candidate in latest_session["items"]
+                        if candidate["id"] == next_id
+                    )
+                    if not latest.get("selected", True):
+                        return "cancel"
+                    return str(
+                        latest.get("requested_action")
+                        or (
+                            "cancel"
+                            if latest["status"] == "cancelled"
+                            else "pause" if latest["status"] == "paused"
+                            else "run"
+                        )
+                    )
+
+                def next_stage(message: str) -> None:
+                    match = re.search(r"\((\d+)%\)$", message)
+                    _update_item(
+                        store,
+                        next_id,
+                        message=message.replace(
+                            "Uploading ", "Preloading ", 1
+                        ),
+                        transfer_progress=(
+                            min(
+                                1.0,
+                                max(0.0, int(match.group(1)) / 100),
+                            )
+                            if match else 0.0
+                        ),
+                    )
+
+                pipeline_futures[next_id] = pipeline_executor.submit(
+                    remote_stage,
+                    next_plan,
+                    config=remote_config,
+                    profile=profile,
+                    preset=settings["preset"],
+                    stage=next_stage,
+                    control=next_control,
+                )
+            if (
+                message.startswith("Downloading result")
+                and pipeline_executor is not None
+                and remote_config is not None
+                and next_item is not None
+                and next_item["id"] in pipeline_futures
+                and next_item["id"] not in pipeline_launch_futures
+            ):
+                next_id = next_item["id"]
+                next_plan = Plan.from_dict(next_item["plan"])
+                staged = pipeline_futures[next_id]
+
+                def launch_control() -> str:
+                    latest_session = store.read()
+                    latest = next(
+                        candidate for candidate in latest_session["items"]
+                        if candidate["id"] == next_id
+                    )
+                    if not latest.get("selected", True):
+                        return "cancel"
+                    return str(
+                        latest.get("requested_action")
+                        or (
+                            "cancel"
+                            if latest["status"] == "cancelled"
+                            else "pause" if latest["status"] == "paused"
+                            else "run"
+                        )
+                    )
+
+                def launch_after_stage() -> str:
+                    staged.result()
+                    return remote_run_staged(
+                        next_plan,
+                        config=remote_config,
+                        control=launch_control,
+                    )
+
+                pipeline_launch_futures[next_id] = (
+                    pipeline_executor.submit(launch_after_stage)
+                )
 
         try:
             if settings.get("delete_source_as_you_go") and plan.candidate:
@@ -1205,6 +1356,19 @@ def run_session(
                 if free < required:
                     raise CommandError(
                         "Not enough free space for this output and safety margin"
+                    )
+            staged = pipeline_futures.pop(item_id, None)
+            if staged is not None:
+                try:
+                    staged.result()
+                except RemoteEncodeControl:
+                    raise
+                except (CommandError, OSError):
+                    _update_item(
+                        store,
+                        item_id,
+                        message="Retrying transfer",
+                        transfer_progress=None,
                     )
             result = encode(
                 root,
@@ -1240,24 +1404,35 @@ def run_session(
                 "eta_seconds": 0.0,
             }
             if settings.get("replace") and plan.media.source.kind == "file":
+                staged_parent = result.output.parent
                 archived, final = archive_and_replace_file(
                     root,
                     result,
                     archive_root=(
                         root.parent if root.is_file() else root
-                    ) / ".reclaim-originals",
+                    ) / "VidReclaim Originals",
                 )
                 result_data.update({
                     "archived": str(archived),
                     "output": str(final),
                 })
-            elif (
-                settings.get("delete_source_as_you_go")
-                and plan.media.source.kind == "file"
-            ):
-                result_data["deleted_source"] = str(
-                    delete_verified_file_source(result)
+                prune_working_tree(
+                    staged_parent,
+                    working_root=output_root,
                 )
+            else:
+                final = place_output_beside_source(
+                    result,
+                    working_root=output_root,
+                )
+                result_data["output"] = str(final)
+                if (
+                    settings.get("delete_source_as_you_go")
+                    and plan.media.source.kind == "file"
+                ):
+                    result_data["deleted_source"] = str(
+                        delete_verified_file_source(result)
+                    )
             try:
                 _save_processed_record(
                     root,
@@ -1287,6 +1462,20 @@ def run_session(
                     else "Cancelled by user"
                 ),
             )
+        except RemoteEncodeControl as controlled:
+            _update_item(
+                store,
+                item_id,
+                status=(
+                    "paused" if controlled.action == "pause"
+                    else "skipped" if controlled.action == "skip"
+                    else "cancelled"
+                ),
+                requested_action=None,
+                progress=0.0,
+                transfer_progress=None,
+                message=controlled.action.capitalize(),
+            )
         except (CommandError, OSError) as error:
             errors += 1
             _update_item(
@@ -1299,6 +1488,9 @@ def run_session(
                 encode_started_at_unix=None,
                 message=str(error),
             )
+
+    if pipeline_executor is not None:
+        pipeline_executor.shutdown(wait=True, cancel_futures=True)
 
     if settings.get("replace") or settings.get("delete_source_as_you_go"):
         session = store.read()
@@ -1326,7 +1518,7 @@ def run_session(
                         video_ts,
                         archive_root=(
                             root.parent if root.is_file() else root
-                        ) / ".reclaim-originals",
+                        ) / "VidReclaim Originals",
                     )
                     field = "archived_dvd_source"
                     note = "DVD source archived after all selected titles verified"
@@ -1384,6 +1576,8 @@ def run_session(
         })
 
     store.mutate(finished)
+    shutil.rmtree(store.path.with_suffix("") / "review", ignore_errors=True)
+    store.path.with_suffix(".review.json").unlink(missing_ok=True)
     return 1 if errors else 0
 
 
@@ -1394,6 +1588,8 @@ def control_session(
     item_id: str | None = None,
     item_ids: list[str] | None = None,
     folder: str | None = None,
+    min_savings_pct: float | None = None,
+    min_reclaim_mb: float | None = None,
 ) -> dict[str, Any]:
     store = SessionStore(path)
 
@@ -1434,6 +1630,35 @@ def control_session(
             if (not requested_ids or item["id"] in requested_ids)
             and in_folder(item)
         ]
+        if action == "threshold":
+            required_pct = float(min_savings_pct or 0)
+            required_bytes = round(float(min_reclaim_mb or 0) * 1024 * 1024)
+            data.setdefault("settings", {})["min_savings_pct"] = required_pct
+            data["settings"]["min_reclaim_mb"] = float(min_reclaim_mb or 0)
+            for item in items:
+                if item["status"] != "ready":
+                    continue
+                source_bytes = int(item.get("source_bytes") or 0)
+                projected_bytes = int(item.get("projected_bytes") or source_bytes)
+                eligible = (
+                    float(item.get("projected_savings_pct") or 0) >= required_pct
+                    and source_bytes - projected_bytes >= required_bytes
+                )
+                item["selected"] = eligible
+                item["message"] = (
+                    (item.get("plan") or {}).get("reason", "Ready")
+                    if eligible else "Excluded"
+                )
+            data["summary"] = (
+                f"{sum(item.get('selected', False) for item in items)} item(s) included"
+            )
+            data["status"] = "queued"
+            data["phase"] = "Queue updated"
+            data["eta_seconds"] = sum(
+                float(item.get("projected_encode_seconds") or 0)
+                for item in items if item.get("selected", False)
+            )
+            return
         if (
             not requested_ids
             and folder is None
@@ -1506,6 +1731,10 @@ def control_session(
             for item in targets:
                 if item["status"] in selection_states:
                     item["selected"] = action == "include"
+                    item["message"] = (
+                        (item.get("plan") or {}).get("reason", "Ready")
+                        if action == "include" else "Excluded by user"
+                    )
         for item in targets:
             status = item["status"]
             if action == "pause" and status in {"ready", "encoding"}:
@@ -1517,9 +1746,12 @@ def control_session(
                     plan_data = item.get("plan")
                     if plan_data and plan_data.get("output"):
                         output = Path(plan_data["output"])
-                        output.with_name(f".{output.stem}.part.mkv").unlink(
-                            missing_ok=True
-                    )
+                        output.with_name(
+                            f"{output.stem} Working.mkv"
+                        ).unlink(missing_ok=True)
+                        output.with_name(
+                            f".{output.stem}.part.mkv"
+                        ).unlink(missing_ok=True)
                 item["requested_action"] = None
                 item["status"] = "ready"
                 item["selected"] = True
@@ -1567,4 +1799,10 @@ def control_session(
         if action not in {"include", "exclude", "only"}:
             data["eta_seconds"] = progress_eta
 
-    return store.mutate(change)
+    result = store.mutate(change)
+    if action in {
+        "clear-all", "clear-completed", "clear-cancelled", "clear-finished",
+    }:
+        shutil.rmtree(store.path.with_suffix("") / "review", ignore_errors=True)
+        store.path.with_suffix(".review.json").unlink(missing_ok=True)
+    return result

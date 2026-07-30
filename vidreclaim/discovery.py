@@ -13,8 +13,8 @@ VIDEO_EXTENSIONS = {
     ".rm", ".rmvb", ".ts", ".vob", ".webm", ".wmv",
 }
 IGNORED_DIRS = {
-    ".git", ".reclaim-originals", ".vidreclaim", "VidReclaim Output",
-    "__pycache__",
+    ".git", ".reclaim-originals", ".vidreclaim", "VidReclaim Originals",
+    "VidReclaim Output", "VidReclaim Working", "__pycache__",
 }
 
 

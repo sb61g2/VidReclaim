@@ -127,6 +127,47 @@ class EncodeResult:
     verified: bool
 
 
+def _prune_empty_parents(start: Path, stop: Path) -> None:
+    current = start
+    while current == stop or stop in current.parents:
+        try:
+            current.rmdir()
+        except OSError:
+            break
+        if current == stop:
+            break
+        current = current.parent
+
+
+def place_output_beside_source(
+    result: EncodeResult,
+    *,
+    working_root: Path,
+) -> Path:
+    """Move a verified output beside its source and prune its staging path."""
+    source = result.plan.media.source
+    if source.kind == "dvd":
+        destination = source.path.parent / (
+            f"{result.output.stem} Reclaimed.mkv"
+        )
+    else:
+        destination = source.path.with_name(
+            f"{source.path.stem} Reclaimed.mkv"
+        )
+    if destination.exists():
+        raise CommandError(f"Refusing to overwrite existing output: {destination}")
+    previous_parent = result.output.parent
+    result.output.replace(destination)
+    result.output = destination
+    result.plan.output = destination
+    _prune_empty_parents(previous_parent, working_root)
+    return destination
+
+
+def prune_working_tree(path: Path, *, working_root: Path) -> None:
+    _prune_empty_parents(path, working_root)
+
+
 def output_path(root: Path, plan: Plan, output_root: Path) -> Path:
     source = plan.media.source
     resolved_root = root.resolve()
@@ -305,7 +346,15 @@ def encode(
         raise ValueError("Only an encode plan can be run")
     destination = output_path(root, plan, output_root)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(f".{destination.stem}.part.mkv")
+    working_root = output_root.parent / "VidReclaim Working"
+    try:
+        relative_destination = destination.relative_to(output_root)
+    except ValueError:
+        relative_destination = Path(destination.name)
+    temporary = (
+        working_root / relative_destination
+    ).with_name(f"{destination.stem} Working.mkv")
+    temporary.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
         raise CommandError(f"Refusing to overwrite existing output: {destination}")
     if temporary.exists():
@@ -355,9 +404,10 @@ def encode(
         temporary.unlink(missing_ok=True)
         raise
     except BaseException:
-        # Keep the partial file for diagnosis; it is never mistaken for a
-        # completed result and a later run will call attention to it.
+        temporary.unlink(missing_ok=True)
         raise
+    finally:
+        _prune_empty_parents(temporary.parent, working_root)
     plan.output = destination
     return EncodeResult(plan, destination, output_bytes, savings, True)
 

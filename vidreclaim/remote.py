@@ -221,7 +221,7 @@ def _claim_remote_job(config: RemoteConfig, job_root: str) -> None:
 $job = Join-Path $HOME '{job_root}'
 New-Item -ItemType Directory -Force -Path $job | Out-Null
 $removed = Join-Path $HOME (
-    '.vidreclaim\\removed\\' + (Split-Path -Leaf $job) + '.txt'
+    'VidReclaim Working\\removed\\' + (Split-Path -Leaf $job) + '.txt'
 )
 if (Test-Path $removed) {{ Remove-Item -Force $removed }}
 $cleanup = Join-Path $job 'cleanup.txt'
@@ -466,8 +466,8 @@ def _job_state(config: RemoteConfig, job_id: str) -> dict[str, object]:
     raw = _ssh_text(
         config,
         f"""
-$path = Join-Path $HOME '.vidreclaim\\jobs\\{job_id}\\status.json'
-$lease = Join-Path $HOME '.vidreclaim\\jobs\\{job_id}\\client.lease'
+$path = Join-Path $HOME 'VidReclaim Working\\jobs\\{job_id}\\status.json'
+$lease = Join-Path $HOME 'VidReclaim Working\\jobs\\{job_id}\\client.lease'
 if (Test-Path (Split-Path -Parent $lease)) {{
     [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() |
         Set-Content -Encoding ASCII $lease
@@ -499,7 +499,7 @@ def _launch_job(
     job_id: str,
 ) -> subprocess.Popen[str]:
     script = f"""
-$job = Join-Path $HOME '.vidreclaim\\jobs\\{job_id}'
+$job = Join-Path $HOME 'VidReclaim Working\\jobs\\{job_id}'
 $statusPath = Join-Path $job 'status.json'
 $running = $false
 if (Test-Path $statusPath) {{
@@ -536,7 +536,7 @@ def _send_control(config: RemoteConfig, job_id: str, action: str) -> None:
     _ssh_text(
         config,
         f"""
-$path = Join-Path $HOME '.vidreclaim\\jobs\\{job_id}\\control.txt'
+$path = Join-Path $HOME 'VidReclaim Working\\jobs\\{job_id}\\control.txt'
 Set-Content -Encoding ASCII -Path $path -Value '{action}'
 """,
         check=False,
@@ -547,8 +547,8 @@ def remote_cleanup(config: RemoteConfig, job_id: str) -> None:
     _ssh_text(
         config,
         f"""
-$job = Join-Path $HOME '.vidreclaim\\jobs\\{job_id}'
-$removedRoot = Join-Path $HOME '.vidreclaim\\removed'
+$job = Join-Path $HOME 'VidReclaim Working\\jobs\\{job_id}'
+$removedRoot = Join-Path $HOME 'VidReclaim Working\\removed'
 $removed = Join-Path $removedRoot '{job_id}.txt'
 New-Item -ItemType Directory -Force -Path $removedRoot | Out-Null
 [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() |
@@ -559,6 +559,16 @@ if (Test-Path $job) {{
 }}
 if (-not (Test-Path $job)) {{
     Remove-Item -Force $removed -ErrorAction SilentlyContinue
+}}
+$jobsRoot = Split-Path -Parent $job
+$workingRoot = Split-Path -Parent $jobsRoot
+foreach ($path in @($removedRoot, $jobsRoot, $workingRoot)) {{
+    if (
+        (Test-Path $path) -and
+        -not (Get-ChildItem -Force $path -ErrorAction SilentlyContinue)
+    ) {{
+        Remove-Item -Force $path -ErrorAction SilentlyContinue
+    }}
 }}
 """,
         check=False,
@@ -607,52 +617,17 @@ def _remote_encode_claimed(
     control: ControlCallback | None = None,
     stage: StageCallback | None = None,
 ) -> str:
-    if plan.media.source.kind != "file":
-        raise CommandError("Remote encoding currently supports regular video files only")
-    config.target
-    job_id = remote_job_id(plan, config)
-    job_root = f".vidreclaim/jobs/{job_id}"
-    source_suffix = plan.media.source.path.suffix.lower()
-    if re.fullmatch(r"\.[a-z0-9]{1,8}", source_suffix) is None:
-        source_suffix = ".media"
-    source_name = f"source{source_suffix}"
+    job_id, job_root = _stage_remote_job_claimed(
+        plan,
+        config=config,
+        profile=profile,
+        preset=preset,
+        stage=stage,
+        control=control,
+    )
     state = _job_state(config, job_id)
     runner: subprocess.Popen[str] | None = None
     if state.get("state") != "complete":
-        if (
-            state.get("state") != "running"
-            and (control() if control else "run") == "run"
-        ):
-            _clear_remote_control(config, job_root)
-        with tempfile.TemporaryDirectory(prefix="vidreclaim-remote-") as folder:
-            root = Path(folder)
-            manifest = root / "manifest.json"
-            worker = root / "worker.ps1"
-            _write_temp(
-                manifest,
-                json.dumps(
-                    _job_manifest(plan, config, profile, preset, source_name),
-                    separators=(",", ":"),
-                ),
-            )
-            worker_source = files("vidreclaim").joinpath("windows_worker.ps1")
-            _write_temp(worker, worker_source.read_bytes())
-            _upload(config, manifest, f"{job_root}/manifest.json")
-            _upload(config, worker, f"{job_root}/worker.ps1")
-        source_size = plan.media.source.path.stat().st_size
-        staged_size = _remote_size(
-            config, f"{job_root}/{source_name}",
-        )
-        if staged_size != source_size:
-            offset = staged_size if 0 <= staged_size < source_size else 0
-            _upload(
-                config,
-                plan.media.source.path,
-                f"{job_root}/{source_name}",
-                offset=offset,
-                stage=stage,
-                control=control,
-            )
         if stage:
             stage(f"Encoding on {config.host}")
         if state.get("state") not in {"running", "complete", "missing"}:
@@ -721,17 +696,167 @@ def _remote_encode_claimed(
                 _stop_transfer(runner)
 
     download_partial = temporary.with_name(
-        f".{temporary.stem}.remote-{job_id}.download"
+        f"{temporary.stem} Downloading {job_id}.mkv"
     )
-    _download(
-        config,
-        f"{job_root}/output.part.mkv",
-        download_partial,
-        stage=stage,
-        control=control,
-    )
+    try:
+        _download(
+            config,
+            f"{job_root}/output.part.mkv",
+            download_partial,
+            stage=stage,
+            control=control,
+        )
+    except BaseException:
+        download_partial.unlink(missing_ok=True)
+        raise
     download_partial.replace(temporary)
     return job_id
+
+
+def _stage_remote_job_claimed(
+    plan: Plan,
+    *,
+    config: RemoteConfig,
+    profile: Profile,
+    preset: str,
+    stage: StageCallback | None = None,
+    control: ControlCallback | None = None,
+) -> tuple[str, str]:
+    if plan.media.source.kind != "file":
+        raise CommandError("Remote encoding currently supports regular video files only")
+    config.target
+    job_id = remote_job_id(plan, config)
+    job_root = f"VidReclaim Working/jobs/{job_id}"
+    source_suffix = plan.media.source.path.suffix.lower()
+    if re.fullmatch(r"\.[a-z0-9]{1,8}", source_suffix) is None:
+        source_suffix = ".media"
+    source_name = f"source{source_suffix}"
+    state = _job_state(config, job_id)
+    if state.get("state") != "complete":
+        if (
+            state.get("state") != "running"
+            and (control() if control else "run") == "run"
+        ):
+            _clear_remote_control(config, job_root)
+        with tempfile.TemporaryDirectory(prefix="vidreclaim-remote-") as folder:
+            root = Path(folder)
+            manifest = root / "manifest.json"
+            worker = root / "worker.ps1"
+            _write_temp(
+                manifest,
+                json.dumps(
+                    _job_manifest(plan, config, profile, preset, source_name),
+                    separators=(",", ":"),
+                ),
+            )
+            worker_source = files("vidreclaim").joinpath("windows_worker.ps1")
+            _write_temp(worker, worker_source.read_bytes())
+            _upload(config, manifest, f"{job_root}/manifest.json")
+            _upload(config, worker, f"{job_root}/worker.ps1")
+        source_size = plan.media.source.path.stat().st_size
+        staged_size = _remote_size(
+            config, f"{job_root}/{source_name}",
+        )
+        if staged_size != source_size:
+            offset = staged_size if 0 <= staged_size < source_size else 0
+            _upload(
+                config,
+                plan.media.source.path,
+                f"{job_root}/{source_name}",
+                offset=offset,
+                stage=stage,
+                control=control,
+            )
+    return job_id, job_root
+
+
+def remote_stage(
+    plan: Plan,
+    *,
+    config: RemoteConfig,
+    profile: Profile,
+    preset: str,
+    stage: StageCallback | None = None,
+    control: ControlCallback | None = None,
+) -> str:
+    """Upload one upcoming job without starting its encode."""
+    job_id = remote_job_id(plan, config)
+    job_root = f"VidReclaim Working/jobs/{job_id}"
+    _claim_remote_job(config, job_root)
+    try:
+        try:
+            _stage_remote_job_claimed(
+                plan,
+                config=config,
+                profile=profile,
+                preset=preset,
+                stage=stage,
+                control=control,
+            )
+        except RemoteEncodeControl as error:
+            if error.action in {"cancel", "skip"}:
+                remote_cleanup(config, job_id)
+            raise
+        return job_id
+    finally:
+        _release_remote_job(config, job_root)
+
+
+def remote_run_staged(
+    plan: Plan,
+    *,
+    config: RemoteConfig,
+    control: ControlCallback | None = None,
+) -> str:
+    """Start a staged job so its encode can overlap the prior download."""
+    job_id = remote_job_id(plan, config)
+    job_root = f"VidReclaim Working/jobs/{job_id}"
+    _claim_remote_job(config, job_root)
+    runner: subprocess.Popen[str] | None = None
+    last_action = "run"
+    try:
+        state = _job_state(config, job_id)
+        if state.get("state") != "complete":
+            initial_action = control() if control else "run"
+            if initial_action in {"pause", "cancel", "skip"}:
+                if initial_action in {"cancel", "skip"}:
+                    remote_cleanup(config, job_id)
+                raise RemoteEncodeControl(initial_action)
+            runner = _launch_job(config, job_id)
+        while True:
+            action = control() if control else "run"
+            if action in {"pause", "cancel", "skip"} and action != last_action:
+                _send_control(config, job_id, action)
+                last_action = action
+            state = _job_state(config, job_id)
+            status = str(state.get("state") or "missing")
+            if status == "complete":
+                return job_id
+            if (
+                status == "missing"
+                and runner is not None
+                and runner.poll() is not None
+            ):
+                return job_id
+            if status in {"paused", "cancelled", "skipped"}:
+                if status in {"cancelled", "skipped"}:
+                    remote_cleanup(config, job_id)
+                raise RemoteEncodeControl(
+                    "pause" if status == "paused" else status
+                )
+            if status == "error":
+                raise CommandError(
+                    "Windows encode failed: "
+                    f"{state.get('message') or 'unknown error'}"
+                )
+            time.sleep(0.75)
+    finally:
+        if runner is not None:
+            try:
+                runner.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _stop_transfer(runner)
+        _release_remote_job(config, job_root)
 
 
 def remote_encode(
@@ -746,18 +871,23 @@ def remote_encode(
     stage: StageCallback | None = None,
 ) -> str:
     job_id = remote_job_id(plan, config)
-    job_root = f".vidreclaim/jobs/{job_id}"
+    job_root = f"VidReclaim Working/jobs/{job_id}"
     _claim_remote_job(config, job_root)
     try:
-        return _remote_encode_claimed(
-            plan,
-            temporary,
-            config=config,
-            profile=profile,
-            preset=preset,
-            progress=progress,
-            control=control,
-            stage=stage,
-        )
+        try:
+            return _remote_encode_claimed(
+                plan,
+                temporary,
+                config=config,
+                profile=profile,
+                preset=preset,
+                progress=progress,
+                control=control,
+                stage=stage,
+            )
+        except RemoteEncodeControl as error:
+            if error.action in {"cancel", "skip"}:
+                remote_cleanup(config, job_id)
+            raise
     finally:
         _release_remote_job(config, job_root)

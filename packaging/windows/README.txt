@@ -31,5 +31,5 @@ Start-menu entry: VidReclaim
 CPU x265 is the default. RTX 4090 is the faster option.
 
 Transfers use SSH and resume in chunks after an interruption. Sources stage in
-%USERPROFILE%\.vidreclaim\jobs and are removed after the Mac verifies the result.
+%USERPROFILE%\VidReclaim Working\jobs and are removed after the Mac verifies the result.
 Regular video files can run remotely. DVD titles and Combine jobs run on the Mac.

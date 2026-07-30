@@ -107,7 +107,7 @@ def canvas_dimensions(media: list[MediaInfo], canvas: Canvas) -> tuple[int, int]
 
 
 def partial_output_path(output: Path) -> Path:
-    return output.with_name(f".{output.stem}.part{output.suffix}")
+    return output.with_name(f"{output.stem} Working{output.suffix}")
 
 
 def estimate_stitch(

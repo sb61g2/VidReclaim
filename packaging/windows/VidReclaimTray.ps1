@@ -15,7 +15,7 @@ $selfTestRoot = $(if ($SelfTest) {
 $jobRoot = $(if ($SelfTest) {
     Join-Path $selfTestRoot "jobs"
 } else {
-    Join-Path $HOME ".vidreclaim\jobs"
+    Join-Path $HOME "VidReclaim Working\jobs"
 })
 $trashRoot = Join-Path (Split-Path -Parent $jobRoot) "trash"
 $removedRoot = Join-Path (Split-Path -Parent $jobRoot) "removed"
