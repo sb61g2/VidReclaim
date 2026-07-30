@@ -4037,25 +4037,6 @@ struct ActivityView: View {
                                 .help("Show scan details")
                             }
 
-                            HStack {
-                                Text("Batch encoding")
-                                    .font(.caption.bold())
-                                Text(
-                                    scanProgress < 1
-                                        ? "Waiting for scan" : session.displayPhase
-                                )
-                                .font(.caption)
-                                .foregroundStyle(AppColors.secondaryText)
-                                .lineLimit(1)
-                                Spacer()
-                                Text(
-                                    "\(encodeProgress * 100, specifier: "%.1f")%"
-                                )
-                                .font(.caption.monospacedDigit())
-                            }
-                            ProgressView(value: encodeProgress)
-                                .progressViewStyle(.linear)
-
                             if let current = currentProgressItem {
                                 Divider()
                                 HStack {
@@ -4086,6 +4067,28 @@ struct ActivityView: View {
                                 ProgressView(value: current.progress)
                                     .progressViewStyle(.linear)
                             }
+
+                            HStack {
+                                Text("Overall")
+                                    .font(.caption.bold())
+                                Text(
+                                    scanProgress < 1
+                                        ? "Waiting for scan"
+                                        : session.displayPhase
+                                )
+                                .font(.caption)
+                                .foregroundStyle(
+                                    AppColors.secondaryText
+                                )
+                                .lineLimit(1)
+                                Spacer()
+                                Text(
+                                    "\(encodeProgress * 100, specifier: "%.1f")%"
+                                )
+                                .font(.caption.monospacedDigit())
+                            }
+                            ProgressView(value: encodeProgress)
+                                .progressViewStyle(.linear)
                         }
                         .onChange(of: scanProgress >= 1) {
                             _, scanCompleted in
