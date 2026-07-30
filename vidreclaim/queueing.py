@@ -292,7 +292,7 @@ def _mark_item_from_processed_record(
         "selected": False,
         "processed": True,
         "progress": 1.0,
-        "message": "Already processed; hidden by default",
+        "message": "Processed",
         "source_bytes": record.get("source_bytes") or item.get("source_bytes"),
         "output": record.get("output"),
         "output_bytes": record.get("output_bytes"),
@@ -936,12 +936,49 @@ def _normalize_interrupted(store: SessionStore) -> None:
     store.mutate(change)
 
 
+def _migrate_hidden_output_root(store: SessionStore) -> None:
+    def change(data: dict[str, Any]) -> None:
+        root = Path(data["root"])
+        base = root.parent if root.is_file() else root
+        old_root = (base / ".vidreclaim" / "output").resolve()
+        settings = data.get("settings", {})
+        configured = Path(
+            settings.get("output_dir") or old_root
+        ).expanduser().resolve()
+        if configured != old_root:
+            return
+        new_root = (base / "VidReclaim Output").resolve()
+        settings["output_dir"] = str(new_root)
+        for item in data.get("items", []):
+            if item.get("status") in {"complete", "processed"}:
+                continue
+            output_text = item.get("output")
+            if output_text:
+                try:
+                    relative = Path(output_text).resolve().relative_to(old_root)
+                except ValueError:
+                    pass
+                else:
+                    item["output"] = str(new_root / relative)
+            plan = item.get("plan")
+            if not plan or not plan.get("output"):
+                continue
+            try:
+                relative = Path(plan["output"]).resolve().relative_to(old_root)
+            except ValueError:
+                continue
+            plan["output"] = str(new_root / relative)
+
+    store.mutate(change)
+
+
 def run_session(
     path: Path,
     *,
     start_encoding: bool | None = None,
 ) -> int:
     store = SessionStore(path)
+    _migrate_hidden_output_root(store)
     _normalize_interrupted(store)
     session = store.read()
     if start_encoding is None:

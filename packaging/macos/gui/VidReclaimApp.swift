@@ -1,6 +1,15 @@
 import AppKit
 import SwiftUI
 
+private enum AppColors {
+    static let primaryText = Color(nsColor: .labelColor)
+    static let secondaryText = Color(nsColor: .secondaryLabelColor)
+    static let tertiaryText = Color(nsColor: .tertiaryLabelColor)
+    static let success = Color(nsColor: .systemGreen)
+    static let warning = Color(nsColor: .systemOrange)
+    static let error = Color(nsColor: .systemRed)
+}
+
 enum SidebarSection {
     case workspace
     case activity
@@ -259,11 +268,11 @@ enum SourcePolicy: String, CaseIterable, Identifiable {
     var detail: String {
         switch self {
         case .keep:
-            return "Write verified results to .vidreclaim/output and leave every source untouched."
+            return "Save to VidReclaim Output. Keep sources."
         case .archive:
-            return "Replace files only after verification and move originals to .reclaim-originals."
+            return "Replace verified files. Archive originals."
         case .delete:
-            return "Permanently delete each source only after its result verifies."
+            return "Replace verified files. Delete originals."
         }
     }
 }
@@ -1157,6 +1166,12 @@ final class AppModel: ObservableObject {
         NSWorkspace.shared.activateFileViewerSelecting([logURL])
     }
 
+    func revealQueueOutput(_ path: String) {
+        NSWorkspace.shared.activateFileViewerSelecting([
+            URL(fileURLWithPath: path)
+        ])
+    }
+
     private func run(arguments: [String], title: String, section: SidebarSection) {
         guard !isRunning else { return }
         guard let executable = cliPath else {
@@ -1477,11 +1492,11 @@ struct PathChooser: View {
         HStack(spacing: 12) {
             Image(systemName: "externaldrive")
                 .font(.title2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(AppColors.secondaryText)
                 .frame(width: 32)
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).fontWeight(.semibold).lineLimit(1)
-                Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                Text(detail).font(.caption).foregroundStyle(AppColors.secondaryText).lineLimit(2)
             }
             Spacer()
             Button("Choose…", action: action)
@@ -1498,7 +1513,7 @@ struct SectionHeading: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             Text(title).font(.largeTitle.bold())
-            Text(subtitle).foregroundStyle(.secondary)
+            Text(subtitle).foregroundStyle(AppColors.secondaryText)
         }
     }
 }
@@ -1514,17 +1529,17 @@ struct RunningBanner: View {
                     if !model.jobName.isEmpty {
                         Text(model.jobName)
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(AppColors.secondaryText)
                             .lineLimit(1)
                     }
                 }
                 Spacer()
                 if !model.speed.isEmpty {
-                    Text(model.speed).monospacedDigit().foregroundStyle(.secondary)
+                    Text(model.speed).monospacedDigit().foregroundStyle(AppColors.secondaryText)
                 }
                 Label(model.eta, systemImage: "clock")
                     .monospacedDigit()
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(AppColors.secondaryText)
                 Button("Stop", role: .destructive) { model.cancel() }
             }
             if model.runningQueue, let session = model.queueSession {
@@ -1558,7 +1573,6 @@ struct RunningBanner: View {
 
 struct CompressionSourcePicker: View {
     @ObservedObject var model: AppModel
-    let onContinue: () -> Void
     @State private var searchText = ""
 
     private func flatten(
@@ -1665,7 +1679,7 @@ struct CompressionSourcePicker: View {
                         ForEach(model.spacePaths, id: \.self) { url in
                             HStack {
                                 Image(systemName: "folder.fill")
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(AppColors.secondaryText)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(
                                         url.lastPathComponent.isEmpty
@@ -1673,7 +1687,7 @@ struct CompressionSourcePicker: View {
                                     )
                                     Text(url.path)
                                         .font(.caption2)
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle(AppColors.secondaryText)
                                 }
                                 Spacer()
                                 Button(role: .destructive) {
@@ -1690,9 +1704,7 @@ struct CompressionSourcePicker: View {
                             ContentUnavailableView(
                                 "Choose library locations",
                                 systemImage: "folder.badge.plus",
-                                description: Text(
-                                    "Add the folders, files, or disks you want to pick from."
-                                )
+                                description: Text("Add folders, files, or disks.")
                             )
                         }
                     }
@@ -1733,19 +1745,19 @@ struct CompressionSourcePicker: View {
                                 )
                                 .foregroundStyle(
                                     item.kind == "video"
-                                        ? Color.orange : Color.secondary
+                                        ? AppColors.warning : AppColors.secondaryText
                                 )
                                 VStack(alignment: .leading, spacing: 1) {
                                     Text(item.name).lineLimit(1)
                                     Text(item.path)
                                         .font(.caption2)
-                                        .foregroundStyle(.tertiary)
+                                        .foregroundStyle(AppColors.tertiaryText)
                                         .lineLimit(1)
                                 }
                                 Spacer()
                                 Text(model.bytesLabel(item.size))
                                     .font(.caption.monospacedDigit())
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(AppColors.secondaryText)
                                     .frame(width: 90, alignment: .trailing)
                                 Button {
                                     toggleAnalysis(item)
@@ -1784,13 +1796,13 @@ struct CompressionSourcePicker: View {
                             "\(model.selectedSpaceVideoPaths.count.formatted()) video\(model.selectedSpaceVideoPaths.count == 1 ? "" : "s") selected for analysis"
                         )
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(AppColors.secondaryText)
                         if !model.selectedReviewSpaceVideoPaths.isEmpty {
                             Text(
                                 "· \(model.selectedReviewSpaceVideoPaths.count.formatted()) for SBS"
                             )
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(AppColors.secondaryText)
                         }
                         Spacer()
                         let everyVideoID = Set(
@@ -1825,42 +1837,18 @@ struct CompressionSourcePicker: View {
 
                     HStack {
                         Label(
-                            "Choose SBS only where a visual spot-check is useful.",
+                            "SBS is optional.",
                             systemImage: "rectangle.split.2x1"
                         )
                         .font(.caption)
-                        .foregroundStyle(.secondary)
-                        Spacer()
-                        Button("Continue to Encode Settings") {
-                            onContinue()
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(!model.canPrepareSelectedVideos)
+                        .foregroundStyle(AppColors.secondaryText)
                     }
                 }
 
                 if let issue = model.queueSelectionIssue {
                     Label(issue, systemImage: "exclamationmark.triangle.fill")
                         .font(.caption)
-                        .foregroundStyle(.orange)
-                }
-                Text(
-                    "You can change scan settings or locations and scan again after completion or cancellation. SBS is optional and runs only for checked content."
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                DisclosureGroup("Directory scan settings") {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Toggle(
-                            "Use logical file sizes instead of allocated disk space",
-                            isOn: $model.useLogicalSizes
-                        )
-                        Toggle(
-                            "Cross mounted filesystems below each selected location",
-                            isOn: $model.crossFilesystems
-                        )
-                    }
-                    .padding(.top, 6)
+                        .foregroundStyle(AppColors.warning)
                 }
             }
             .padding(.top, 6)
@@ -1876,7 +1864,7 @@ struct ReviewFrameView: View {
         VStack(alignment: .leading, spacing: 5) {
             Text(title)
                 .font(.caption.bold())
-                .foregroundStyle(.secondary)
+                .foregroundStyle(AppColors.secondaryText)
             if let image = NSImage(contentsOfFile: path) {
                 Image(nsImage: image)
                     .resizable()
@@ -1918,7 +1906,7 @@ struct NativeSBSReviewView: View {
                         .font(.headline)
                     Text(item.path)
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(AppColors.secondaryText)
                         .lineLimit(1)
                 }
                 Spacer()
@@ -1927,7 +1915,7 @@ struct NativeSBSReviewView: View {
                         "\(savings, specifier: "%.1f")% projected savings"
                     )
                     .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(AppColors.secondaryText)
                 }
                 Button(isExpanded ? "Hide Frames" : "Compare Frames") {
                     withAnimation { isExpanded.toggle() }
@@ -1946,7 +1934,7 @@ struct NativeSBSReviewView: View {
                     )
                 }
                 .buttonStyle(.bordered)
-                .tint(item.isIncluded ? Color.accentColor : Color.secondary)
+                .tint(item.isIncluded ? Color.accentColor : AppColors.secondaryText)
             }
 
             if isExpanded {
@@ -1983,7 +1971,6 @@ struct NativeSBSReviewView: View {
 struct PreparedQueueView: View {
     @ObservedObject var model: AppModel
     let session: QueueSession
-    let onAdjust: () -> Void
 
     private var reviewItems: [QueueItem] {
         session.items.filter { !($0.reviewPairs ?? []).isEmpty }
@@ -2011,15 +1998,13 @@ struct PreparedQueueView: View {
                         .font(.headline)
                     Spacer()
                     Text("\(includedCount) included")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(AppColors.secondaryText)
                 }
 
                 if !reviewItems.isEmpty {
-                    Text(
-                        "Compare the selected frames here. Exclude any video you do not want encoded."
-                    )
+                    Text("Exclude anything you do not want.")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(AppColors.secondaryText)
                     ForEach(
                         Array(reviewItems.enumerated()),
                         id: \.element.id
@@ -2033,13 +2018,7 @@ struct PreparedQueueView: View {
                 }
 
                 HStack {
-                    Button("Adjust Selection or Settings") {
-                        onAdjust()
-                    }
                     Spacer()
-                    Button("Manage Detailed Queue") {
-                        model.selection = .activity
-                    }
                     Button("Start \(runnableCount) Encode\(runnableCount == 1 ? "" : "s")") {
                         model.resumeQueue()
                     }
@@ -2070,46 +2049,36 @@ struct CompressView: View {
     }
 
     var body: some View {
-        ScrollViewReader { scrollProxy in
-            ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
                 SectionHeading(
                     title: "Reclaim Space",
-                    subtitle: "Select videos, choose settings, and prepare the queue."
+                    subtitle: "Work from top to bottom."
                 )
-                CompressionSourcePicker(
-                    model: model,
-                    onContinue: {
-                        withAnimation {
-                            scrollProxy.scrollTo(
-                                "encode-settings",
-                                anchor: .top
-                            )
-                        }
-                    }
-                )
-                .id("library-selection")
+                CompressionSourcePicker(model: model)
 
-                Label("Step 3 — Choose encode settings", systemImage: "3.circle.fill")
-                    .font(.headline)
-                GroupBox("Quality and speed") {
-                    Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 13) {
+                GroupBox {
+                    Grid(
+                        alignment: .leading,
+                        horizontalSpacing: 18,
+                        verticalSpacing: 13
+                    ) {
                         GridRow {
-                            Text("Quality profile")
-                            Picker("Quality profile", selection: $model.compressionProfile) {
-                                Text("Conservative").tag("conservative")
+                            Text("Quality")
+                            Picker(
+                                "Quality",
+                                selection: $model.compressionProfile
+                            ) {
+                                Text("More detail").tag("conservative")
                                 Text("Balanced").tag("balanced")
-                                Text("Compact").tag("compact")
+                                Text("Smaller").tag("compact")
                             }
                             .labelsHidden()
                             .pickerStyle(.segmented)
                         }
                         GridRow {
-                            Text("Encode on")
-                            Toggle(
-                                "Windows PC",
-                                isOn: $model.remoteEnabled
-                            )
+                            Text("Computer")
+                            Toggle("Use Windows PC", isOn: $model.remoteEnabled)
                             .toggleStyle(.switch)
                         }
                         if model.remoteEnabled {
@@ -2125,12 +2094,6 @@ struct CompressView: View {
                                         text: $model.remoteUser
                                     )
                                     .frame(width: 120)
-                                    TextField(
-                                        "Port",
-                                        value: $model.remotePort,
-                                        format: .number
-                                    )
-                                    .frame(width: 58)
                                     Button("Test") {
                                         model.testRemote()
                                     }
@@ -2142,203 +2105,88 @@ struct CompressView: View {
                                 }
                             }
                             GridRow {
-                                Text("Windows encoder")
+                                Text("Mode")
                                 Picker(
-                                    "Windows encoder",
+                                    "Mode",
                                     selection: $model.remoteEncoder
                                 ) {
-                                    Text("CPU x265 · smaller").tag("x265")
-                                    Text("RTX 4090 · faster").tag("nvenc")
+                                    Text("Smaller").tag("x265")
+                                    Text("Faster").tag("nvenc")
                                 }
                                 .labelsHidden()
                                 .pickerStyle(.segmented)
-                            }
-                            GridRow {
-                                Color.clear.frame(width: 1, height: 1)
-                                Text(
-                                    model.remoteEncoder == "x265"
-                                    ? "Best storage efficiency. Encodes run on the Ryzen CPU."
-                                    : "Much faster. Files may be larger at similar quality."
-                                )
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
                             }
                         } else {
                             GridRow {
-                                Text("Encoder")
-                                Picker("Encoder", selection: $model.compressionEncoder) {
-                                    Text("Smaller files (x265)").tag("x265")
-                                    Text("Faster on M4 (hardware)").tag("videotoolbox")
+                                Text("Mode")
+                                Picker(
+                                    "Mode",
+                                    selection: $model.compressionEncoder
+                                ) {
+                                    Text("Smaller").tag("x265")
+                                    Text("Faster").tag("videotoolbox")
                                 }
                                 .labelsHidden()
                                 .pickerStyle(.segmented)
                             }
-                            GridRow {
-                                Color.clear.frame(width: 1, height: 1)
-                                Text(
-                                    model.compressionEncoder == "videotoolbox"
-                                    ? "Usually 4–8× faster; often 15–35% larger."
-                                    : "Usually 15–35% smaller; often 4–8× slower."
-                                )
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            }
                         }
-                        if (
-                            !model.remoteEnabled
-                            && model.compressionEncoder == "x265"
-                        ) || (
-                            model.remoteEnabled
-                            && model.remoteEncoder == "x265"
-                        ) {
-                            GridRow {
-                                Text("x265 preset")
-                                Picker("x265 preset", selection: $model.compressionPreset) {
-                                    ForEach(
-                                        ["veryfast", "faster", "fast", "medium", "slow"],
-                                        id: \.self
-                                    ) { Text($0.capitalized).tag($0) }
-                                }
-                                .labelsHidden()
-                            }
-                        }
-                        GridRow {
-                            Text("Performance")
-                            HStack(spacing: 10) {
-                                VStack(spacing: 2) {
-                                    Slider(
-                                        value: Binding(
-                                            get: { Double(model.nice) },
-                                            set: { model.nice = Int($0.rounded()) }
-                                        ),
-                                        in: 0...20,
-                                        step: 1
-                                    )
-                                    HStack {
-                                        Text("Encode faster")
-                                        Spacer()
-                                        Text("Mac smoother")
-                                    }
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                }
-                                Text(model.nice.formatted())
-                                    .font(.caption.monospacedDigit())
-                                    .foregroundStyle(.secondary)
-                                    .frame(width: 20, alignment: .trailing)
-                            }
-                        }
-                    }
-                    .padding(.top, 6)
-                }
-                .id("encode-settings")
-
-                GroupBox("Savings threshold") {
-                    Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 13) {
                         GridRow {
                             Text("Minimum savings")
                             HStack {
-                                Slider(value: $model.minimumSavings, in: 5...50, step: 1)
-                                Text("\(model.minimumSavings, specifier: "%.0f")%")
-                                    .monospacedDigit().frame(width: 42, alignment: .trailing)
+                                Slider(
+                                    value: $model.minimumSavings,
+                                    in: 5...50,
+                                    step: 1
+                                )
+                                Text(
+                                    "\(model.minimumSavings, specifier: "%.0f")%"
+                                )
+                                .monospacedDigit()
+                                .frame(width: 42, alignment: .trailing)
                             }
                         }
                         GridRow {
-                            Text("Minimum reclaim")
-                            HStack {
-                                Slider(value: $model.minimumReclaimMB, in: 25...2000, step: 25)
-                                Text("\(model.minimumReclaimMB, specifier: "%.0f") MiB")
-                                    .monospacedDigit().frame(width: 74, alignment: .trailing)
-                            }
-                        }
-                    }
-                    .padding(.top, 6)
-                }
-
-                GroupBox("Scan, review, and disc options") {
-                    VStack(alignment: .leading, spacing: 9) {
-                        Toggle(
-                            "Thorough visual analysis (trial encodes and XPSNR)",
-                            isOn: $model.thoroughAnalysis
-                        )
-                        Picker("SBS method", selection: $model.reviewMode) {
-                            Text("Still frames (fast)").tag("frames")
-                            Text("Short samples").tag("clips")
-                        }
-                        .pickerStyle(.segmented)
-                        Text(
-                            model.reviewMode == "frames"
-                            ? "Encodes only a few selected frames. This quickly checks detail and scaling, but cannot reveal motion artifacts."
-                            : "Encodes short samples for a more representative check of motion and compression. This takes longer."
-                        )
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        Toggle("Decode every output frame during verification", isOn: $model.deepVerify)
-                        Toggle(
-                            "Preserve DVD trailers, menus, and extras",
-                            isOn: $model.preserveDVDExtras
-                        )
-                        if !model.preserveDVDExtras {
-                            Label(
-                                "Main-content-only mode is on. Movie features and episode-length title groups are retained.",
-                                systemImage: "checkmark.shield"
-                            )
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        }
-                        if model.thoroughAnalysis
-                            || model.reviewMode == "clips" {
-                            DisclosureGroup("Sampling details") {
-                                HStack {
-                                    Stepper(
-                                        "\(model.sampleCount) samples per title",
-                                        value: $model.sampleCount, in: 1...3
-                                    )
-                                    Spacer()
-                                    Stepper(
-                                        "\(model.sampleSeconds, specifier: "%.0f") seconds each",
-                                        value: $model.sampleSeconds, in: 4...30, step: 1
-                                    )
+                            Text("Sources")
+                            Picker(
+                                "Sources",
+                                selection: $model.sourcePolicy
+                            ) {
+                                ForEach(SourcePolicy.allCases) {
+                                    Text($0.rawValue).tag($0)
                                 }
-                                .padding(.top, 6)
                             }
+                            .labelsHidden()
+                            .pickerStyle(.segmented)
                         }
-                    }
-                    .padding(.top, 6)
-                }
-
-                GroupBox("After each verified encode") {
-                    VStack(alignment: .leading, spacing: 9) {
-                        Picker("Source handling", selection: $model.sourcePolicy) {
-                            ForEach(SourcePolicy.allCases) { Text($0.rawValue).tag($0) }
-                        }
-                        .pickerStyle(.radioGroup)
-                        Text(model.sourcePolicy.detail)
+                        GridRow {
+                            Color.clear.frame(width: 1, height: 1)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(model.sourcePolicy.detail)
+                                Label(
+                                    "Output: VidReclaim Output",
+                                    systemImage: "folder"
+                                )
+                            }
                             .font(.caption)
                             .foregroundStyle(
-                                model.sourcePolicy == .delete ? Color.orange : Color.secondary
+                                model.sourcePolicy == .delete
+                                    ? AppColors.warning
+                                    : AppColors.secondaryText
                             )
+                        }
                     }
                     .padding(.top, 6)
+                } label: {
+                    Label("Step 3 — Choose options", systemImage: "3.circle.fill")
+                        .font(.headline)
                 }
 
                 HStack {
-                    Text(
-                        "Preparing creates a resumable queue and does not begin full encodes."
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
                     Spacer()
-                    if model.lastSummary != "No plan has been run yet." {
-                        Text(model.lastSummary)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                    }
                     Button(
                         !model.selectedReviewSpaceVideoPaths.isEmpty
-                            ? "Analyze & Review Selection"
-                            : "Analyze Selection"
+                            ? "Prepare and Review"
+                            : "Prepare"
                     ) {
                         if model.sourcePolicy == .delete {
                             confirmDeletion = true
@@ -2356,29 +2204,12 @@ struct CompressView: View {
                 if let preparedSession {
                     PreparedQueueView(
                         model: model,
-                        session: preparedSession,
-                        onAdjust: {
-                            withAnimation {
-                                scrollProxy.scrollTo(
-                                    "library-selection",
-                                    anchor: .top
-                                )
-                            }
-                        }
+                        session: preparedSession
                     )
-                    .id("review-ready")
-                }
-                }
-                .padding(28)
-                .frame(maxWidth: 880, alignment: .leading)
-            }
-            .onChange(of: preparedSession?.id) { _, sessionID in
-                if sessionID != nil {
-                    withAnimation {
-                        scrollProxy.scrollTo("review-ready", anchor: .top)
-                    }
                 }
             }
+            .padding(28)
+            .frame(maxWidth: 880, alignment: .leading)
         }
         .alert("Permanently delete verified sources?", isPresented: $confirmDeletion) {
             Button("Cancel", role: .cancel) {}
@@ -2386,9 +2217,7 @@ struct CompressView: View {
                 model.queueSelectedSpaceFindings()
             }
         } message: {
-            Text(
-                "Preparing and reviewing do not delete anything. If you later start this queue, each source will be deleted only after its replacement passes verification and the actual savings threshold."
-            )
+            Text("Sources are deleted only after verification.")
         }
     }
 }
@@ -2452,18 +2281,18 @@ struct StitchView: View {
                     .disabled(model.stitchInputs.isEmpty || model.isRunning)
                 Spacer()
                 Text("\(model.stitchInputs.count) selected")
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(AppColors.secondaryText)
             }
             List {
                 ForEach(Array(model.stitchInputs.enumerated()), id: \.element) { index, url in
                     HStack {
-                        Text("\(index + 1)").monospacedDigit().foregroundStyle(.secondary)
+                        Text("\(index + 1)").monospacedDigit().foregroundStyle(AppColors.secondaryText)
                             .frame(width: 25, alignment: .trailing)
                         Image(systemName: url.hasDirectoryPath ? "folder" : "film")
                         VStack(alignment: .leading) {
                             Text(url.lastPathComponent).lineLimit(1)
                             Text(url.deletingLastPathComponent().path)
-                                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                .font(.caption).foregroundStyle(AppColors.secondaryText).lineLimit(1)
                         }
                         Spacer()
                         Button { model.moveStitchInput(from: index, by: -1) } label: {
@@ -2495,7 +2324,7 @@ struct StitchView: View {
                     ContentUnavailableView(
                         "No clips yet",
                         systemImage: "rectangle.stack.badge.plus",
-                        description: Text("Add at least two files or folders. Folder contents use natural filename order.")
+                        description: Text("Add at least two clips.")
                     )
                 }
             }
@@ -2521,10 +2350,10 @@ struct StitchView: View {
                                 )
                                 .foregroundStyle(
                                     model.combineResult != nil
-                                        ? Color.green
+                                        ? AppColors.success
                                         : (
                                             model.lastExitSuccessful == false
-                                                ? Color.red : Color.accentColor
+                                                ? AppColors.error : Color.accentColor
                                         )
                                 )
                             }
@@ -2533,7 +2362,7 @@ struct StitchView: View {
                                 if !model.jobName.isEmpty {
                                     Text(model.jobName)
                                         .font(.caption)
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle(AppColors.secondaryText)
                                         .lineLimit(1)
                                 }
                             }
@@ -2545,7 +2374,7 @@ struct StitchView: View {
                                         : "ETA \(model.eta)"
                                 )
                                 .font(.caption.monospacedDigit())
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(AppColors.secondaryText)
                             }
                         }
 
@@ -2577,7 +2406,7 @@ struct StitchView: View {
                                             } ?? "")
                                     )
                                     .font(.caption.monospacedDigit())
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(AppColors.secondaryText)
                                     .lineLimit(1)
                                 }
                                 Spacer()
@@ -2598,11 +2427,11 @@ struct StitchView: View {
                                 verticalSpacing: 7
                             ) {
                                 GridRow {
-                                    Text("Clips").foregroundStyle(.secondary)
+                                    Text("Clips").foregroundStyle(AppColors.secondaryText)
                                     Text(estimate.clipCount.formatted())
                                         .monospacedDigit()
                                     Text("Total runtime")
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle(AppColors.secondaryText)
                                     Text(
                                         model.durationLabel(
                                             estimate.totalDurationSeconds
@@ -2610,27 +2439,27 @@ struct StitchView: View {
                                     )
                                     .monospacedDigit()
                                     Text("Resolution")
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle(AppColors.secondaryText)
                                     Text("\(estimate.width)×\(estimate.height)")
                                         .monospacedDigit()
                                 }
                                 GridRow {
                                     Text("Source size")
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle(AppColors.secondaryText)
                                     Text(model.bytesLabel(estimate.sourceBytes))
                                         .monospacedDigit()
                                     Text(outputSizeTitle)
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle(AppColors.secondaryText)
                                     Text(model.bytesLabel(outputSize))
                                         .monospacedDigit()
                                     Text(differenceTitle)
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle(AppColors.secondaryText)
                                     Text(differenceValue)
                                         .monospacedDigit()
                                 }
                                 GridRow {
                                     Text("Estimated encode")
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle(AppColors.secondaryText)
                                     Text(
                                         model.durationLabel(
                                             estimate.projectedEncodeSeconds
@@ -2638,7 +2467,7 @@ struct StitchView: View {
                                     )
                                     .monospacedDigit()
                                     Text("Output files")
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle(AppColors.secondaryText)
                                     Text(
                                         model.combineResult?.outputCount
                                             .formatted() ?? (
@@ -2653,10 +2482,10 @@ struct StitchView: View {
                             }
                             .font(.caption)
                             Text(
-                                "Size and encode time are metadata-based estimates. Live progress replaces the time estimate during encoding."
+                                "Estimates update during encoding."
                             )
                             .font(.caption2)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(AppColors.secondaryText)
                         }
                     }
                     .padding(.top, 5)
@@ -2724,7 +2553,7 @@ struct StitchView: View {
                         : "HDR clips are converted to BT.709 SDR when color-aware tone mapping is available; otherwise two outputs are created.",
                     systemImage: "info.circle"
                 )
-                .font(.caption).foregroundStyle(.secondary)
+                .font(.caption).foregroundStyle(AppColors.secondaryText)
                 Spacer()
                 Button {
                     model.runStitch()
@@ -2832,7 +2661,7 @@ struct SpaceMapView: View {
                     .disabled(model.spacePaths.isEmpty || model.isRunning)
                 Spacer()
                 Text("\(model.spacePaths.count) location\(model.spacePaths.count == 1 ? "" : "s")")
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(AppColors.secondaryText)
             }
 
             if let scan = model.spaceScan {
@@ -2847,7 +2676,7 @@ struct SpaceMapView: View {
                             "\(scan.root.errors) unreadable",
                             systemImage: "exclamationmark.triangle"
                         )
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(AppColors.warning)
                     }
                     Spacer()
                     TextField("Filter findings", text: $searchText)
@@ -2883,13 +2712,15 @@ struct SpaceMapView: View {
                                     : (item.kind == "video" ? "film.fill" : "doc.fill")
                             )
                             .foregroundStyle(
-                                item.kind == "video" ? .orange : .secondary
+                                item.kind == "video"
+                                    ? AppColors.warning
+                                    : AppColors.secondaryText
                             )
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(item.name).lineLimit(1)
                                 Text(item.path)
                                     .font(.caption2)
-                                    .foregroundStyle(.tertiary)
+                                    .foregroundStyle(AppColors.tertiaryText)
                                     .lineLimit(1)
                             }
                             .padding(
@@ -2900,7 +2731,7 @@ struct SpaceMapView: View {
                             if item.kind == "directory" {
                                 Text("\(item.files.formatted()) files")
                                     .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(AppColors.secondaryText)
                             }
                             Text(model.bytesLabel(item.size))
                                 .monospacedDigit()
@@ -2916,7 +2747,7 @@ struct SpaceMapView: View {
                         "\(selectedVideoPaths.count.formatted()) unique video\(selectedVideoPaths.count == 1 ? "" : "s") selected"
                     )
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(AppColors.secondaryText)
                     Button("Clear Selection") {
                         model.selectedSpaceFindingIDs.removeAll()
                     }
@@ -2940,7 +2771,7 @@ struct SpaceMapView: View {
                                 )
                                 Text(url.path)
                                     .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(AppColors.secondaryText)
                             }
                             Spacer()
                             Button(role: .destructive) {
@@ -2957,9 +2788,7 @@ struct SpaceMapView: View {
                         ContentUnavailableView(
                             "Choose what to map",
                             systemImage: "square.3.layers.3d",
-                            description: Text(
-                                "Scan folders, external disks, or mounted volumes."
-                            )
+                            description: Text("Choose folders or disks.")
                         )
                     }
                 }
@@ -2981,7 +2810,7 @@ struct SpaceMapView: View {
                         systemImage: "checkmark.shield"
                     )
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(AppColors.secondaryText)
                 }
                 .padding(.top, 6)
             }
@@ -3030,10 +2859,10 @@ struct WhatIfView: View {
                     Text("Compare encode options").font(.title2.bold())
                     Text(item.name).font(.headline)
                     Text(
-                        "Uses metadata already collected for this session."
+                        "Uses existing scan data."
                     )
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(AppColors.secondaryText)
                 }
                 Spacer()
                 Button("Done") { dismiss() }
@@ -3045,7 +2874,7 @@ struct WhatIfView: View {
                     "Estimates unavailable",
                     systemImage: "chart.bar.xaxis",
                     description: Text(
-                        "This session predates the what-if estimator. Re-plan it to compare options."
+                        "Re-plan this queue."
                     )
                 )
             } else {
@@ -3070,7 +2899,7 @@ struct WhatIfView: View {
                                     Text(estimate.profile.capitalized)
                                     if estimate.selected {
                                         Image(systemName: "checkmark.circle.fill")
-                                            .foregroundStyle(.green)
+                                            .foregroundStyle(AppColors.success)
                                             .help("Current job setting")
                                     }
                                 }
@@ -3081,7 +2910,7 @@ struct WhatIfView: View {
                                 Text("\(estimate.savingsPct, specifier: "%.1f")%")
                                     .monospacedDigit()
                                     .foregroundStyle(
-                                        estimate.savingsPct >= 0 ? Color.primary : Color.orange
+                                        estimate.savingsPct >= 0 ? AppColors.primaryText : AppColors.warning
                                     )
                                 Text(model.durationLabel(estimate.encodeSeconds))
                                     .monospacedDigit()
@@ -3098,11 +2927,11 @@ struct WhatIfView: View {
                 .overlay(RoundedRectangle(cornerRadius: 10).stroke(.separator))
 
                 Label(
-                    "Estimates can vary with grain, motion, HDR, and source complexity. The ETA updates during encoding.",
+                    "Actual results may vary.",
                     systemImage: "info.circle"
                 )
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(AppColors.secondaryText)
             }
         }
         .padding(24)
@@ -3125,12 +2954,12 @@ struct QueueSummaryCard: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(AppColors.secondaryText)
                 Text(value)
                     .font(.headline.monospacedDigit())
                 Text(detail)
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(AppColors.tertiaryText)
                     .lineLimit(1)
             }
             Spacer(minLength: 0)
@@ -3164,7 +2993,7 @@ struct ActivityView: View {
     @State private var whatIfItem: QueueItem?
     @State private var searchText = ""
     @State private var sortOption: QueueSortOption = .savingsBytes
-    @State private var statusFilter: QueueStatusFilter = .all
+    @State private var statusFilter: QueueStatusFilter = .included
     @State private var showProcessed = false
     @State private var selectedFolder = ""
 
@@ -3180,6 +3009,33 @@ struct ActivityView: View {
 
     private var selectedItems: [QueueItem] {
         orderedItems.filter { model.selectedQueueItemIDs.contains($0.id) }
+    }
+
+    private var pausableItems: [QueueItem] {
+        includedItems.filter { ["ready", "encoding"].contains($0.status) }
+    }
+
+    private var resumableItems: [QueueItem] {
+        includedItems.filter {
+            ["paused", "cancelled", "error"].contains($0.status)
+                && $0.output != nil
+        }
+    }
+
+    private var cancellableItems: [QueueItem] {
+        includedItems.filter { !$0.isTerminal }
+    }
+
+    private var completedItems: [QueueItem] {
+        orderedItems.filter { ["complete", "processed"].contains($0.status) }
+    }
+
+    private var cancelledItems: [QueueItem] {
+        orderedItems.filter { $0.status == "cancelled" }
+    }
+
+    private var finishedItems: [QueueItem] {
+        orderedItems.filter(\.isTerminal)
     }
 
     private var currentProgressItem: QueueItem? {
@@ -3329,15 +3185,16 @@ struct ActivityView: View {
 
     private func statusColor(_ status: String) -> Color {
         switch status {
-        case "complete", "processed": return .green
+        case "complete", "processed": return AppColors.success
         case "encoding", "verifying": return .accentColor
-        case "paused": return .orange
-        case "cancelled", "error": return .red
-        default: return .secondary
+        case "paused": return AppColors.warning
+        case "cancelled", "error": return AppColors.error
+        default: return AppColors.secondaryText
         }
     }
 
     private func itemDetail(_ item: QueueItem) -> String {
+        if !item.isIncluded || item.status == "skipped" { return "" }
         guard item.isActive else { return item.message }
         if item.transferProgress != nil { return item.message }
         return String(format: "%.1f%%", item.progress * 100)
@@ -3359,14 +3216,14 @@ struct ActivityView: View {
                                 Text(session.name).font(.title3.bold())
                                 Text(session.root)
                                     .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(AppColors.secondaryText)
                                     .lineLimit(1)
                             }
                             Spacer()
                             VStack(alignment: .trailing, spacing: 2) {
                                 Text(model.eta).font(.title3.monospacedDigit())
                                 Text(model.speed.isEmpty ? "remaining" : "\(model.speed) · remaining")
-                                    .font(.caption).foregroundStyle(.secondary)
+                                    .font(.caption).foregroundStyle(AppColors.secondaryText)
                             }
                         }
                         let scanProgress = session.scanFraction ?? (
@@ -3385,7 +3242,7 @@ struct ActivityView: View {
                                         ? "Complete" : session.displayPhase
                                 )
                                 .font(.caption)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(AppColors.secondaryText)
                                 .lineLimit(1)
                                 Spacer()
                                 Text(
@@ -3404,7 +3261,7 @@ struct ActivityView: View {
                                         ? "Waiting for scan" : session.displayPhase
                                 )
                                 .font(.caption)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(AppColors.secondaryText)
                                 .lineLimit(1)
                                 Spacer()
                                 Text(
@@ -3435,7 +3292,7 @@ struct ActivityView: View {
                                             "ETA \(model.durationLabel(eta))"
                                         )
                                         .font(.caption.monospacedDigit())
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle(AppColors.secondaryText)
                                     }
                                     Text(
                                         "\(current.progress * 100, specifier: "%.1f")%"
@@ -3449,23 +3306,26 @@ struct ActivityView: View {
                         HStack {
                             Text(session.summary)
                                 .font(.caption)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(AppColors.secondaryText)
                             Spacer()
                             Button {
                                 model.queueControl("pause")
                             } label: {
                                 Label("Pause All", systemImage: "pause.fill")
                             }
+                            .disabled(pausableItems.isEmpty)
                             Button {
                                 model.queueControl("resume")
                             } label: {
                                 Label("Resume All", systemImage: "play.fill")
                             }
+                            .disabled(resumableItems.isEmpty)
                             Button(role: .destructive) {
                                 model.queueControl("cancel")
                             } label: {
                                 Label("Cancel All", systemImage: "xmark")
                             }
+                            .disabled(cancellableItems.isEmpty)
                             if !model.isRunning
                                 && !["complete", "attention", "running"].contains(session.status)
                                 && (
@@ -3592,7 +3452,11 @@ struct ActivityView: View {
                     } label: {
                         Label("Pause", systemImage: "pause")
                     }
-                    .disabled(selectedItems.isEmpty)
+                    .disabled(
+                        !selectedItems.contains {
+                            ["ready", "encoding"].contains($0.status)
+                        }
+                    )
                     Button {
                         model.queueControl(
                             "resume", itemIDs: selectedItems.map(\.id)
@@ -3600,7 +3464,13 @@ struct ActivityView: View {
                     } label: {
                         Label("Resume", systemImage: "play")
                     }
-                    .disabled(selectedItems.isEmpty)
+                    .disabled(
+                        !selectedItems.contains {
+                            ["paused", "cancelled", "error"]
+                                .contains($0.status)
+                                && $0.output != nil
+                        }
+                    )
                     Button {
                         model.queueControl(
                             "skip", itemIDs: selectedItems.map(\.id)
@@ -3608,7 +3478,7 @@ struct ActivityView: View {
                     } label: {
                         Label("Skip", systemImage: "forward.end")
                     }
-                    .disabled(selectedItems.isEmpty)
+                    .disabled(!selectedItems.contains { !$0.isTerminal })
                     Button(role: .destructive) {
                         model.queueControl(
                             "cancel", itemIDs: selectedItems.map(\.id)
@@ -3616,7 +3486,7 @@ struct ActivityView: View {
                     } label: {
                         Label("Cancel", systemImage: "xmark")
                     }
-                    .disabled(selectedItems.isEmpty)
+                    .disabled(!selectedItems.contains { !$0.isTerminal })
 
                     if let item = selectedItem {
                         Divider().frame(height: 18)
@@ -3649,23 +3519,39 @@ struct ActivityView: View {
                             )
                         }
                         .disabled((item.whatIf ?? []).isEmpty)
+                        if let output = item.output {
+                            Button {
+                                model.revealQueueOutput(output)
+                            } label: {
+                                Label("Show Output", systemImage: "folder")
+                            }
+                        }
                     }
                     Spacer()
+                    Button {
+                        model.queueControl("clear-completed")
+                        model.selectedQueueItemIDs.removeAll()
+                    } label: {
+                        Label("Clear Completed", systemImage: "trash")
+                    }
+                    .disabled(
+                        completedItems.isEmpty
+                            || model.isRunning
+                            || session.status == "running"
+                    )
                     Menu {
-                        Button("Clear Completed") {
-                            model.queueControl("clear-completed")
-                            model.selectedQueueItemIDs.removeAll()
-                        }
                         Button("Clear Cancelled") {
                             model.queueControl("clear-cancelled")
                             model.selectedQueueItemIDs.removeAll()
                         }
-                        Button("Clear All Finished") {
+                        .disabled(cancelledItems.isEmpty)
+                        Button("Clear Finished") {
                             model.queueControl("clear-finished")
                             model.selectedQueueItemIDs.removeAll()
                         }
+                        .disabled(finishedItems.isEmpty)
                         Divider()
-                        Button("Clear Queue", role: .destructive) {
+                        Button("Clear All", role: .destructive) {
                             model.queueControl("clear-all")
                             model.selectedQueueItemIDs.removeAll()
                         }
@@ -3673,8 +3559,10 @@ struct ActivityView: View {
                             model.isRunning || session.status == "running"
                         )
                     } label: {
-                        Label("Clear", systemImage: "trash")
+                        Image(systemName: "chevron.down")
                     }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
                 }
 
                 HSplitView {
@@ -3717,7 +3605,7 @@ struct ActivityView: View {
                                         .lineLimit(1)
                                         Spacer()
                                         Text(summary.total.formatted())
-                                            .foregroundStyle(.secondary)
+                                            .foregroundStyle(AppColors.secondaryText)
                                     }
                                     .contentShape(Rectangle())
                                 }
@@ -3764,11 +3652,11 @@ struct ActivityView: View {
                                         if item.isProcessed {
                                             Text("Processed")
                                                 .font(.caption2.bold())
-                                                .foregroundStyle(.green)
+                                                .foregroundStyle(AppColors.success)
                                         } else if !item.isIncluded {
                                             Text("Excluded")
                                                 .font(.caption2.bold())
-                                                .foregroundStyle(.secondary)
+                                                .foregroundStyle(AppColors.secondaryText)
                                         } else {
                                             Text(item.status.capitalized)
                                                 .font(.caption2.bold())
@@ -3779,12 +3667,15 @@ struct ActivityView: View {
                                     }
                                     Text(item.relativePath ?? item.path)
                                         .font(.caption2)
-                                        .foregroundStyle(.tertiary)
+                                        .foregroundStyle(AppColors.tertiaryText)
                                         .lineLimit(1)
-                                    Text(itemDetail(item))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
+                                    let detail = itemDetail(item)
+                                    if !detail.isEmpty {
+                                        Text(detail)
+                                            .font(.caption)
+                                            .foregroundStyle(AppColors.secondaryText)
+                                            .lineLimit(1)
+                                    }
                                 }
                                 Spacer(minLength: 8)
                                 VStack(alignment: .trailing, spacing: 2) {
@@ -3803,13 +3694,13 @@ struct ActivityView: View {
                                         "\(model.bytesLabel(item.sourceBytes)) → \(model.bytesLabel(item.projectedBytes ?? item.outputBytes))"
                                     )
                                     .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(AppColors.secondaryText)
                                     if !item.isTerminal {
                                         Text(
                                             "~\(model.durationLabel(item.projectedEncodeSeconds ?? item.etaSeconds))"
                                         )
                                         .font(.caption.monospacedDigit())
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle(AppColors.secondaryText)
                                     }
                                 }
                                 .frame(width: 215, alignment: .trailing)
@@ -3827,8 +3718,8 @@ struct ActivityView: View {
                                 systemImage: "line.3.horizontal.decrease.circle",
                                 description: Text(
                                     showProcessed
-                                        ? "Adjust the folder, search, or status filter."
-                                        : "Processed items are hidden by default."
+                                        ? "Change the filters."
+                                        : "Processed items are hidden."
                                 )
                             )
                         }
@@ -3839,9 +3730,7 @@ struct ActivityView: View {
                 ContentUnavailableView(
                     "No queue session yet",
                     systemImage: "list.bullet.rectangle",
-                    description: Text(
-                        "Choose media in the Workspace, then prepare a queue."
-                    )
+                    description: Text("Prepare a queue in Reclaim.")
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -3936,6 +3825,7 @@ struct ContentView: View {
                 }
             }
         }
+        .foregroundStyle(AppColors.primaryText)
         .onReceive(
             NotificationCenter.default.publisher(
                 for: NSApplication.willTerminateNotification

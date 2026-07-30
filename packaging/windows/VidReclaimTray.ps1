@@ -79,17 +79,42 @@ function Get-RemoteJobs {
         }
         $state = "Waiting"
         $fraction = 0.0
+        $controlAction = ""
+        $controlPath = Join-Path $directory.FullName "control.txt"
+        if (Test-Path $controlPath) {
+            try {
+                $controlAction = (
+                    Get-Content -Raw $controlPath
+                ).Trim().ToLowerInvariant()
+            }
+            catch {}
+        }
         if ($status -and $status.state) {
             $state = [string]$status.state
             if ($status.fraction -ne $null) {
                 $fraction = [double]$status.fraction
             }
         }
+        elseif ($controlAction -eq "cancel") {
+            $state = "cancelled"
+        }
+        elseif ($controlAction -eq "pause") {
+            $state = "paused"
+        }
+        elseif ($controlAction -eq "skip") {
+            $state = "skipped"
+        }
         elseif ($manifest -or $source) {
             $state = "uploading"
             if ($totalBytes -gt 0) {
                 $fraction = [Math]::Min(1.0, $sourceBytes / $totalBytes)
             }
+        }
+        if (
+            $controlAction -eq "cancel" -and
+            $state -in @("starting", "running", "uploading", "waiting")
+        ) {
+            $state = "cancelling"
         }
         $name = $directory.Name
         if ($manifest -and $manifest.source_display_name) {
@@ -133,7 +158,14 @@ function Get-RemoteJobs {
 function Set-JobControl {
     param([string]$Action)
     foreach ($job in Get-RemoteJobs) {
-        if ($job.State -in @("starting", "running", "uploading", "waiting")) {
+        $canPause = $job.State -in @(
+            "starting", "running", "uploading", "waiting"
+        )
+        $canCancel = $canPause -or $job.State -eq "paused"
+        if (
+            ($Action -eq "pause" -and $canPause) -or
+            ($Action -eq "cancel" -and $canCancel)
+        ) {
             Set-Content `
                 -Encoding ASCII `
                 -Path (Join-Path $job.Directory "control.txt") `
@@ -143,16 +175,6 @@ function Set-JobControl {
 }
 
 function Remove-FinishedStaging {
-    $answer = [System.Windows.Forms.MessageBox]::Show(
-        "Remove completed, cancelled, and failed staging files? " +
-        "A completed result that has not returned to the Mac will be lost.",
-        "Remove staging files",
-        [System.Windows.Forms.MessageBoxButtons]::OKCancel,
-        [System.Windows.Forms.MessageBoxIcon]::Warning
-    )
-    if ($answer -ne [System.Windows.Forms.DialogResult]::OK) {
-        return
-    }
     foreach ($job in Get-RemoteJobs) {
         if ($job.State -in @("complete", "cancelled", "error", "skipped")) {
             Remove-Item -Recurse -Force $job.Directory -ErrorAction SilentlyContinue
@@ -256,16 +278,6 @@ function Set-SshServiceState {
 }
 
 function Stop-VidReclaimCompletely {
-    $answer = [System.Windows.Forms.MessageBox]::Show(
-        "Cancel active jobs, stop remote access, and exit VidReclaim? " +
-        "Staged files will be retained.",
-        "Stop VidReclaim completely",
-        [System.Windows.Forms.MessageBoxButtons]::OKCancel,
-        [System.Windows.Forms.MessageBoxIcon]::Warning
-    )
-    if ($answer -ne [System.Windows.Forms.DialogResult]::OK) {
-        return
-    }
     $jobs = @(Get-RemoteJobs)
     Set-JobControl "cancel"
     Start-Sleep -Seconds 3
@@ -286,15 +298,17 @@ function Stop-VidReclaimCompletely {
                     -ErrorAction SilentlyContinue
             }
         }
-        if ($job.WorkerPid -gt 0) {
+        if (
+            $job.WorkerPid -gt 0 -and
+            $job.State -in @("starting", "running", "cancelling")
+        ) {
             $workerProcess = Get-CimInstance `
                 Win32_Process `
                 -Filter "ProcessId=$($job.WorkerPid)" `
                 -ErrorAction SilentlyContinue
             if (
                 $workerProcess -and
-                $workerProcess.Name -eq "powershell.exe" -and
-                $workerProcess.CommandLine -like "*windows_worker.ps1*"
+                $workerProcess.Name -eq "powershell.exe"
             ) {
                 Stop-Process `
                     -Id $job.WorkerPid `
@@ -384,15 +398,7 @@ $cancelButton.Text = "Cancel Active"
 $cancelButton.Location = New-Object Drawing.Point(212, 310)
 $cancelButton.Anchor = "Bottom,Left"
 $cancelButton.Add_Click({
-    $answer = [System.Windows.Forms.MessageBox]::Show(
-        "Cancel every active VidReclaim job?",
-        "Cancel active jobs",
-        [System.Windows.Forms.MessageBoxButtons]::OKCancel,
-        [System.Windows.Forms.MessageBoxIcon]::Warning
-    )
-    if ($answer -eq [System.Windows.Forms.DialogResult]::OK) {
-        Set-JobControl "cancel"
-    }
+    Set-JobControl "cancel"
 })
 $form.Controls.Add($cancelButton)
 
@@ -444,15 +450,7 @@ $pauseItem = $menu.Items.Add("Pause Active Jobs")
 $pauseItem.Add_Click({ Set-JobControl "pause" })
 $cancelItem = $menu.Items.Add("Cancel Active Jobs")
 $cancelItem.Add_Click({
-    $answer = [System.Windows.Forms.MessageBox]::Show(
-        "Cancel every active VidReclaim job?",
-        "Cancel active jobs",
-        [System.Windows.Forms.MessageBoxButtons]::OKCancel,
-        [System.Windows.Forms.MessageBoxIcon]::Warning
-    )
-    if ($answer -eq [System.Windows.Forms.DialogResult]::OK) {
-        Set-JobControl "cancel"
-    }
+    Set-JobControl "cancel"
 })
 $clearItem = $menu.Items.Add("Remove Finished Staging...")
 $clearItem.Add_Click({ Remove-FinishedStaging })
@@ -482,22 +480,29 @@ $knownStates = @{}
 function Update-Display {
     $jobs = @(Get-RemoteJobs)
     $active = @($jobs | Where-Object {
-        $_.State -in @("starting", "running", "uploading", "waiting")
+        $_.State -in @(
+            "starting", "running", "uploading", "waiting", "cancelling"
+        )
+    })
+    $cancellable = @($jobs | Where-Object {
+        $_.State -in @(
+            "starting", "running", "uploading", "waiting", "paused"
+        )
     })
     $summaryLabel.Text = (
-        "{0} active · {1} staged job{2}" -f
+        "{0} active - {1} staged job{2}" -f
         $active.Count,
         $jobs.Count,
         $(if ($jobs.Count -eq 1) { "" } else { "s" })
     )
-    $statusItem.Text = "{0} active · {1} staged" -f $active.Count, $jobs.Count
+    $statusItem.Text = "{0} active - {1} staged" -f $active.Count, $jobs.Count
     $notify.Text = (
         "VidReclaim: {0} active, {1} staged" -f $active.Count, $jobs.Count
     )
     $pauseItem.Enabled = $active.Count -gt 0
-    $cancelItem.Enabled = $active.Count -gt 0
+    $cancelItem.Enabled = $cancellable.Count -gt 0
     $pauseButton.Enabled = $active.Count -gt 0
-    $cancelButton.Enabled = $active.Count -gt 0
+    $cancelButton.Enabled = $cancellable.Count -gt 0
     $service = Get-Service sshd -ErrorAction SilentlyContinue
     if ($service -and $service.Status -eq "Running") {
         $sshItem.Text = "Stop SSH Service..."

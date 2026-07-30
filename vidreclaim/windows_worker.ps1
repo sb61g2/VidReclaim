@@ -97,16 +97,31 @@ try {
         $process.Refresh()
     }
     $process.WaitForExit()
-    if ($process.ExitCode -ne 0 -or -not (Test-Path $outputPath)) {
+    $process.Refresh()
+    $exitCode = $process.ExitCode
+    $progressEnded = $false
+    if (Test-Path $progressPath) {
+        $progressEnded = [bool](
+            Get-Content $progressPath -ErrorAction SilentlyContinue |
+            Where-Object { $_ -eq "progress=end" } |
+            Select-Object -First 1
+        )
+    }
+    if (
+        ($exitCode -ne $null -and $exitCode -ne 0) -or
+        -not $progressEnded -or
+        -not (Test-Path $outputPath)
+    ) {
         $tail = ""
         if (Test-Path $errorPath) {
             $tail = (Get-Content $errorPath -Tail 30) -join "`n"
         }
+        $exitText = $(if ($exitCode -eq $null) { "unknown" } else { $exitCode })
         Write-Status @{
             state = "error"
             fraction = 0.0
             speed_x = $null
-            message = "ffmpeg exited $($process.ExitCode): $tail"
+            message = "ffmpeg exited ${exitText}: $tail"
         }
         exit 1
     }

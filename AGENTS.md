@@ -11,3 +11,6 @@
   attribution.
 - Prefer concrete capability language. For example, say “persistent queue with
   per-item controls” instead of comparing it to another application.
+- Keep UI labels, descriptions, documentation, logs, and errors brief.
+- Do not repeat information already shown by a nearby heading, status, badge,
+  value, or control.

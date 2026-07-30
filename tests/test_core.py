@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from vidreclaim.cli import _default_output_root
 from vidreclaim.discovery import discover
 from vidreclaim.dvd import DvdTitle, _extract_json, select_main_titles
 from vidreclaim.model import Candidate, MediaInfo, Plan, PROFILES, Source
@@ -20,6 +22,7 @@ from vidreclaim.planner import (
 from vidreclaim.queueing import (
     SessionStore,
     _load_processed_catalog,
+    _migrate_hidden_output_root,
     _normalize_interrupted,
     _processed_record,
     _save_processed_record,
@@ -36,6 +39,7 @@ from vidreclaim.remote import (
     _job_manifest,
     _remote_transfer_state,
     _sftp_quote,
+    _ssh_text,
     config_from_settings,
     remote_job_id,
 )
@@ -163,6 +167,9 @@ class DiscoveryAndOutputTests(unittest.TestCase):
             video_ts.mkdir(parents=True)
             (video_ts / "VTS_01_1.VOB").write_bytes(b"vob")
             (root / "clip.mp4").write_bytes(b"mp4")
+            output = root / "VidReclaim Output"
+            output.mkdir()
+            (output / "result.mkv").write_bytes(b"result")
             found = list(discover(root))
         self.assertEqual(2, len(found))
         self.assertEqual(1, sum(item.kind == "dvd" for item in found))
@@ -177,6 +184,20 @@ class DiscoveryAndOutputTests(unittest.TestCase):
             Path("/tmp/output/movie.mkv"),
             output_path(source, plan, Path("/tmp/output")),
         )
+
+    def test_default_output_directory_is_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "movie.mp4"
+            source.write_bytes(b"video")
+            self.assertEqual(
+                root / "VidReclaim Output",
+                _default_output_root(root),
+            )
+            self.assertEqual(
+                root / "VidReclaim Output",
+                _default_output_root(source),
+            )
 
     def test_explicit_delete_helpers_are_narrowly_scoped(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -388,6 +409,38 @@ class SpaceMapTests(unittest.TestCase):
 
 
 class QueueTests(unittest.TestCase):
+    def test_pending_legacy_output_moves_to_visible_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "session.json"
+            settings = self.settings(root)
+            create_session(path, root=root, settings=settings)
+            store = SessionStore(path)
+            old_output = root / ".vidreclaim" / "output" / "movie.mkv"
+
+            def add_item(data: dict[str, object]) -> None:
+                data["items"] = [{
+                    "id": "movie",
+                    "status": "error",
+                    "output": str(old_output),
+                    "plan": {"output": str(old_output)},
+                }]
+
+            store.mutate(add_item)
+            _migrate_hidden_output_root(store)
+            session = store.read()
+            visible_root = (root / "VidReclaim Output").resolve()
+            expected = visible_root / "movie.mkv"
+            self.assertEqual(
+                str(visible_root),
+                session["settings"]["output_dir"],
+            )
+            self.assertEqual(str(expected), session["items"][0]["output"])
+            self.assertEqual(
+                str(expected),
+                session["items"][0]["plan"]["output"],
+            )
+
     def test_legacy_plan_ready_phase_is_shortened(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -759,6 +812,33 @@ class QueueTests(unittest.TestCase):
 
 
 class RemoteEncodingTests(unittest.TestCase):
+    def test_first_use_progress_noise_is_retried(self) -> None:
+        noise = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="",
+            stderr=(
+                "#< CLIXML><Obj S=\"progress\">"
+                "Preparing modules for first use.</Obj>"
+            ),
+        )
+        success = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="ok\n",
+            stderr="",
+        )
+        with mock.patch(
+            "vidreclaim.remote.subprocess.run",
+            side_effect=[noise, success],
+        ) as run:
+            result = _ssh_text(
+                RemoteConfig("video-pc", "encoder"),
+                "Write-Output ok",
+            )
+        self.assertEqual("ok", result)
+        self.assertEqual(2, run.call_count)
+
     def test_sftp_paths_are_quoted_for_spaces_and_apostrophes(self) -> None:
         self.assertEqual(
             "\"/Media/Director's Cut/movie file.mkv\"",

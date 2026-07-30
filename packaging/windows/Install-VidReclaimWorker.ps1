@@ -152,11 +152,15 @@ if (-not $SkipTray) {
     }
 
     $programShortcut = Join-Path $env:APPDATA (
+        "Microsoft\Windows\Start Menu\Programs\VidReclaim.lnk"
+    )
+    $oldProgramShortcut = Join-Path $env:APPDATA (
         "Microsoft\Windows\Start Menu\Programs\VidReclaim Remote Monitor.lnk"
     )
     $startupShortcut = Join-Path $env:APPDATA (
         "Microsoft\Windows\Start Menu\Programs\Startup\VidReclaim Remote Monitor.lnk"
     )
+    Remove-Item -Force $oldProgramShortcut -ErrorAction SilentlyContinue
     New-TrayShortcut $programShortcut -StartService
     if ($StartWithWindows -eq "Yes") {
         New-TrayShortcut $startupShortcut

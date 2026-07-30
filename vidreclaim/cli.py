@@ -289,7 +289,7 @@ def build_parser() -> argparse.ArgumentParser:
         _add_analysis_options(subparser)
         subparser.add_argument(
             "--output-dir", type=Path,
-            help="staging output directory (default: ROOT/.vidreclaim/output)",
+            help="output directory (default: ROOT/VidReclaim Output)",
         )
         subparser.add_argument(
             "--manifest", type=Path,
@@ -424,10 +424,9 @@ def command_space(args: argparse.Namespace) -> int:
 
 
 def _queue_settings(args: argparse.Namespace, root: Path) -> dict[str, Any]:
-    state_base = root.parent if root.is_file() else root
     output_root = (
         args.output_dir.expanduser().resolve()
-        if args.output_dir else state_base / ".vidreclaim" / "output"
+        if args.output_dir else _default_output_root(root)
     )
     return {
         "profile": args.profile,
@@ -534,13 +533,18 @@ def _paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
     state_base = root.parent if root.is_file() else root
     output_root = (
         args.output_dir.expanduser().resolve()
-        if args.output_dir else state_base / ".vidreclaim" / "output"
+        if args.output_dir else _default_output_root(root)
     )
     manifest = (
         args.manifest.expanduser().resolve()
         if args.manifest else state_base / ".vidreclaim" / "plan.json"
     )
     return root, output_root, manifest
+
+
+def _default_output_root(root: Path) -> Path:
+    base = root.parent if root.is_file() else root
+    return base / "VidReclaim Output"
 
 
 def _collect_media(args: argparse.Namespace, root: Path) -> tuple[list[MediaInfo], list[dict[str, Any]]]:

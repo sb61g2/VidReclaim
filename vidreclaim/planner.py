@@ -171,26 +171,23 @@ def analyze_fast(
             ),
             savings_pct=savings_pct,
             accepted=accepted,
-            reason="accepted by fast metadata analysis" if accepted else "; ".join(failures),
+            reason="Eligible" if accepted else "; ".join(failures),
         )
         candidates.append(candidate)
 
     accepted = [candidate for candidate in candidates if candidate.accepted]
     if not accepted:
-        details = ", ".join(
-            f"{candidate.resolution}: {candidate.reason}" for candidate in candidates
-        )
         return Plan(
             media,
             "skip",
-            f"fast analysis found no worthwhile candidate ({details})",
+            "Excluded",
             candidates=candidates,
         )
     chosen = min(accepted, key=lambda candidate: candidate.projected_bytes)
     return Plan(
         media,
         "encode",
-        f"fast metadata estimate: {chosen.savings_pct:.1f}% reclaim",
+        f"~{chosen.savings_pct:.1f}% savings",
         candidate=chosen,
         candidates=candidates,
     )

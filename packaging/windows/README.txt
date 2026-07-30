@@ -24,6 +24,8 @@ jobs, change the Start with Windows preference, or shut down VidReclaim fully.
 Full shutdown cancels its jobs, stops remote access, and exits. Close Monitor
 Only leaves remote access and active jobs running.
 
+Start-menu entry: VidReclaim
+
 CPU x265 is the default. RTX 4090 is the faster option.
 
 Transfers use SSH and resume in chunks after an interruption. Sources stage in

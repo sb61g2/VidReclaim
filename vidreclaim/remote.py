@@ -103,6 +103,11 @@ def _sftp_quote(value: str) -> str:
 
 
 def _powershell_encoded(script: str) -> list[str]:
+    script = (
+        "$ProgressPreference='SilentlyContinue'\n"
+        "$InformationPreference='SilentlyContinue'\n"
+        + script
+    )
     encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
     return [
         "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
@@ -116,13 +121,25 @@ def _ssh_text(
     *,
     check: bool = True,
 ) -> str:
-    completed = subprocess.run(
-        [*_ssh_base(config), *_powershell_encoded(script)],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=30,
-    )
+    completed: subprocess.CompletedProcess[str] | None = None
+    for attempt in range(2):
+        completed = subprocess.run(
+            [*_ssh_base(config), *_powershell_encoded(script)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+        detail = (completed.stderr or completed.stdout).strip()
+        first_use_noise = (
+            completed.returncode != 0
+            and "Preparing modules for first use." in detail
+            and "<S S=\"Error\">" not in detail
+        )
+        if first_use_noise and attempt == 0:
+            continue
+        break
+    assert completed is not None
     if check and completed.returncode:
         detail = (completed.stderr or completed.stdout).strip()
         raise CommandError(
@@ -175,7 +192,17 @@ def _clear_remote_control(config: RemoteConfig, job_root: str) -> None:
         config,
         f"""
 $path = Join-Path $HOME '{job_root}/control.txt'
-Remove-Item -Force -ErrorAction SilentlyContinue $path
+if (Test-Path $path) {{ Remove-Item -Force $path }}
+""",
+    )
+
+
+def _clear_remote_status(config: RemoteConfig, job_root: str) -> None:
+    _ssh_text(
+        config,
+        f"""
+$path = Join-Path $HOME '{job_root}/status.json'
+if (Test-Path $path) {{ Remove-Item -Force $path }}
 """,
     )
 
@@ -412,10 +439,11 @@ if (Test-Path $path) {{ Get-Content -Raw $path }} else {{ '{{"state":"missing"}}
         raise CommandError(f"Windows worker returned invalid status: {raw}") from error
 
 
-def _start_job(config: RemoteConfig, job_id: str) -> None:
-    _ssh_text(
-        config,
-        f"""
+def _launch_job(
+    config: RemoteConfig,
+    job_id: str,
+) -> subprocess.Popen[str]:
+    script = f"""
 $job = Join-Path $HOME '.vidreclaim\\jobs\\{job_id}'
 $statusPath = Join-Path $job 'status.json'
 $running = $false
@@ -431,12 +459,18 @@ if (Test-Path $statusPath) {{
     }} catch {{}}
 }}
 if (-not $running) {{
-    Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $job 'control.txt')
+    $control = Join-Path $job 'control.txt'
+    if (Test-Path $control) {{ Remove-Item -Force $control }}
     $worker = Join-Path $job 'worker.ps1'
-    $arguments = @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$worker,'-JobDir',$job)
-    Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments -WindowStyle Hidden | Out-Null
+    & $worker -JobDir $job
+    exit $LASTEXITCODE
 }}
-""",
+"""
+    return subprocess.Popen(
+        [*_ssh_base(config), *_powershell_encoded(script)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
     )
 
 
@@ -514,6 +548,7 @@ def remote_encode(
         source_suffix = ".media"
     source_name = f"source{source_suffix}"
     state = _job_state(config, job_id)
+    runner: subprocess.Popen[str] | None = None
     if state.get("state") != "complete":
         if (
             state.get("state") != "running"
@@ -551,44 +586,64 @@ def remote_encode(
             )
         if stage:
             stage(f"Encoding on {config.host}")
-        _start_job(config, job_id)
+        if state.get("state") not in {"running", "complete", "missing"}:
+            _clear_remote_status(config, job_root)
+        runner = _launch_job(config, job_id)
 
     failures = 0
     last_action = "run"
-    while True:
-        action = control() if control else "run"
-        if action in {"pause", "cancel", "skip"} and action != last_action:
-            _send_control(config, job_id, action)
-            last_action = action
-        try:
-            state = _job_state(config, job_id)
-            failures = 0
-        except CommandError:
-            failures += 1
-            if failures >= 8:
-                raise
-            time.sleep(1)
-            continue
-        status = str(state.get("state") or "missing")
-        if progress and status == "running":
-            progress(
-                float(state.get("fraction") or 0.0),
-                (
-                    float(state["speed_x"])
-                    if state.get("speed_x") is not None else None
-                ),
-            )
-        if status == "complete":
-            break
-        if status in {"paused", "cancelled", "skipped"}:
-            raise RemoteEncodeControl("pause" if status == "paused" else status)
-        if status == "error":
-            raise CommandError(
-                f"Windows encode failed: {state.get('message') or 'unknown error'}"
-            )
-        if status == "missing":
-            _start_job(config, job_id)
-        time.sleep(0.75)
+    runner_output = ""
+    try:
+        while True:
+            action = control() if control else "run"
+            if action in {"pause", "cancel", "skip"} and action != last_action:
+                _send_control(config, job_id, action)
+                last_action = action
+            if runner is not None and runner.poll() is not None:
+                runner_output = runner.communicate()[0].strip()
+                runner = None
+            try:
+                state = _job_state(config, job_id)
+                failures = 0
+            except CommandError:
+                failures += 1
+                if failures >= 8:
+                    raise
+                time.sleep(1)
+                continue
+            status = str(state.get("state") or "missing")
+            if progress and status == "running":
+                progress(
+                    float(state.get("fraction") or 0.0),
+                    (
+                        float(state["speed_x"])
+                        if state.get("speed_x") is not None else None
+                    ),
+                )
+            if status == "complete":
+                break
+            if status in {"paused", "cancelled", "skipped"}:
+                raise RemoteEncodeControl(
+                    "pause" if status == "paused" else status
+                )
+            if status == "error":
+                raise CommandError(
+                    "Windows encode failed: "
+                    f"{state.get('message') or 'unknown error'}"
+                )
+            if status == "missing" and runner is None:
+                if runner_output:
+                    raise CommandError(
+                        f"Windows worker did not start: {runner_output}"
+                    )
+                runner = _launch_job(config, job_id)
+            time.sleep(0.75)
+    finally:
+        if runner is not None:
+            try:
+                runner.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _stop_transfer(runner)
 
     download_partial = temporary.with_name(
         f".{temporary.stem}.remote-{job_id}.download"
