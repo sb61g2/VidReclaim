@@ -102,7 +102,7 @@ $x265 = $encoders.Contains("libx265")
 $nvenc = $encoders.Contains("hevc_nvenc")
 
 if (-not $SkipTray) {
-    Write-Step "Installing the tray monitor"
+    Write-Step "Installing VidReclaim"
     $traySource = Join-Path $PSScriptRoot "VidReclaimTray.ps1"
     $iconSource = Join-Path $PSScriptRoot "VidReclaimIcon.png"
     if (-not (Test-Path $traySource)) {
@@ -158,9 +158,13 @@ if (-not $SkipTray) {
         "Microsoft\Windows\Start Menu\Programs\VidReclaim Remote Monitor.lnk"
     )
     $startupShortcut = Join-Path $env:APPDATA (
+        "Microsoft\Windows\Start Menu\Programs\Startup\VidReclaim.lnk"
+    )
+    $oldStartupShortcut = Join-Path $env:APPDATA (
         "Microsoft\Windows\Start Menu\Programs\Startup\VidReclaim Remote Monitor.lnk"
     )
     Remove-Item -Force $oldProgramShortcut -ErrorAction SilentlyContinue
+    Remove-Item -Force $oldStartupShortcut -ErrorAction SilentlyContinue
     New-TrayShortcut $programShortcut -StartService
     if ($StartWithWindows -eq "Yes") {
         New-TrayShortcut $startupShortcut

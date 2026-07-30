@@ -62,7 +62,10 @@ try {
         $fraction = 0.0
         $speed = $null
         if (Test-Path $progressPath) {
-            $lines = Get-Content $progressPath -ErrorAction SilentlyContinue
+            $lines = Get-Content `
+                $progressPath `
+                -Tail 30 `
+                -ErrorAction SilentlyContinue
             $timeLine = $lines | Where-Object { $_ -like "out_time_us=*" } |
                 Select-Object -Last 1
             $speedLine = $lines | Where-Object { $_ -like "speed=*" } |

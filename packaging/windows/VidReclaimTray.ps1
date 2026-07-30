@@ -1,29 +1,40 @@
 [CmdletBinding()]
 param(
-    [switch]$StartService
+    [switch]$StartService,
+    [switch]$SelfTest
 )
 
 $ErrorActionPreference = "Stop"
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-[System.Windows.Forms.Application]::EnableVisualStyles()
-
-$jobRoot = Join-Path $HOME ".vidreclaim\jobs"
+$selfTestRoot = $(if ($SelfTest) {
+    Join-Path ([IO.Path]::GetTempPath()) (
+        "vidreclaim-tray-test-" + [Guid]::NewGuid().ToString("N")
+    )
+} else {
+    ""
+})
+$jobRoot = $(if ($SelfTest) {
+    Join-Path $selfTestRoot "jobs"
+} else {
+    Join-Path $HOME ".vidreclaim\jobs"
+})
+$trashRoot = Join-Path (Split-Path -Parent $jobRoot) "trash"
+$leaseFreshSeconds = 15
+$cleanupGraceSeconds = 5
 $scriptPath = $MyInvocation.MyCommand.Path
 $installRoot = Split-Path -Parent $scriptPath
 $pidPath = Join-Path $installRoot "tray.pid"
-$startupDirectory = Join-Path $env:APPDATA (
-    "Microsoft\Windows\Start Menu\Programs\Startup"
-)
-$startupShortcut = Join-Path $startupDirectory "VidReclaim Remote Monitor.lnk"
-$created = $false
-$mutex = New-Object `
-    -TypeName Threading.Mutex `
-    -ArgumentList $true, "Local\VidReclaimTray", ([ref]$created)
-if (-not $created) {
-    exit 0
-}
-Set-Content -Encoding ASCII -Path $pidPath -Value $PID
+$startupDirectory = $(if ($SelfTest) {
+    ""
+} else {
+    Join-Path $env:APPDATA (
+        "Microsoft\Windows\Start Menu\Programs\Startup"
+    )
+})
+$startupShortcut = $(if ($SelfTest) {
+    ""
+} else {
+    Join-Path $startupDirectory "VidReclaim.lnk"
+})
 
 function Read-JsonFile {
     param([string]$Path)
@@ -55,6 +66,39 @@ function Format-Bytes {
     return "$Value B"
 }
 
+function Test-JobProcess {
+    param(
+        [int]$ProcessId,
+        [string]$ProcessName
+    )
+    if ($ProcessId -le 0) {
+        return $false
+    }
+    $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    return (
+        $null -ne $process -and
+        $process.ProcessName -eq $ProcessName
+    )
+}
+
+function Test-FreshFile {
+    param(
+        [string]$Path,
+        [int]$MaximumAgeSeconds
+    )
+    if (-not (Test-Path $Path)) {
+        return $false
+    }
+    $item = Get-Item $Path -ErrorAction SilentlyContinue
+    if (-not $item) {
+        return $false
+    }
+    return (
+        ([DateTime]::UtcNow - $item.LastWriteTimeUtc).TotalSeconds -lt
+        $MaximumAgeSeconds
+    )
+}
+
 function Get-RemoteJobs {
     $jobs = @()
     if (-not (Test-Path $jobRoot)) {
@@ -77,7 +121,28 @@ function Get-RemoteJobs {
         if ($manifest -and $manifest.source_bytes) {
             $totalBytes = [long]$manifest.source_bytes
         }
-        $state = "Waiting"
+        $workerPid = 0
+        $encoderPid = 0
+        if ($status -and $status.worker_pid) {
+            $workerPid = [int]$status.worker_pid
+        }
+        if ($status -and $status.encoder_pid) {
+            $encoderPid = [int]$status.encoder_pid
+        }
+        $workerAlive = Test-JobProcess $workerPid "powershell"
+        $encoderAlive = Test-JobProcess $encoderPid "ffmpeg"
+        $clientActive = Test-FreshFile (
+            Join-Path $directory.FullName "client.lease"
+        ) $leaseFreshSeconds
+        $cleanupRequested = Test-Path (
+            Join-Path $directory.FullName "cleanup.txt"
+        )
+        $message = $(if ($status -and $status.message) {
+            [string]$status.message
+        } else {
+            ""
+        })
+        $state = "interrupted"
         $fraction = 0.0
         $controlAction = ""
         $controlPath = Join-Path $directory.FullName "control.txt"
@@ -89,14 +154,16 @@ function Get-RemoteJobs {
             }
             catch {}
         }
-        if ($status -and $status.state) {
-            $state = [string]$status.state
-            if ($status.fraction -ne $null) {
-                $fraction = [double]$status.fraction
-            }
+        if ($cleanupRequested) {
+            $state = "clearing"
         }
         elseif ($controlAction -eq "cancel") {
-            $state = "cancelled"
+            if ($clientActive -or $workerAlive -or $encoderAlive) {
+                $state = "cancelling"
+            }
+            else {
+                $state = "cancelled"
+            }
         }
         elseif ($controlAction -eq "pause") {
             $state = "paused"
@@ -104,17 +171,45 @@ function Get-RemoteJobs {
         elseif ($controlAction -eq "skip") {
             $state = "skipped"
         }
+        elseif ($status -and $status.state) {
+            $state = [string]$status.state
+            if ($status.fraction -ne $null) {
+                $fraction = [double]$status.fraction
+            }
+            if (
+                $state -in @("starting", "running", "uploading", "waiting") -and
+                -not $clientActive -and
+                -not $workerAlive -and
+                -not $encoderAlive
+            ) {
+                $state = "interrupted"
+            }
+            elseif (
+                $state -eq "complete" -and
+                -not (Test-Path (
+                    Join-Path $directory.FullName "output.part.mkv"
+                ))
+            ) {
+                $state = "error"
+                $message = "Result missing."
+            }
+            elseif ($state -eq "complete" -and $clientActive) {
+                $state = "downloading"
+            }
+        }
         elseif ($manifest -or $source) {
-            $state = "uploading"
             if ($totalBytes -gt 0) {
                 $fraction = [Math]::Min(1.0, $sourceBytes / $totalBytes)
             }
+            if ($clientActive) {
+                $state = $(if (
+                    $totalBytes -gt 0 -and
+                    $sourceBytes -ge $totalBytes
+                ) { "waiting" } else { "uploading" })
+            }
         }
-        if (
-            $controlAction -eq "cancel" -and
-            $state -in @("starting", "running", "uploading", "waiting")
-        ) {
-            $state = "cancelling"
+        elseif ($clientActive) {
+            $state = "waiting"
         }
         $name = $directory.Name
         if ($manifest -and $manifest.source_display_name) {
@@ -123,14 +218,6 @@ function Get-RemoteJobs {
         $encoder = ""
         if ($manifest -and $manifest.encoder) {
             $encoder = [string]$manifest.encoder
-        }
-        $workerPid = 0
-        $encoderPid = 0
-        if ($status -and $status.worker_pid) {
-            $workerPid = [int]$status.worker_pid
-        }
-        if ($status -and $status.encoder_pid) {
-            $encoderPid = [int]$status.encoder_pid
         }
         $updated = $directory.LastWriteTime
         if ($status -and $status.updated_at_unix) {
@@ -148,6 +235,11 @@ function Get-RemoteJobs {
             TotalBytes = $totalBytes
             WorkerPid = $workerPid
             EncoderPid = $encoderPid
+            WorkerAlive = $workerAlive
+            EncoderAlive = $encoderAlive
+            ClientActive = $clientActive
+            CleanupRequested = $cleanupRequested
+            Message = $message
             Updated = $updated
             Directory = $directory.FullName
         }
@@ -159,13 +251,20 @@ function Set-JobControl {
     param([string]$Action)
     foreach ($job in Get-RemoteJobs) {
         $canPause = $job.State -in @(
-            "starting", "running", "uploading", "waiting"
+            "starting", "running", "uploading", "downloading", "waiting"
         )
-        $canCancel = $canPause -or $job.State -eq "paused"
+        $canCancel = (
+            $canPause -or
+            $job.State -in @("paused", "interrupted")
+        )
         if (
             ($Action -eq "pause" -and $canPause) -or
             ($Action -eq "cancel" -and $canCancel)
         ) {
+            Remove-Item `
+                -Force `
+                -ErrorAction SilentlyContinue `
+                -LiteralPath (Join-Path $job.Directory "cleanup.txt")
             Set-Content `
                 -Encoding ASCII `
                 -Path (Join-Path $job.Directory "control.txt") `
@@ -174,10 +273,95 @@ function Set-JobControl {
     }
 }
 
-function Remove-FinishedStaging {
+function Request-FinishedCleanup {
     foreach ($job in Get-RemoteJobs) {
         if ($job.State -in @("complete", "cancelled", "error", "skipped")) {
-            Remove-Item -Recurse -Force $job.Directory -ErrorAction SilentlyContinue
+            Set-Content `
+                -Encoding ASCII `
+                -Path (Join-Path $job.Directory "cleanup.txt") `
+                -Value ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
+        }
+    }
+}
+
+function Invoke-PendingCleanup {
+    if (-not (Test-Path $jobRoot)) {
+        return
+    }
+    New-Item -ItemType Directory -Force -Path $trashRoot | Out-Null
+    foreach (
+        $trashDirectory in Get-ChildItem `
+            $trashRoot `
+            -Directory `
+            -ErrorAction SilentlyContinue
+    ) {
+        Remove-Item `
+            -LiteralPath $trashDirectory.FullName `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue
+    }
+    foreach (
+        $directory in Get-ChildItem `
+            $jobRoot `
+            -Directory `
+            -ErrorAction SilentlyContinue
+    ) {
+        $cleanupPath = Join-Path $directory.FullName "cleanup.txt"
+        if (-not (Test-Path $cleanupPath)) {
+            continue
+        }
+        if (
+            Test-FreshFile (
+                Join-Path $directory.FullName "client.lease"
+            ) $leaseFreshSeconds
+        ) {
+            continue
+        }
+        $status = Read-JsonFile (
+            Join-Path $directory.FullName "status.json"
+        )
+        $cleanupDelay = $cleanupGraceSeconds
+        if (
+            $status -and
+            $status.state -eq "complete" -and
+            -not (Test-Path (
+                Join-Path $directory.FullName "client.protocol"
+            ))
+        ) {
+            $cleanupDelay = 300
+        }
+        if (Test-FreshFile $cleanupPath $cleanupDelay) {
+            continue
+        }
+        $workerPid = $(if ($status -and $status.worker_pid) {
+            [int]$status.worker_pid
+        } else { 0 })
+        $encoderPid = $(if ($status -and $status.encoder_pid) {
+            [int]$status.encoder_pid
+        } else { 0 })
+        if (
+            (Test-JobProcess $workerPid "powershell") -or
+            (Test-JobProcess $encoderPid "ffmpeg")
+        ) {
+            continue
+        }
+        $trash = Join-Path $trashRoot (
+            $directory.Name + "-" + [Guid]::NewGuid().ToString("N")
+        )
+        try {
+            Move-Item `
+                -LiteralPath $directory.FullName `
+                -Destination $trash `
+                -ErrorAction Stop
+            Remove-Item `
+                -LiteralPath $trash `
+                -Recurse `
+                -Force `
+                -ErrorAction SilentlyContinue
+        }
+        catch {
+            # Keep the complete job folder and retry later.
         }
     }
 }
@@ -256,8 +440,8 @@ function Set-SshServiceState {
     $service = Get-Service sshd -ErrorAction SilentlyContinue
     if (-not $service) {
         [System.Windows.Forms.MessageBox]::Show(
-            "The Windows SSH service is not installed.",
-            "SSH service",
+            "Remote access is unavailable.",
+            "Remote Access",
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Information
         ) | Out-Null
@@ -269,8 +453,8 @@ function Set-SshServiceState {
     }
     if (-not (Invoke-ElevatedPowerShell $command)) {
         [System.Windows.Forms.MessageBox]::Show(
-            "The SSH service was not changed.",
-            "SSH service",
+            "Remote access was not changed.",
+            "Remote Access",
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Warning
         ) | Out-Null
@@ -319,8 +503,8 @@ function Stop-VidReclaimCompletely {
     }
     if (-not (Invoke-ElevatedPowerShell "Stop-Service sshd -Force")) {
         [System.Windows.Forms.MessageBox]::Show(
-            "Remote access could not be stopped. The tray monitor will remain open.",
-            "Stop VidReclaim completely",
+            "Remote access could not be stopped.",
+            "Quit VidReclaim",
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Warning
         ) | Out-Null
@@ -330,6 +514,153 @@ function Stop-VidReclaimCompletely {
     [System.Windows.Forms.Application]::Exit()
 }
 
+if ($SelfTest) {
+    function Assert-Test {
+        param(
+            [bool]$Condition,
+            [string]$Message
+        )
+        if (-not $Condition) {
+            throw $Message
+        }
+    }
+
+    try {
+        New-Item -ItemType Directory -Force -Path $jobRoot | Out-Null
+        $interrupted = Join-Path $jobRoot "interrupted"
+        New-Item -ItemType Directory -Force -Path $interrupted | Out-Null
+        Set-Content `
+            -Encoding ASCII `
+            -Path (Join-Path $interrupted "source.mkv") `
+            -Value "partial"
+        $job = @(Get-RemoteJobs)[0]
+        Assert-Test ($job.State -eq "interrupted") (
+            "Stale partial job was not interrupted."
+        )
+
+        Set-JobControl "cancel"
+        $job = @(Get-RemoteJobs)[0]
+        Assert-Test ($job.State -eq "cancelled") (
+            "Interrupted job was not cancelled."
+        )
+        $cleanupGraceSeconds = 0
+        Request-FinishedCleanup
+        Assert-Test (@(Get-RemoteJobs)[0].State -eq "clearing") (
+            "Finished job did not enter clearing state."
+        )
+        Invoke-PendingCleanup
+        Assert-Test (-not (Test-Path $interrupted)) (
+            "Finished job was not removed."
+        )
+
+        $leased = Join-Path $jobRoot "leased"
+        New-Item -ItemType Directory -Force -Path $leased | Out-Null
+        Set-Content `
+            -Encoding ASCII `
+            -Path (Join-Path $leased "status.json") `
+            -Value '{"state":"cancelled","fraction":0.0}'
+        Set-Content `
+            -Encoding ASCII `
+            -Path (Join-Path $leased "client.lease") `
+            -Value "active"
+        Request-FinishedCleanup
+        Invoke-PendingCleanup
+        Assert-Test (Test-Path $leased) (
+            "Active client job was removed."
+        )
+        Remove-Item -Force (Join-Path $leased "client.lease")
+        Invoke-PendingCleanup
+        Assert-Test (-not (Test-Path $leased)) (
+            "Released job was not removed."
+        )
+
+        $downloading = Join-Path $jobRoot "downloading"
+        New-Item -ItemType Directory -Force -Path $downloading | Out-Null
+        Set-Content `
+            -Encoding ASCII `
+            -Path (Join-Path $downloading "status.json") `
+            -Value '{"state":"complete","fraction":1.0}'
+        Set-Content `
+            -Encoding ASCII `
+            -Path (Join-Path $downloading "output.part.mkv") `
+            -Value "result"
+        Set-Content `
+            -Encoding ASCII `
+            -Path (Join-Path $downloading "client.lease") `
+            -Value "active"
+        Set-Content `
+            -Encoding ASCII `
+            -Path (Join-Path $downloading "client.protocol") `
+            -Value "3"
+        $job = @(Get-RemoteJobs)[0]
+        Assert-Test ($job.State -eq "downloading") (
+            "Active download was shown as complete."
+        )
+        Request-FinishedCleanup
+        Assert-Test (-not (Test-Path (
+            Join-Path $downloading "cleanup.txt"
+        ))) (
+            "Active download was marked for cleanup."
+        )
+        Remove-Item -Force (Join-Path $downloading "client.lease")
+        Request-FinishedCleanup
+        Invoke-PendingCleanup
+        Assert-Test (-not (Test-Path $downloading)) (
+            "Completed download staging was not removed."
+        )
+
+        $dead = Join-Path $jobRoot "dead-worker"
+        New-Item -ItemType Directory -Force -Path $dead | Out-Null
+        Set-Content `
+            -Encoding ASCII `
+            -Path (Join-Path $dead "status.json") `
+            -Value (
+                '{"state":"running","fraction":0.4,' +
+                '"worker_pid":2147483000}'
+            )
+        $job = @(Get-RemoteJobs)[0]
+        Assert-Test ($job.State -eq "interrupted") (
+            "Dead worker was shown as running."
+        )
+
+        $missing = Join-Path $jobRoot "missing-result"
+        New-Item -ItemType Directory -Force -Path $missing | Out-Null
+        Set-Content `
+            -Encoding ASCII `
+            -Path (Join-Path $missing "status.json") `
+            -Value '{"state":"complete","fraction":1.0}'
+        $job = @(
+            Get-RemoteJobs |
+                Where-Object { $_.Id -eq "missing-result" }
+        )[0]
+        Assert-Test ($job.State -eq "error") (
+            "Missing result was shown as complete."
+        )
+        Write-Output "VidReclaim tray self-test passed."
+        exit 0
+    }
+    finally {
+        Remove-Item `
+            -LiteralPath $selfTestRoot `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue
+    }
+}
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+$created = $false
+$mutex = New-Object `
+    -TypeName Threading.Mutex `
+    -ArgumentList $true, "Local\VidReclaimTray", ([ref]$created)
+if (-not $created) {
+    exit 0
+}
+Set-Content -Encoding ASCII -Path $pidPath -Value $PID
+
 if ($StartService) {
     $service = Get-Service sshd -ErrorAction SilentlyContinue
     if ($service -and $service.Status -ne "Running") {
@@ -338,7 +669,7 @@ if ($StartService) {
 }
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text = "VidReclaim Remote Jobs"
+$form.Text = "VidReclaim"
 $form.Size = New-Object Drawing.Size(780, 390)
 $form.MinimumSize = New-Object Drawing.Size(650, 300)
 $form.StartPosition = "CenterScreen"
@@ -365,6 +696,11 @@ $grid.RowHeadersVisible = $false
 $grid.SelectionMode = "FullRowSelect"
 $grid.MultiSelect = $false
 $grid.AutoGenerateColumns = $false
+$grid.BackgroundColor = [Drawing.SystemColors]::Window
+$grid.DefaultCellStyle.BackColor = [Drawing.SystemColors]::Window
+$grid.DefaultCellStyle.ForeColor = [Drawing.SystemColors]::WindowText
+$grid.DefaultCellStyle.SelectionBackColor = [Drawing.SystemColors]::Highlight
+$grid.DefaultCellStyle.SelectionForeColor = [Drawing.SystemColors]::HighlightText
 $grid.Columns.Add("Name", "File") | Out-Null
 $grid.Columns["Name"].AutoSizeMode = "Fill"
 $grid.Columns.Add("State", "State") | Out-Null
@@ -387,14 +723,14 @@ $openButton.Add_Click({ Open-JobFolder })
 $form.Controls.Add($openButton)
 
 $pauseButton = New-Object System.Windows.Forms.Button
-$pauseButton.Text = "Pause Active"
+$pauseButton.Text = "Pause All"
 $pauseButton.Location = New-Object Drawing.Point(108, 310)
 $pauseButton.Anchor = "Bottom,Left"
 $pauseButton.Add_Click({ Set-JobControl "pause" })
 $form.Controls.Add($pauseButton)
 
 $cancelButton = New-Object System.Windows.Forms.Button
-$cancelButton.Text = "Cancel Active"
+$cancelButton.Text = "Cancel All"
 $cancelButton.Location = New-Object Drawing.Point(212, 310)
 $cancelButton.Anchor = "Bottom,Left"
 $cancelButton.Add_Click({
@@ -403,15 +739,15 @@ $cancelButton.Add_Click({
 $form.Controls.Add($cancelButton)
 
 $clearButton = New-Object System.Windows.Forms.Button
-$clearButton.Text = "Remove Finished"
+$clearButton.Text = "Clear Finished"
 $clearButton.Location = New-Object Drawing.Point(324, 310)
 $clearButton.Size = New-Object Drawing.Size(112, 23)
 $clearButton.Anchor = "Bottom,Left"
-$clearButton.Add_Click({ Remove-FinishedStaging })
+$clearButton.Add_Click({ Request-FinishedCleanup })
 $form.Controls.Add($clearButton)
 
 $shutdownButton = New-Object System.Windows.Forms.Button
-$shutdownButton.Text = "Shut Down"
+$shutdownButton.Text = "Quit VidReclaim"
 $shutdownButton.Location = New-Object Drawing.Point(640, 310)
 $shutdownButton.Size = New-Object Drawing.Size(112, 23)
 $shutdownButton.Anchor = "Bottom,Right"
@@ -439,31 +775,31 @@ $statusItem.Text = "No remote jobs"
 $statusItem.Enabled = $false
 $menu.Items.Add($statusItem) | Out-Null
 $menu.Items.Add("-") | Out-Null
-$showItem = $menu.Items.Add("Show Jobs")
+$showItem = $menu.Items.Add("Open")
 $showItem.Add_Click({
     $form.Show()
     $form.Activate()
 })
-$openItem = $menu.Items.Add("Open Work Folder")
+$openItem = $menu.Items.Add("Open Job Folder")
 $openItem.Add_Click({ Open-JobFolder })
-$pauseItem = $menu.Items.Add("Pause Active Jobs")
+$pauseItem = $menu.Items.Add("Pause All")
 $pauseItem.Add_Click({ Set-JobControl "pause" })
-$cancelItem = $menu.Items.Add("Cancel Active Jobs")
+$cancelItem = $menu.Items.Add("Cancel All")
 $cancelItem.Add_Click({
     Set-JobControl "cancel"
 })
-$clearItem = $menu.Items.Add("Remove Finished Staging...")
-$clearItem.Add_Click({ Remove-FinishedStaging })
+$clearItem = $menu.Items.Add("Clear Finished")
+$clearItem.Add_Click({ Request-FinishedCleanup })
 $menu.Items.Add("-") | Out-Null
 $startItem = $menu.Items.Add("Start with Windows")
 $startItem.CheckOnClick = $false
 $startItem.Add_Click({
     Set-StartWithWindows (-not (Test-Path $startupShortcut))
 })
-$sshItem = $menu.Items.Add("Stop SSH Service...")
+$sshItem = $menu.Items.Add("Stop Remote Access...")
 $sshItem.Add_Click({ Set-SshServiceState })
 $menu.Items.Add("-") | Out-Null
-$stopAllItem = $menu.Items.Add("Shut Down VidReclaim...")
+$stopAllItem = $menu.Items.Add("Quit VidReclaim...")
 $stopAllItem.Add_Click({ Stop-VidReclaimCompletely })
 $exitItem = $menu.Items.Add("Close Monitor Only")
 $exitItem.Add_Click({
@@ -478,42 +814,66 @@ $notify.Add_DoubleClick({
 
 $knownStates = @{}
 function Update-Display {
+    Invoke-PendingCleanup
     $jobs = @(Get-RemoteJobs)
     $active = @($jobs | Where-Object {
         $_.State -in @(
-            "starting", "running", "uploading", "waiting", "cancelling"
+            "starting", "running", "uploading", "downloading", "waiting",
+            "cancelling"
+        )
+    })
+    $pausable = @($jobs | Where-Object {
+        $_.State -in @(
+            "starting", "running", "uploading", "downloading", "waiting"
         )
     })
     $cancellable = @($jobs | Where-Object {
         $_.State -in @(
-            "starting", "running", "uploading", "waiting", "paused"
+            "starting", "running", "uploading", "downloading", "waiting",
+            "paused", "interrupted"
         )
     })
+    $finished = @($jobs | Where-Object {
+        $_.State -in @("complete", "cancelled", "error", "skipped")
+    })
     $summaryLabel.Text = (
-        "{0} active - {1} staged job{2}" -f
+        "{0} active - {1} job{2}" -f
         $active.Count,
         $jobs.Count,
         $(if ($jobs.Count -eq 1) { "" } else { "s" })
     )
-    $statusItem.Text = "{0} active - {1} staged" -f $active.Count, $jobs.Count
-    $notify.Text = (
-        "VidReclaim: {0} active, {1} staged" -f $active.Count, $jobs.Count
+    $jobSuffix = $(if ($jobs.Count -eq 1) { "" } else { "s" })
+    $statusItem.Text = (
+        "{0} active - {1} job{2}" -f
+        $active.Count,
+        $jobs.Count,
+        $jobSuffix
     )
-    $pauseItem.Enabled = $active.Count -gt 0
+    $notify.Text = (
+        "VidReclaim: {0} active, {1} job{2}" -f
+        $active.Count,
+        $jobs.Count,
+        $jobSuffix
+    )
+    $pauseItem.Enabled = $pausable.Count -gt 0
     $cancelItem.Enabled = $cancellable.Count -gt 0
-    $pauseButton.Enabled = $active.Count -gt 0
+    $pauseButton.Enabled = $pausable.Count -gt 0
     $cancelButton.Enabled = $cancellable.Count -gt 0
+    $clearItem.Enabled = $finished.Count -gt 0
+    $clearButton.Enabled = $finished.Count -gt 0
     $service = Get-Service sshd -ErrorAction SilentlyContinue
     if ($service -and $service.Status -eq "Running") {
-        $sshItem.Text = "Stop SSH Service..."
+        $sshItem.Text = "Stop Remote Access..."
     }
     else {
-        $sshItem.Text = "Start SSH Service..."
+        $sshItem.Text = "Start Remote Access..."
     }
     $startItem.Checked = Test-Path $startupShortcut
 
     $grid.Rows.Clear()
+    $currentIds = @{}
     foreach ($job in $jobs) {
+        $currentIds[$job.Id] = $true
         $staged = Format-Bytes $job.SourceBytes
         if ($job.TotalBytes -gt 0) {
             $staged = "{0} / {1}" -f (
@@ -522,14 +882,21 @@ function Update-Display {
                 Format-Bytes $job.TotalBytes
             )
         }
-        $grid.Rows.Add(
+        $rowIndex = $grid.Rows.Add(
             $job.Name,
-            $job.State,
+            (
+                $job.State.Substring(0, 1).ToUpperInvariant() +
+                $job.State.Substring(1)
+            ),
             ("{0:N0}%" -f ($job.Fraction * 100)),
             $job.Encoder,
             $staged,
             $job.Updated.ToString("g")
-        ) | Out-Null
+        )
+        $grid.Rows[$rowIndex].Tag = $job.Id
+        if ($job.Message) {
+            $grid.Rows[$rowIndex].Cells["State"].ToolTipText = $job.Message
+        }
         $previous = $knownStates[$job.Id]
         if ($previous -and $previous -ne $job.State) {
             if ($job.State -eq "complete") {
@@ -550,6 +917,11 @@ function Update-Display {
             }
         }
         $knownStates[$job.Id] = $job.State
+    }
+    foreach ($knownId in @($knownStates.Keys)) {
+        if (-not $currentIds.ContainsKey($knownId)) {
+            $knownStates.Remove($knownId)
+        }
     }
 }
 

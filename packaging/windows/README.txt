@@ -16,13 +16,15 @@ Manual alternative from PowerShell as Administrator:
    Set-ExecutionPolicy -Scope Process Bypass
    .\Install-VidReclaimWorker.ps1 -PublicKey 'PASTE THE KEY HERE'
 
-4. In VidReclaim, enable Windows PC under Quality and speed. Enter the Windows
-   hostname (shown by the setup), Windows user, and click Test.
+4. In VidReclaim, enable Windows PC. Enter the Windows hostname and user, then
+   click Test.
 
-The tray icon shows current transfers and encodes. Its menu can pause or cancel
-jobs, change the Start with Windows preference, or shut down VidReclaim fully.
-Full shutdown cancels its jobs, stops remote access, and exits. Close Monitor
-Only leaves remote access and active jobs running.
+The tray shows transfers and encodes. Interrupted jobs can resume from the Mac.
+Cancel, then Clear Finished, to remove an interrupted job. Cleanup waits for
+active transfers to stop.
+
+Quit VidReclaim cancels jobs, stops remote access, and exits. Close Monitor Only
+leaves jobs and remote access running.
 
 Start-menu entry: VidReclaim
 

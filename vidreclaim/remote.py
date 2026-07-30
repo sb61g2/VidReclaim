@@ -172,6 +172,11 @@ def _remote_transfer_state(
         f"""
 $path = Join-Path $HOME '{remote_path}'
 $control = Join-Path $HOME '{parent}/control.txt'
+$lease = Join-Path $HOME '{parent}/client.lease'
+if (Test-Path (Split-Path -Parent $lease)) {{
+    [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() |
+        Set-Content -Encoding ASCII $lease
+}}
 [ordered]@{{
     size = $(if (Test-Path $path) {{ (Get-Item $path).Length }} else {{ -1 }})
     action = $(if (Test-Path $control) {{ (Get-Content -Raw $control).Trim().ToLowerInvariant() }} else {{ '' }})
@@ -193,6 +198,8 @@ def _clear_remote_control(config: RemoteConfig, job_root: str) -> None:
         f"""
 $path = Join-Path $HOME '{job_root}/control.txt'
 if (Test-Path $path) {{ Remove-Item -Force $path }}
+$cleanup = Join-Path $HOME '{job_root}/cleanup.txt'
+if (Test-Path $cleanup) {{ Remove-Item -Force $cleanup }}
 """,
     )
 
@@ -204,6 +211,32 @@ def _clear_remote_status(config: RemoteConfig, job_root: str) -> None:
 $path = Join-Path $HOME '{job_root}/status.json'
 if (Test-Path $path) {{ Remove-Item -Force $path }}
 """,
+    )
+
+
+def _claim_remote_job(config: RemoteConfig, job_root: str) -> None:
+    _ssh_text(
+        config,
+        f"""
+$job = Join-Path $HOME '{job_root}'
+New-Item -ItemType Directory -Force -Path $job | Out-Null
+$cleanup = Join-Path $job 'cleanup.txt'
+if (Test-Path $cleanup) {{ Remove-Item -Force $cleanup }}
+Set-Content -Encoding ASCII (Join-Path $job 'client.protocol') -Value '3'
+[DateTimeOffset]::UtcNow.ToUnixTimeSeconds() |
+    Set-Content -Encoding ASCII (Join-Path $job 'client.lease')
+""",
+    )
+
+
+def _release_remote_job(config: RemoteConfig, job_root: str) -> None:
+    _ssh_text(
+        config,
+        f"""
+$lease = Join-Path $HOME '{job_root}/client.lease'
+if (Test-Path $lease) {{ Remove-Item -Force $lease }}
+""",
+        check=False,
     )
 
 
@@ -430,7 +463,25 @@ def _job_state(config: RemoteConfig, job_id: str) -> dict[str, object]:
         config,
         f"""
 $path = Join-Path $HOME '.vidreclaim\\jobs\\{job_id}\\status.json'
-if (Test-Path $path) {{ Get-Content -Raw $path }} else {{ '{{"state":"missing"}}' }}
+$lease = Join-Path $HOME '.vidreclaim\\jobs\\{job_id}\\client.lease'
+if (Test-Path (Split-Path -Parent $lease)) {{
+    [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() |
+        Set-Content -Encoding ASCII $lease
+}}
+if (Test-Path $path) {{
+    $status = Get-Content -Raw $path | ConvertFrom-Json
+    $workerAlive = $false
+    if ($status.worker_pid) {{
+        $workerAlive = $null -ne (
+            Get-Process -Id $status.worker_pid -ErrorAction SilentlyContinue
+        )
+    }}
+    $status |
+        Add-Member -NotePropertyName worker_alive -NotePropertyValue $workerAlive -Force
+    $status | ConvertTo-Json -Compress
+}} else {{
+    '{{"state":"missing","worker_alive":false}}'
+}}
 """,
     )
     try:
@@ -450,7 +501,10 @@ $running = $false
 if (Test-Path $statusPath) {{
     try {{
         $status = Get-Content -Raw $statusPath | ConvertFrom-Json
-        if ($status.state -eq 'running' -and $status.worker_pid) {{
+        if (
+            $status.state -in @('starting', 'running') -and
+            $status.worker_pid
+        ) {{
             $running = $null -ne (Get-Process -Id $status.worker_pid -ErrorAction SilentlyContinue)
         }}
         if ($status.state -eq 'complete' -and (Test-Path (Join-Path $job 'output.part.mkv'))) {{
@@ -527,7 +581,7 @@ if ($gpu) { $gpuName = (& $gpu.Source --query-gpu=name --format=csv,noheader 2>$
     return result
 
 
-def remote_encode(
+def _remote_encode_claimed(
     plan: Plan,
     temporary: Path,
     *,
@@ -637,6 +691,12 @@ def remote_encode(
                         f"Windows worker did not start: {runner_output}"
                     )
                 runner = _launch_job(config, job_id)
+            elif (
+                status in {"starting", "running"}
+                and runner is None
+                and state.get("worker_alive") is False
+            ):
+                runner = _launch_job(config, job_id)
             time.sleep(0.75)
     finally:
         if runner is not None:
@@ -657,3 +717,32 @@ def remote_encode(
     )
     download_partial.replace(temporary)
     return job_id
+
+
+def remote_encode(
+    plan: Plan,
+    temporary: Path,
+    *,
+    config: RemoteConfig,
+    profile: Profile,
+    preset: str,
+    progress: ProgressCallback | None = None,
+    control: ControlCallback | None = None,
+    stage: StageCallback | None = None,
+) -> str:
+    job_id = remote_job_id(plan, config)
+    job_root = f".vidreclaim/jobs/{job_id}"
+    _claim_remote_job(config, job_root)
+    try:
+        return _remote_encode_claimed(
+            plan,
+            temporary,
+            config=config,
+            profile=profile,
+            preset=preset,
+            progress=progress,
+            control=control,
+            stage=stage,
+        )
+    finally:
+        _release_remote_job(config, job_root)

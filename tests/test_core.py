@@ -41,6 +41,7 @@ from vidreclaim.remote import (
     _sftp_quote,
     _ssh_text,
     config_from_settings,
+    remote_encode,
     remote_job_id,
 )
 from vidreclaim.runner import EncodeControl, _stream_command, output_path
@@ -908,13 +909,75 @@ class RemoteEncodingTests(unittest.TestCase):
         with mock.patch(
             "vidreclaim.remote._ssh_text",
             return_value='{"size":12345,"action":"cancel"}',
-        ):
+        ) as ssh:
             size, action = _remote_transfer_state(
                 config,
                 ".vidreclaim/jobs/test/source.mkv",
             )
         self.assertEqual(12345, size)
         self.assertEqual("cancel", action)
+        self.assertIn("client.lease", ssh.call_args.args[1])
+
+    def test_remote_encode_releases_client_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "movie.mkv"
+            source.write_bytes(b"source")
+            plan = Plan(
+                media(source, 1920, 1080),
+                "encode",
+                "test",
+                Candidate(1920, 1080, 22, accepted=True),
+            )
+            config = RemoteConfig("video-pc", "encoder")
+            with (
+                mock.patch("vidreclaim.remote._claim_remote_job") as claim,
+                mock.patch(
+                    "vidreclaim.remote._remote_encode_claimed",
+                    return_value="job-id",
+                ),
+                mock.patch("vidreclaim.remote._release_remote_job") as release,
+            ):
+                result = remote_encode(
+                    plan,
+                    root / "output.mkv",
+                    config=config,
+                    profile=PROFILES["balanced"],
+                    preset="medium",
+                )
+        self.assertEqual("job-id", result)
+        claim.assert_called_once()
+        release.assert_called_once()
+
+    def test_remote_encode_releases_lease_after_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "movie.mkv"
+            source.write_bytes(b"source")
+            plan = Plan(
+                media(source, 1920, 1080),
+                "encode",
+                "test",
+                Candidate(1920, 1080, 22, accepted=True),
+            )
+            config = RemoteConfig("video-pc", "encoder")
+            with (
+                mock.patch("vidreclaim.remote._claim_remote_job"),
+                mock.patch(
+                    "vidreclaim.remote._remote_encode_claimed",
+                    side_effect=CommandError("failed"),
+                ),
+                mock.patch("vidreclaim.remote._release_remote_job") as release,
+            ):
+                with self.assertRaises(CommandError):
+                    remote_encode(
+                        plan,
+                        root / "output.mkv",
+                        config=config,
+                        profile=PROFILES["balanced"],
+                        preset="medium",
+                    )
+        release.assert_called_once()
 
 
 if __name__ == "__main__":
