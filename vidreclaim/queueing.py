@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import time
 import uuid
@@ -1097,6 +1098,7 @@ def run_session(
                 f"Sending to {settings.get('remote_host')}"
                 if settings.get("remote_host") else "Encoding"
             ),
+            transfer_progress=None,
         )
 
         def requested_action() -> str:
@@ -1132,6 +1134,7 @@ def run_session(
                 encode_elapsed_seconds=elapsed_now(),
                 message="Verifying" if fraction >= 1 else "Encoding",
                 status="verifying" if fraction >= 1 else "encoding",
+                transfer_progress=None,
             )
             snapshot = store.read()
             overall, eta = _session_progress(snapshot)
@@ -1144,11 +1147,17 @@ def run_session(
             store.mutate(update_overall)
 
         def update_stage(message: str) -> None:
+            match = re.search(r"\((\d+)%\)$", message)
+            transferring = message.startswith(("Uploading ", "Downloading "))
             _update_item(
                 store,
                 item_id,
                 message=message,
                 encode_elapsed_seconds=elapsed_now(),
+                transfer_progress=(
+                    min(1.0, max(0.0, int(match.group(1)) / 100))
+                    if match else (0.0 if transferring else None)
+                ),
             )
 
         try:

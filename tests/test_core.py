@@ -34,6 +34,7 @@ from vidreclaim.review import _render_html, build_review_assets
 from vidreclaim.remote import (
     RemoteConfig,
     _job_manifest,
+    _sftp_quote,
     config_from_settings,
     remote_job_id,
 )
@@ -757,6 +758,16 @@ class QueueTests(unittest.TestCase):
 
 
 class RemoteEncodingTests(unittest.TestCase):
+    def test_sftp_paths_are_quoted_for_spaces_and_apostrophes(self) -> None:
+        self.assertEqual(
+            "\"/Media/Director's Cut/movie file.mkv\"",
+            _sftp_quote("/Media/Director's Cut/movie file.mkv"),
+        )
+
+    def test_sftp_paths_reject_line_breaks(self) -> None:
+        with self.assertRaises(CommandError):
+            _sftp_quote("movie\nfile.mkv")
+
     def test_cpu_encoder_is_the_remote_default(self) -> None:
         config = config_from_settings({
             "remote_host": "video-pc",

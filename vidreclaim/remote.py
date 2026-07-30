@@ -3,9 +3,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import os
 import re
 import subprocess
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from importlib.resources import files
@@ -81,6 +81,27 @@ def _ssh_base(config: RemoteConfig) -> list[str]:
     return [*args, config.target]
 
 
+def _sftp_base(config: RemoteConfig, batch_path: Path) -> list[str]:
+    args = [
+        "/usr/bin/sftp",
+        "-P", str(config.port),
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=8",
+        "-o", "ServerAliveInterval=10",
+        "-o", "ServerAliveCountMax=3",
+        "-o", "StrictHostKeyChecking=accept-new",
+    ]
+    if config.identity_file:
+        args += ["-i", str(config.identity_file)]
+    return [*args, "-b", str(batch_path), config.target]
+
+
+def _sftp_quote(value: str) -> str:
+    if "\n" in value or "\r" in value:
+        raise CommandError("SFTP paths cannot contain line breaks")
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def _powershell_encoded(script: str) -> list[str]:
     encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
     return [
@@ -110,6 +131,20 @@ def _ssh_text(
     return completed.stdout.strip()
 
 
+def _remote_size(config: RemoteConfig, remote_path: str) -> int:
+    raw = _ssh_text(
+        config,
+        f"""
+$path = Join-Path $HOME '{remote_path}'
+if (Test-Path $path) {{ (Get-Item $path).Length }} else {{ -1 }}
+""",
+    )
+    try:
+        return int(raw or -1)
+    except ValueError as error:
+        raise CommandError(f"Windows returned an invalid file size: {raw}") from error
+
+
 def _upload(
     config: RemoteConfig,
     data_path: Path,
@@ -117,54 +152,64 @@ def _upload(
     *,
     offset: int = 0,
     stage: StageCallback | None = None,
+    control: ControlCallback | None = None,
 ) -> None:
+    total = data_path.stat().st_size
     if stage:
-        remaining = data_path.stat().st_size - offset
+        remaining = total - offset
         verb = "Resuming upload" if offset else "Uploading"
         stage(f"{verb} {data_path.name} ({remaining:,} bytes remaining)")
-    script = f"""
-$path = Join-Path $HOME '{remote_path}'
-$parent = Split-Path -Parent $path
-New-Item -ItemType Directory -Force -Path $parent | Out-Null
-$source = [Console]::OpenStandardInput()
-$target = [IO.File]::Open($path, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::Write, [IO.FileShare]::None)
-try {{
-    $target.SetLength({offset})
-    [void]$target.Seek({offset}, [IO.SeekOrigin]::Begin)
-    $source.CopyTo($target)
-}} finally {{ $target.Dispose() }}
-"""
-    process = subprocess.Popen(
-        [*_ssh_base(config), *_powershell_encoded(script)],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+    parent = remote_path.rsplit("/", 1)[0]
+    _ssh_text(
+        config,
+        f"""
+$path = Join-Path $HOME '{parent}'
+New-Item -ItemType Directory -Force -Path $path | Out-Null
+""",
     )
-    assert process.stdin is not None
-    try:
-        total = data_path.stat().st_size
-        sent = offset
-        next_report = sent + 64 * 1024 * 1024
-        with data_path.open("rb") as source:
-            source.seek(offset)
-            while chunk := source.read(4 * 1024 * 1024):
-                process.stdin.write(chunk)
-                sent += len(chunk)
-                if stage and (sent >= next_report or sent == total):
-                    stage(
-                        f"Uploading {data_path.name} "
-                        f"({sent / max(total, 1):.0%})"
-                    )
-                    next_report = sent + 64 * 1024 * 1024
-        process.stdin.close()
-        error = process.stderr.read().decode("utf-8", errors="replace")
-        return_code = process.wait()
-    except BaseException:
-        process.kill()
-        process.wait()
-        raise
-    if return_code:
-        raise CommandError(f"Remote upload failed: {error.strip()}")
+    command = "put -a" if offset else "put"
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix="vidreclaim-sftp-",
+        suffix=".txt",
+    ) as batch:
+        batch.write(
+            f"{command} {_sftp_quote(str(data_path))} "
+            f"{_sftp_quote(remote_path)}\n"
+        )
+        batch.flush()
+        process = subprocess.Popen(
+            _sftp_base(config, Path(batch.name)),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        last_reported = -1
+        while process.poll() is None:
+            action = control() if control else "run"
+            if action in {"pause", "cancel", "skip"}:
+                process.terminate()
+                process.wait()
+                raise RemoteEncodeControl(action)
+            if stage:
+                try:
+                    sent = _remote_size(config, remote_path)
+                    percent = round(sent / max(total, 1) * 100)
+                    if percent != last_reported:
+                        stage(f"Uploading {data_path.name} ({percent}%)")
+                        last_reported = percent
+                except (CommandError, ValueError):
+                    pass
+            time.sleep(1)
+        output = process.communicate()[0]
+    if process.returncode:
+        raise CommandError(f"Remote upload failed: {output.strip()}")
+    remote_size = _remote_size(config, remote_path)
+    if remote_size != total:
+        raise CommandError(
+            f"Remote upload size mismatch: expected {total}, got {remote_size}"
+        )
 
 
 def _download(
@@ -173,15 +218,10 @@ def _download(
     destination: Path,
     *,
     stage: StageCallback | None = None,
+    control: ControlCallback | None = None,
 ) -> None:
     offset = destination.stat().st_size if destination.exists() else 0
-    remote_size = int(_ssh_text(
-        config,
-        f"""
-$path = Join-Path $HOME '{remote_path}'
-if (Test-Path $path) {{ (Get-Item $path).Length }} else {{ -1 }}
-""",
-    ) or -1)
+    remote_size = _remote_size(config, remote_path)
     if remote_size < 0:
         raise CommandError("Remote output is missing")
     if offset > remote_size:
@@ -190,47 +230,46 @@ if (Test-Path $path) {{ (Get-Item $path).Length }} else {{ -1 }}
     if stage:
         verb = "Resuming download" if offset else "Downloading result"
         stage(f"{verb} ({offset / max(remote_size, 1):.0%})")
-    script = f"""
-$path = Join-Path $HOME '{remote_path}'
-$source = [IO.File]::OpenRead($path)
-$target = [Console]::OpenStandardOutput()
-try {{
-    if ({offset} -gt $source.Length) {{ exit 9 }}
-    [void]$source.Seek({offset}, [IO.SeekOrigin]::Begin)
-    $source.CopyTo($target)
-}} finally {{ $source.Dispose() }}
-"""
-    process = subprocess.Popen(
-        [*_ssh_base(config), *_powershell_encoded(script)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    assert process.stdout is not None
-    try:
-        received = offset
-        next_report = received + 64 * 1024 * 1024
-        with destination.open("ab") as target:
-            while chunk := process.stdout.read(4 * 1024 * 1024):
-                target.write(chunk)
-                received += len(chunk)
-                if stage and (
-                    received >= next_report or received == remote_size
-                ):
-                    stage(
-                        f"Downloading result "
-                        f"({received / max(remote_size, 1):.0%})"
-                    )
-                    next_report = received + 64 * 1024 * 1024
-        error = process.stderr.read().decode("utf-8", errors="replace")
-        return_code = process.wait()
-    except BaseException:
-        process.kill()
-        process.wait()
-        raise
-    if return_code:
-        if return_code == 9:
-            destination.unlink(missing_ok=True)
-        raise CommandError(f"Remote download failed: {error.strip()}")
+    command = "get -a" if offset else "get"
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix="vidreclaim-sftp-",
+        suffix=".txt",
+    ) as batch:
+        batch.write(
+            f"{command} {_sftp_quote(remote_path)} "
+            f"{_sftp_quote(str(destination))}\n"
+        )
+        batch.flush()
+        process = subprocess.Popen(
+            _sftp_base(config, Path(batch.name)),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        last_reported = -1
+        while process.poll() is None:
+            action = control() if control else "run"
+            if action in {"pause", "cancel", "skip"}:
+                process.terminate()
+                process.wait()
+                raise RemoteEncodeControl(action)
+            if stage and destination.exists():
+                received = destination.stat().st_size
+                percent = round(received / max(remote_size, 1) * 100)
+                if percent != last_reported:
+                    stage(f"Downloading result ({percent}%)")
+                    last_reported = percent
+            time.sleep(1)
+        output = process.communicate()[0]
+    if process.returncode:
+        raise CommandError(f"Remote download failed: {output.strip()}")
+    received = destination.stat().st_size if destination.exists() else -1
+    if received != remote_size:
+        raise CommandError(
+            f"Remote download size mismatch: expected {remote_size}, got {received}"
+        )
 
 
 def remote_job_id(plan: Plan, config: RemoteConfig) -> str:
@@ -410,15 +449,10 @@ def remote_encode(
     source_name = f"source{source_suffix}"
     state = _job_state(config, job_id)
     if state.get("state") != "complete":
-        remote_size = _ssh_text(
-            config,
-            f"""
-$path = Join-Path $HOME '{job_root}/{source_name}'
-if (Test-Path $path) {{ (Get-Item $path).Length }} else {{ -1 }}
-""",
-        )
         source_size = plan.media.source.path.stat().st_size
-        staged_size = int(remote_size or -1)
+        staged_size = _remote_size(
+            config, f"{job_root}/{source_name}",
+        )
         if staged_size != source_size:
             offset = staged_size if 0 <= staged_size < source_size else 0
             _upload(
@@ -427,6 +461,7 @@ if (Test-Path $path) {{ (Get-Item $path).Length }} else {{ -1 }}
                 f"{job_root}/{source_name}",
                 offset=offset,
                 stage=stage,
+                control=control,
             )
         import tempfile
 
@@ -494,6 +529,7 @@ if (Test-Path $path) {{ (Get-Item $path).Length }} else {{ -1 }}
         f"{job_root}/output.part.mkv",
         download_partial,
         stage=stage,
+        control=control,
     )
     download_partial.replace(temporary)
     return job_id

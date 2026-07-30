@@ -22,7 +22,7 @@ progress, speed and ETA, cancellation, and a persistent activity log.
 Sessions survive app restarts and reboots.
 
 Regular video-file encodes can run on a Windows PC over the local network.
-Transfers use SSH, resume from byte offsets after an interruption, and stage
+Transfers use SFTP, resume from byte offsets after an interruption, and stage
 the source on the Windows drive so FFmpeg retains normal seeking. The Mac still
 plans the job, verifies the returned output, applies the savings threshold, and
 handles the source. CPU x265 is the default remote encoder; NVIDIA NVENC is the

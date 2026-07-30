@@ -87,6 +87,7 @@ struct QueueItem: Codable, Identifiable {
     let path: String
     let status: String
     let progress: Double
+    let transferProgress: Double?
     let speedX: Double?
     let etaSeconds: Double?
     let duration: Double?
@@ -108,6 +109,7 @@ struct QueueItem: Codable, Identifiable {
 
     enum CodingKeys: String, CodingKey {
         case id, order, name, path, status, progress, duration, output, message
+        case transferProgress = "transfer_progress"
         case speedX = "speed_x"
         case etaSeconds = "eta_seconds"
         case sourceBytes = "source_bytes"
@@ -831,7 +833,10 @@ final class AppModel: ObservableObject {
         eta = durationLabel(session.etaSeconds)
         if let active = session.items.first(where: { $0.isActive }) {
             jobName = active.name
-            jobProgress = active.progress
+            jobProgress = active.transferProgress ?? active.progress
+            if active.transferProgress != nil {
+                phase = active.message
+            }
             speed = active.speedX.map { String(format: "%.2f×", $0) } ?? ""
         } else {
             jobName = session.summary
@@ -3334,6 +3339,7 @@ struct ActivityView: View {
 
     private func itemDetail(_ item: QueueItem) -> String {
         guard item.isActive else { return item.message }
+        if item.transferProgress != nil { return item.message }
         return String(format: "%.1f%%", item.progress * 100)
     }
 
