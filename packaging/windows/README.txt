@@ -9,7 +9,8 @@ VidReclaim Windows encoder setup
 3. On Windows, double-click:
    Install VidReclaim Worker.cmd
 
-   Approve the Administrator prompt, then paste the Mac public key when asked.
+   Approve the Administrator prompt, paste the Mac public key, and choose
+   whether VidReclaim should start with Windows.
 
 Manual alternative from PowerShell as Administrator:
    Set-ExecutionPolicy -Scope Process Bypass
@@ -17,6 +18,11 @@ Manual alternative from PowerShell as Administrator:
 
 4. In VidReclaim, enable Windows PC under Quality and speed. Enter the Windows
    hostname (shown by the setup), Windows user, and click Test.
+
+The tray icon shows current transfers and encodes. Its menu can pause or cancel
+jobs, change the Start with Windows preference, or shut down VidReclaim fully.
+Full shutdown cancels its jobs, stops remote access, and exits. Close Monitor
+Only leaves remote access and active jobs running.
 
 CPU x265 is the default. RTX 4090 is the faster option.
 

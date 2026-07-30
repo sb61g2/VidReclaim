@@ -1,7 +1,10 @@
 [CmdletBinding()]
 param(
     [string]$PublicKey = "",
-    [switch]$SkipFFmpeg
+    [switch]$SkipFFmpeg,
+    [switch]$SkipTray,
+    [ValidateSet("Ask", "Yes", "No")]
+    [string]$StartWithWindows = "Ask"
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,6 +26,10 @@ if (-not $isAdministrator) {
 if (-not $PSBoundParameters.ContainsKey("PublicKey")) {
     $PublicKey = Read-Host "Paste the Mac public SSH key, or press Enter to skip"
 }
+if ($StartWithWindows -eq "Ask") {
+    $answer = Read-Host "Start VidReclaim with Windows? [Y/n]"
+    $StartWithWindows = $(if ($answer -match "^[Nn]") { "No" } else { "Yes" })
+}
 
 Write-Step "Installing the Windows SSH server"
 $capability = Get-WindowsCapability -Online |
@@ -30,7 +37,9 @@ $capability = Get-WindowsCapability -Online |
 if ($capability.State -ne "Installed") {
     Add-WindowsCapability -Online -Name $capability.Name | Out-Null
 }
-Set-Service -Name sshd -StartupType Automatic
+Set-Service `
+    -Name sshd `
+    -StartupType $(if ($StartWithWindows -eq "Yes") { "Automatic" } else { "Manual" })
 Start-Service sshd
 if (-not (Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue)) {
     New-NetFirewallRule `
@@ -92,12 +101,84 @@ $encoders = (& $ffmpeg.Source -hide_banner -encoders 2>&1 | Out-String)
 $x265 = $encoders.Contains("libx265")
 $nvenc = $encoders.Contains("hevc_nvenc")
 
+if (-not $SkipTray) {
+    Write-Step "Installing the tray monitor"
+    $traySource = Join-Path $PSScriptRoot "VidReclaimTray.ps1"
+    $iconSource = Join-Path $PSScriptRoot "VidReclaimIcon.png"
+    if (-not (Test-Path $traySource)) {
+        throw "VidReclaimTray.ps1 is missing from the setup folder."
+    }
+    $trayRoot = Join-Path $env:LOCALAPPDATA "VidReclaim"
+    New-Item -ItemType Directory -Force -Path $trayRoot | Out-Null
+    $pidPath = Join-Path $trayRoot "tray.pid"
+    if (Test-Path $pidPath) {
+        $oldPid = [int](Get-Content -Raw $pidPath)
+        $oldProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$oldPid" `
+            -ErrorAction SilentlyContinue
+        if (
+            $oldProcess -and
+            $oldProcess.Name -eq "powershell.exe" -and
+            $oldProcess.CommandLine -like "*VidReclaimTray.ps1*"
+        ) {
+            Stop-Process -Id $oldPid -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 500
+        }
+    }
+    $trayDestination = Join-Path $trayRoot "VidReclaimTray.ps1"
+    Copy-Item -Force $traySource $trayDestination
+    if (Test-Path $iconSource) {
+        Copy-Item -Force $iconSource (Join-Path $trayRoot "VidReclaimIcon.png")
+    }
+
+    function New-TrayShortcut {
+        param(
+            [string]$Path,
+            [switch]$StartService
+        )
+        New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path (Split-Path -Parent $Path) | Out-Null
+        $shell = New-Object -ComObject WScript.Shell
+        $shortcut = $shell.CreateShortcut($Path)
+        $shortcut.TargetPath = "powershell.exe"
+        $shortcut.Arguments = (
+            "-NoLogo -NoProfile -STA -ExecutionPolicy Bypass " +
+            "-WindowStyle Hidden -File `"$trayDestination`"" +
+            $(if ($StartService) { " -StartService" } else { "" })
+        )
+        $shortcut.WorkingDirectory = $trayRoot
+        $shortcut.Save()
+    }
+
+    $programShortcut = Join-Path $env:APPDATA (
+        "Microsoft\Windows\Start Menu\Programs\VidReclaim Remote Monitor.lnk"
+    )
+    $startupShortcut = Join-Path $env:APPDATA (
+        "Microsoft\Windows\Start Menu\Programs\Startup\VidReclaim Remote Monitor.lnk"
+    )
+    New-TrayShortcut $programShortcut -StartService
+    if ($StartWithWindows -eq "Yes") {
+        New-TrayShortcut $startupShortcut
+    }
+    else {
+        Remove-Item -Force $startupShortcut -ErrorAction SilentlyContinue
+    }
+    Start-Process `
+        -FilePath "powershell.exe" `
+        -ArgumentList (
+            "-NoLogo -NoProfile -STA -ExecutionPolicy Bypass " +
+            "-WindowStyle Hidden -File `"$trayDestination`""
+        ) | Out-Null
+}
+
 Write-Host ""
 Write-Host "Windows PC: $env:COMPUTERNAME"
 Write-Host "Windows user: $env:USERNAME"
 Write-Host "CPU x265: $(if ($x265) { 'ready' } else { 'missing' })"
 Write-Host "NVIDIA HEVC: $(if ($nvenc) { 'ready' } else { 'missing' })"
 Write-Host "SSH service: $((Get-Service sshd).Status)"
+Write-Host "Start with Windows: $StartWithWindows"
 if (-not $PublicKey) {
     Write-Host ""
     Write-Host "Run again with the Mac public key:"

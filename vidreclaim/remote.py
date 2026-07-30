@@ -145,6 +145,52 @@ if (Test-Path $path) {{ (Get-Item $path).Length }} else {{ -1 }}
         raise CommandError(f"Windows returned an invalid file size: {raw}") from error
 
 
+def _remote_transfer_state(
+    config: RemoteConfig,
+    remote_path: str,
+) -> tuple[int, str]:
+    parent = remote_path.rsplit("/", 1)[0]
+    raw = _ssh_text(
+        config,
+        f"""
+$path = Join-Path $HOME '{remote_path}'
+$control = Join-Path $HOME '{parent}/control.txt'
+[ordered]@{{
+    size = $(if (Test-Path $path) {{ (Get-Item $path).Length }} else {{ -1 }})
+    action = $(if (Test-Path $control) {{ (Get-Content -Raw $control).Trim().ToLowerInvariant() }} else {{ '' }})
+}} | ConvertTo-Json -Compress
+""",
+    )
+    try:
+        state = json.loads(raw)
+        return int(state.get("size", -1)), str(state.get("action") or "")
+    except (json.JSONDecodeError, TypeError, ValueError) as error:
+        raise CommandError(
+            f"Windows returned invalid transfer status: {raw}"
+        ) from error
+
+
+def _clear_remote_control(config: RemoteConfig, job_root: str) -> None:
+    _ssh_text(
+        config,
+        f"""
+$path = Join-Path $HOME '{job_root}/control.txt'
+Remove-Item -Force -ErrorAction SilentlyContinue $path
+""",
+    )
+
+
+def _stop_transfer(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
 def _upload(
     config: RemoteConfig,
     data_path: Path,
@@ -186,23 +232,30 @@ New-Item -ItemType Directory -Force -Path $path | Out-Null
             stderr=subprocess.STDOUT,
         )
         last_reported = -1
-        while process.poll() is None:
-            action = control() if control else "run"
-            if action in {"pause", "cancel", "skip"}:
-                process.terminate()
-                process.wait()
-                raise RemoteEncodeControl(action)
-            if stage:
+        try:
+            while process.poll() is None:
+                action = control() if control else "run"
+                if action in {"pause", "cancel", "skip"}:
+                    raise RemoteEncodeControl(action)
                 try:
-                    sent = _remote_size(config, remote_path)
-                    percent = round(sent / max(total, 1) * 100)
-                    if percent != last_reported:
-                        stage(f"Uploading {data_path.name} ({percent}%)")
-                        last_reported = percent
+                    sent, remote_action = _remote_transfer_state(
+                        config, remote_path,
+                    )
                 except (CommandError, ValueError):
                     pass
-            time.sleep(1)
-        output = process.communicate()[0]
+                else:
+                    if remote_action in {"pause", "cancel", "skip"}:
+                        raise RemoteEncodeControl(remote_action)
+                    if stage:
+                        percent = round(sent / max(total, 1) * 100)
+                        if percent != last_reported:
+                            stage(f"Uploading {data_path.name} ({percent}%)")
+                            last_reported = percent
+                time.sleep(1)
+            output = process.communicate()[0]
+        except BaseException:
+            _stop_transfer(process)
+            raise
     if process.returncode:
         raise CommandError(f"Remote upload failed: {output.strip()}")
     remote_size = _remote_size(config, remote_path)
@@ -249,20 +302,31 @@ def _download(
             stderr=subprocess.STDOUT,
         )
         last_reported = -1
-        while process.poll() is None:
-            action = control() if control else "run"
-            if action in {"pause", "cancel", "skip"}:
-                process.terminate()
-                process.wait()
-                raise RemoteEncodeControl(action)
-            if stage and destination.exists():
-                received = destination.stat().st_size
-                percent = round(received / max(remote_size, 1) * 100)
-                if percent != last_reported:
-                    stage(f"Downloading result ({percent}%)")
-                    last_reported = percent
-            time.sleep(1)
-        output = process.communicate()[0]
+        try:
+            while process.poll() is None:
+                action = control() if control else "run"
+                if action in {"pause", "cancel", "skip"}:
+                    raise RemoteEncodeControl(action)
+                try:
+                    _, remote_action = _remote_transfer_state(
+                        config, remote_path,
+                    )
+                except (CommandError, ValueError):
+                    pass
+                else:
+                    if remote_action in {"pause", "cancel", "skip"}:
+                        raise RemoteEncodeControl(remote_action)
+                if stage and destination.exists():
+                    received = destination.stat().st_size
+                    percent = round(received / max(remote_size, 1) * 100)
+                    if percent != last_reported:
+                        stage(f"Downloading result ({percent}%)")
+                        last_reported = percent
+                time.sleep(1)
+            output = process.communicate()[0]
+        except BaseException:
+            _stop_transfer(process)
+            raise
     if process.returncode:
         raise CommandError(f"Remote download failed: {output.strip()}")
     received = destination.stat().st_size if destination.exists() else -1
@@ -318,10 +382,12 @@ def _job_manifest(
         "-progress", "pipe:1", "output.part.mkv",
     ]
     return {
-        "schema": 1,
+        "schema": 2,
         "duration": media.duration,
         "arguments": arguments,
         "encoder": config.encoder,
+        "source_display_name": media.source.path.name,
+        "source_bytes": media.source.path.stat().st_size,
     }
 
 
@@ -449,22 +515,11 @@ def remote_encode(
     source_name = f"source{source_suffix}"
     state = _job_state(config, job_id)
     if state.get("state") != "complete":
-        source_size = plan.media.source.path.stat().st_size
-        staged_size = _remote_size(
-            config, f"{job_root}/{source_name}",
-        )
-        if staged_size != source_size:
-            offset = staged_size if 0 <= staged_size < source_size else 0
-            _upload(
-                config,
-                plan.media.source.path,
-                f"{job_root}/{source_name}",
-                offset=offset,
-                stage=stage,
-                control=control,
-            )
-        import tempfile
-
+        if (
+            state.get("state") != "running"
+            and (control() if control else "run") == "run"
+        ):
+            _clear_remote_control(config, job_root)
         with tempfile.TemporaryDirectory(prefix="vidreclaim-remote-") as folder:
             root = Path(folder)
             manifest = root / "manifest.json"
@@ -480,6 +535,20 @@ def remote_encode(
             _write_temp(worker, worker_source.read_bytes())
             _upload(config, manifest, f"{job_root}/manifest.json")
             _upload(config, worker, f"{job_root}/worker.ps1")
+        source_size = plan.media.source.path.stat().st_size
+        staged_size = _remote_size(
+            config, f"{job_root}/{source_name}",
+        )
+        if staged_size != source_size:
+            offset = staged_size if 0 <= staged_size < source_size else 0
+            _upload(
+                config,
+                plan.media.source.path,
+                f"{job_root}/{source_name}",
+                offset=offset,
+                stage=stage,
+                control=control,
+            )
         if stage:
             stage(f"Encoding on {config.host}")
         _start_job(config, job_id)

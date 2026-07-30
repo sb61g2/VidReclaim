@@ -34,6 +34,7 @@ from vidreclaim.review import _render_html, build_review_assets
 from vidreclaim.remote import (
     RemoteConfig,
     _job_manifest,
+    _remote_transfer_state,
     _sftp_quote,
     config_from_settings,
     remote_job_id,
@@ -816,8 +817,24 @@ class RemoteEncodingTests(unittest.TestCase):
                 "source.mkv",
             )
         arguments = manifest["arguments"]
+        self.assertEqual(2, manifest["schema"])
+        self.assertEqual("movie.mkv", manifest["source_display_name"])
+        self.assertEqual(6, manifest["source_bytes"])
         self.assertIn("hevc_nvenc", arguments)
         self.assertIn("p010le", arguments)
+
+    def test_remote_transfer_state_reports_control_action(self) -> None:
+        config = RemoteConfig("video-pc", "encoder")
+        with mock.patch(
+            "vidreclaim.remote._ssh_text",
+            return_value='{"size":12345,"action":"cancel"}',
+        ):
+            size, action = _remote_transfer_state(
+                config,
+                ".vidreclaim/jobs/test/source.mkv",
+            )
+        self.assertEqual(12345, size)
+        self.assertEqual("cancel", action)
 
 
 if __name__ == "__main__":

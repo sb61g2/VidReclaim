@@ -24,7 +24,7 @@ try {
     $manifest = Get-Content -Raw $manifestPath | ConvertFrom-Json
     $ffmpeg = Get-Command ffmpeg.exe -ErrorAction Stop
     Remove-Item -Force -ErrorAction SilentlyContinue $progressPath, $errorPath, $outputPath
-    Write-Status @{ state = "running"; fraction = 0.0; speed_x = $null }
+    Write-Status @{ state = "starting"; fraction = 0.0; speed_x = $null }
     $arguments = @()
     foreach ($argument in $manifest.arguments) {
         $arguments += [string]$argument
@@ -37,6 +37,12 @@ try {
         -RedirectStandardError $errorPath `
         -PassThru `
         -NoNewWindow
+    Write-Status @{
+        state = "running"
+        fraction = 0.0
+        speed_x = $null
+        encoder_pid = $process.Id
+    }
     while (-not $process.HasExited) {
         if (Test-Path $controlPath) {
             $action = (Get-Content -Raw $controlPath).Trim().ToLowerInvariant()
@@ -81,7 +87,12 @@ try {
                 }
             }
         }
-        Write-Status @{ state = "running"; fraction = $fraction; speed_x = $speed }
+        Write-Status @{
+            state = "running"
+            fraction = $fraction
+            speed_x = $speed
+            encoder_pid = $process.Id
+        }
         Start-Sleep -Milliseconds 750
         $process.Refresh()
     }

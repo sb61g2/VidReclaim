@@ -28,6 +28,12 @@ plans the job, verifies the returned output, applies the savings threshold, and
 handles the source. CPU x265 is the default remote encoder; NVIDIA NVENC is the
 speed-first option.
 
+The Windows setup adds a tray monitor for transfer and encode status. Its menu
+can pause or cancel active jobs, change whether VidReclaim starts with Windows,
+and shut down VidReclaim completely. Full shutdown cancels VidReclaim jobs,
+stops its worker processes and remote access, and closes the monitor. Closing
+only the monitor leaves active work and remote access running.
+
 The app uses the same installed command-line engine described below. Disk-usage
 findings stay in the native interface and can feed selected files or folders
 directly into a queue. Its unified picking flow first scans user-selected
@@ -339,11 +345,12 @@ Use `--deep-verify` to decode every frame before accepting an output.
 
 ## Windows encoding PC
 
-Run `packaging/windows/Install-VidReclaimWorker.ps1` as Administrator on the
-Windows PC. It enables the built-in OpenSSH server, adds the firewall rule,
-installs FFmpeg through `winget` when needed, and can add the Mac's public SSH
-key. The native Mac app exposes the connection under **Quality and speed** and
-tests it before a job is prepared.
+Double-click `packaging/windows/Install VidReclaim Worker.cmd` on the Windows
+PC. It requests administrator access, enables the built-in OpenSSH server, adds
+the firewall rule, installs FFmpeg through `winget` when needed, can add the
+Mac's public SSH key, and asks whether VidReclaim should start with Windows.
+The native Mac app exposes the connection under **Quality and speed** and tests
+it before a job is prepared.
 
 Command-line example:
 
