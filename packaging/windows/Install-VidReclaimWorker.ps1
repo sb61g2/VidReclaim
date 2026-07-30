@@ -20,6 +20,10 @@ if (-not $isAdministrator) {
     throw "Run this script from PowerShell as Administrator."
 }
 
+if (-not $PSBoundParameters.ContainsKey("PublicKey")) {
+    $PublicKey = Read-Host "Paste the Mac public SSH key, or press Enter to skip"
+}
+
 Write-Step "Installing the Windows SSH server"
 $capability = Get-WindowsCapability -Online |
     Where-Object Name -Like "OpenSSH.Server*"
@@ -50,11 +54,9 @@ if (-not $SkipFFmpeg -and -not (Get-Command ffmpeg.exe -ErrorAction SilentlyCont
         --exact `
         --accept-package-agreements `
         --accept-source-agreements
-    $env:Path = (
-        [Environment]::GetEnvironmentVariable("Path", "Machine")
-        + ";"
-        + [Environment]::GetEnvironmentVariable("Path", "User")
-    )
+    $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $env:Path = "$machinePath;$userPath"
 }
 
 if ($PublicKey) {

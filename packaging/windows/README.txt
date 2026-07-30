@@ -6,7 +6,12 @@ VidReclaim Windows encoder setup
 2. Copy the single line printed by:
    cat ~/.ssh/id_ed25519.pub
 
-3. On Windows, open PowerShell as Administrator, change to this folder, and run:
+3. On Windows, double-click:
+   Install VidReclaim Worker.cmd
+
+   Approve the Administrator prompt, then paste the Mac public key when asked.
+
+Manual alternative from PowerShell as Administrator:
    Set-ExecutionPolicy -Scope Process Bypass
    .\Install-VidReclaimWorker.ps1 -PublicKey 'PASTE THE KEY HERE'
 
