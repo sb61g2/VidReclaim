@@ -824,8 +824,9 @@ def remote_run_staged(
     *,
     config: RemoteConfig,
     control: ControlCallback | None = None,
+    progress: ProgressCallback | None = None,
 ) -> str:
-    """Start a staged job so its encode can overlap the prior download."""
+    """Run a staged job while the preceding queue item finishes."""
     job_id = remote_job_id(plan, config)
     job_root = f"VidReclaim Working/jobs/{job_id}"
     _claim_remote_job(config, job_root)
@@ -847,6 +848,14 @@ def remote_run_staged(
                 last_action = action
             state = _job_state(config, job_id)
             status = str(state.get("state") or "missing")
+            if progress and status == "running":
+                progress(
+                    float(state.get("fraction") or 0.0),
+                    (
+                        float(state["speed_x"])
+                        if state.get("speed_x") is not None else None
+                    ),
+                )
             if status == "complete":
                 return job_id
             if (

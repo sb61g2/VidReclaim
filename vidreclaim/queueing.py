@@ -20,6 +20,7 @@ from .planner import analyze, analyze_fast
 from .probe import probe_file
 from .review import build_review_assets, review_in_browser
 from .remote import (
+    RemoteConfig,
     RemoteEncodeControl,
     config_from_settings,
     remote_run_staged,
@@ -43,6 +44,28 @@ TERMINAL_ITEM_STATES = {
     "complete", "processed", "skipped", "cancelled", "error",
 }
 RUNNABLE_ITEM_STATES = {"ready"}
+
+
+def _can_parallel_remote_cpu(
+    current: Plan,
+    upcoming: Plan,
+    config: RemoteConfig | None,
+) -> bool:
+    """Use a second x265 process when neither encode is 4K-sized."""
+    if config is None or config.encoder != "x265":
+        return False
+    if (
+        current.media.source.kind != "file"
+        or upcoming.media.source.kind != "file"
+        or current.candidate is None
+        or upcoming.candidate is None
+    ):
+        return False
+    four_k_pixels = 3840 * 2160
+    return all(
+        candidate.width * candidate.height < four_k_pixels
+        for candidate in (current.candidate, upcoming.candidate)
+    )
 
 
 def sessions_directory() -> Path:
@@ -1177,7 +1200,15 @@ def run_session(
         plan = Plan.from_dict(item["plan"])
         label = item["name"]
         print(f"Queue: encoding {label}", flush=True)
+        prelaunched = item_id in pipeline_launch_futures
+        prelaunched_at = (
+            float(item["encode_started_at_unix"])
+            if prelaunched and item.get("encode_started_at_unix")
+            else None
+        )
         elapsed_base = float(item.get("encode_elapsed_seconds") or 0.0)
+        if prelaunched_at is not None:
+            elapsed_base += max(0.0, time.time() - prelaunched_at)
         active_since: float | None = time.monotonic()
 
         def elapsed_now() -> float:
@@ -1200,10 +1231,15 @@ def run_session(
             item_id,
             status="encoding",
             requested_action=None,
-            progress=0.0,
-            encode_started_at_unix=time.time(),
+            progress=(
+                float(item.get("progress") or 0.0)
+                if prelaunched else 0.0
+            ),
+            encode_started_at_unix=prelaunched_at or time.time(),
             message=(
-                f"Sending to {settings.get('remote_host')}"
+                "Encoding"
+                if prelaunched
+                else f"Sending to {settings.get('remote_host')}"
                 if settings.get("remote_host") else "Encoding"
             ),
             transfer_progress=None,
@@ -1254,6 +1290,92 @@ def run_session(
 
             store.mutate(update_overall)
 
+        def pipeline_control(next_id: str) -> str:
+            latest_session = store.read()
+            latest = next(
+                candidate for candidate in latest_session["items"]
+                if candidate["id"] == next_id
+            )
+            if not latest.get("selected", True):
+                return "cancel"
+            return str(
+                latest.get("requested_action")
+                or (
+                    "cancel"
+                    if latest["status"] == "cancelled"
+                    else "pause" if latest["status"] == "paused"
+                    else "run"
+                )
+            )
+
+        def pipeline_progress(
+            next_id: str,
+            next_plan: Plan,
+            fraction: float,
+            speed: float | None,
+        ) -> None:
+            remaining = (
+                next_plan.media.duration * (1 - fraction) / speed
+                if speed and speed > 0 else None
+            )
+            _update_item(
+                store,
+                next_id,
+                progress=min(1.0, max(0.0, fraction)),
+                speed_x=speed,
+                eta_seconds=remaining,
+                message="Encoding",
+                transfer_progress=None,
+            )
+            snapshot = store.read()
+            overall, eta = _session_progress(snapshot)
+
+            def update_overall(data: dict[str, Any]) -> None:
+                data["overall_fraction"] = overall
+                data["encode_fraction"] = overall
+                data["eta_seconds"] = eta
+
+            store.mutate(update_overall)
+
+        def schedule_pipeline_launch(
+            next_id: str,
+            next_plan: Plan,
+            staged: Any,
+        ) -> None:
+            if (
+                pipeline_executor is None
+                or remote_config is None
+                or next_id in pipeline_launch_futures
+            ):
+                return
+
+            def launch_after_stage() -> str | None:
+                try:
+                    staged.result()
+                except RemoteEncodeControl:
+                    raise
+                except (CommandError, OSError):
+                    return None
+                _update_item(
+                    store,
+                    next_id,
+                    message=f"Encoding on {remote_config.host}",
+                    encode_started_at_unix=time.time(),
+                    transfer_progress=None,
+                )
+                return remote_run_staged(
+                    next_plan,
+                    config=remote_config,
+                    control=lambda: pipeline_control(next_id),
+                    progress=lambda fraction, speed: pipeline_progress(
+                        next_id, next_plan, fraction, speed
+                    ),
+                )
+
+            pipeline_launch_futures[next_id] = pipeline_executor.submit(
+                launch_after_stage
+            )
+
         def update_stage(message: str) -> None:
             match = re.search(r"\((\d+)%\)$", message)
             transferring = message.startswith(("Uploading ", "Downloading "))
@@ -1280,22 +1402,7 @@ def run_session(
                     return
 
                 def next_control() -> str:
-                    latest_session = store.read()
-                    latest = next(
-                        candidate for candidate in latest_session["items"]
-                        if candidate["id"] == next_id
-                    )
-                    if not latest.get("selected", True):
-                        return "cancel"
-                    return str(
-                        latest.get("requested_action")
-                        or (
-                            "cancel"
-                            if latest["status"] == "cancelled"
-                            else "pause" if latest["status"] == "paused"
-                            else "run"
-                        )
-                    )
+                    return pipeline_control(next_id)
 
                 def next_stage(message: str) -> None:
                     match = re.search(r"\((\d+)%\)$", message)
@@ -1323,6 +1430,14 @@ def run_session(
                     stage=next_stage,
                     control=next_control,
                 )
+                if _can_parallel_remote_cpu(
+                    plan, next_plan, remote_config
+                ):
+                    schedule_pipeline_launch(
+                        next_id,
+                        next_plan,
+                        pipeline_futures[next_id],
+                    )
             if (
                 message.startswith("Downloading result")
                 and pipeline_executor is not None
@@ -1334,35 +1449,10 @@ def run_session(
                 next_id = next_item["id"]
                 next_plan = Plan.from_dict(next_item["plan"])
                 staged = pipeline_futures[next_id]
-
-                def launch_control() -> str:
-                    latest_session = store.read()
-                    latest = next(
-                        candidate for candidate in latest_session["items"]
-                        if candidate["id"] == next_id
-                    )
-                    if not latest.get("selected", True):
-                        return "cancel"
-                    return str(
-                        latest.get("requested_action")
-                        or (
-                            "cancel"
-                            if latest["status"] == "cancelled"
-                            else "pause" if latest["status"] == "paused"
-                            else "run"
-                        )
-                    )
-
-                def launch_after_stage() -> str:
-                    staged.result()
-                    return remote_run_staged(
-                        next_plan,
-                        config=remote_config,
-                        control=launch_control,
-                    )
-
-                pipeline_launch_futures[next_id] = (
-                    pipeline_executor.submit(launch_after_stage)
+                schedule_pipeline_launch(
+                    next_id,
+                    next_plan,
+                    staged,
                 )
 
         try:
@@ -1387,6 +1477,9 @@ def run_session(
                         message="Retrying transfer",
                         transfer_progress=None,
                     )
+            launched = pipeline_launch_futures.pop(item_id, None)
+            if launched is not None:
+                launched.result()
             result = encode(
                 root,
                 plan,

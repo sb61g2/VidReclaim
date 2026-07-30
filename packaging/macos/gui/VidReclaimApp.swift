@@ -4980,6 +4980,82 @@ struct WorkspaceView: View {
 struct ContentView: View {
     @ObservedObject var model: AppModel
 
+    private var workspaceControlSelected: Bool {
+        model.selection == .workspace
+    }
+
+    private var workspaceControlBackground: Color {
+        workspaceControlSelected
+            ? Color(nsColor: .controlAccentColor)
+            : Color(nsColor: .controlColor)
+    }
+
+    private var workspaceControlForeground: Color {
+        workspaceControlSelected ? .white : AppColors.primaryText
+    }
+
+    private func openWorkspace(_ operation: WorkspaceOperation) {
+        model.workspaceOperation = operation
+        model.selection = .workspace
+    }
+
+    private var workspaceSplitButton: some View {
+        HStack(spacing: 0) {
+            Button {
+                model.selection = .workspace
+            } label: {
+                Text(model.workspaceOperation.rawValue)
+                    .frame(minWidth: 88, minHeight: 28)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Open \(model.workspaceOperation.rawValue)")
+
+            Divider()
+                .frame(height: 22)
+                .overlay(
+                    workspaceControlSelected
+                        ? Color.white.opacity(0.35)
+                        : Color(nsColor: .separatorColor)
+                )
+
+            Menu {
+                ForEach(WorkspaceOperation.allCases) { operation in
+                    Button {
+                        openWorkspace(operation)
+                    } label: {
+                        if model.workspaceOperation == operation {
+                            Label(operation.rawValue, systemImage: "checkmark")
+                        } else {
+                            Text(operation.rawValue)
+                        }
+                    }
+                }
+            } label: {
+                Image(systemName: "chevron.down")
+                    .frame(width: 30, height: 28)
+                    .contentShape(Rectangle())
+            }
+            .menuIndicator(.hidden)
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("Choose tool")
+        }
+        .foregroundStyle(workspaceControlForeground)
+        .background(
+            workspaceControlBackground,
+            in: RoundedRectangle(cornerRadius: 7)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 7)
+                .stroke(
+                    workspaceControlSelected
+                        ? Color.clear
+                        : Color(nsColor: .separatorColor)
+                )
+        )
+    }
+
     @ViewBuilder
     private func sectionButton(
         _ title: String,
@@ -5005,17 +5081,7 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                Picker("Tool", selection: $model.workspaceOperation) {
-                    ForEach(WorkspaceOperation.allCases) {
-                        Text($0.rawValue).tag($0)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.menu)
-                .frame(width: 126)
-                .onChange(of: model.workspaceOperation) { _, _ in
-                    model.selection = .workspace
-                }
+                workspaceSplitButton
                 sectionButton(
                     "Queue",
                     section: .queue,

@@ -21,6 +21,7 @@ from vidreclaim.planner import (
 )
 from vidreclaim.queueing import (
     SessionStore,
+    _can_parallel_remote_cpu,
     _load_processed_catalog,
     _migrate_hidden_output_root,
     _normalize_interrupted,
@@ -949,6 +950,63 @@ class QueueTests(unittest.TestCase):
 
 
 class RemoteEncodingTests(unittest.TestCase):
+    def test_parallel_cpu_encode_is_used_below_4k(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first_path = root / "first.mkv"
+            second_path = root / "second.mkv"
+            first_path.write_bytes(b"first")
+            second_path.write_bytes(b"second")
+            first = Plan(
+                media(first_path, 1920, 1080),
+                "encode",
+                "test",
+                Candidate(1920, 1080, 22, accepted=True),
+            )
+            second = Plan(
+                media(second_path, 2560, 1440),
+                "encode",
+                "test",
+                Candidate(2560, 1440, 22, accepted=True),
+            )
+        self.assertTrue(
+            _can_parallel_remote_cpu(
+                first, second, RemoteConfig("video-pc", "encoder")
+            )
+        )
+
+    def test_parallel_cpu_encode_is_not_used_for_4k_or_nvenc(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            hd_path = root / "hd.mkv"
+            uhd_path = root / "uhd.mkv"
+            hd_path.write_bytes(b"hd")
+            uhd_path.write_bytes(b"uhd")
+            hd = Plan(
+                media(hd_path, 1920, 1080),
+                "encode",
+                "test",
+                Candidate(1920, 1080, 22, accepted=True),
+            )
+            uhd = Plan(
+                media(uhd_path, 3840, 2160),
+                "encode",
+                "test",
+                Candidate(3840, 2160, 22, accepted=True),
+            )
+        self.assertFalse(
+            _can_parallel_remote_cpu(
+                hd, uhd, RemoteConfig("video-pc", "encoder")
+            )
+        )
+        self.assertFalse(
+            _can_parallel_remote_cpu(
+                hd,
+                hd,
+                RemoteConfig("video-pc", "encoder", encoder="nvenc"),
+            )
+        )
+
     def test_first_use_progress_noise_is_retried(self) -> None:
         noise = subprocess.CompletedProcess(
             args=[],
