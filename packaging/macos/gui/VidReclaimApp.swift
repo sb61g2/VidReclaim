@@ -198,6 +198,22 @@ struct SpaceFindingRow: Identifiable {
     var id: String { finding.id }
 }
 
+enum LibraryViewMode: String, CaseIterable, Identifiable {
+    case browse = "Folders"
+    case largestVideos = "Largest Videos"
+
+    var id: String { rawValue }
+}
+
+enum LibrarySortOption: String, CaseIterable, Identifiable {
+    case size = "Size"
+    case name = "Name"
+    case files = "File Count"
+    case kind = "Type"
+
+    var id: String { rawValue }
+}
+
 enum QueueSortOption: String, CaseIterable, Identifiable {
     case queue = "Queue order"
     case savingsBytes = "Greatest space savings"
@@ -1574,32 +1590,128 @@ struct RunningBanner: View {
 struct CompressionSourcePicker: View {
     @ObservedObject var model: AppModel
     @State private var searchText = ""
+    @State private var viewMode: LibraryViewMode = .browse
+    @State private var sortOption: LibrarySortOption = .size
+    @State private var ascending = false
+    @State private var expandedFindingIDs = Set<String>()
 
-    private func flatten(
-        _ findings: [SpaceFinding],
-        depth: Int = 0
-    ) -> [SpaceFindingRow] {
-        findings.flatMap { finding in
-            [SpaceFindingRow(finding: finding, depth: depth)]
-                + flatten(
-                    finding.children.sorted { $0.size > $1.size },
-                    depth: depth + 1
-                )
-        }
+    private var roots: [SpaceFinding] {
+        model.spaceScan?.root.children ?? []
     }
 
-    private var allFindings: [SpaceFindingRow] {
-        guard let root = model.spaceScan?.root else { return [] }
-        return flatten(root.children.sorted { $0.size > $1.size })
+    private var scanIdentity: String {
+        guard let root = model.spaceScan?.root else { return "" }
+        return "\(root.size):\(root.files):"
+            + root.children.map(\.id).joined(separator: "|")
+    }
+
+    private func compare(
+        _ left: SpaceFinding,
+        _ right: SpaceFinding
+    ) -> Bool {
+        let order: ComparisonResult
+        switch sortOption {
+        case .size:
+            if left.size == right.size {
+                order = left.name.localizedStandardCompare(right.name)
+            } else {
+                order = left.size < right.size
+                    ? .orderedAscending : .orderedDescending
+            }
+        case .name:
+            order = left.name.localizedStandardCompare(right.name)
+        case .files:
+            if left.files == right.files {
+                order = left.name.localizedStandardCompare(right.name)
+            } else {
+                order = left.files < right.files
+                    ? .orderedAscending : .orderedDescending
+            }
+        case .kind:
+            if left.kind == right.kind {
+                order = left.name.localizedStandardCompare(right.name)
+            } else {
+                order = left.kind.localizedStandardCompare(right.kind)
+            }
+        }
+        return ascending
+            ? order == .orderedAscending
+            : order == .orderedDescending
+    }
+
+    private func flatten(_ findings: [SpaceFinding]) -> [SpaceFinding] {
+        findings.flatMap { [$0] + flatten($0.children) }
+    }
+
+    private var allFindings: [SpaceFinding] {
+        flatten(roots)
+    }
+
+    private var allVideoIDs: Set<String> {
+        Set(allFindings.filter { $0.kind == "video" }.map(\.id))
+    }
+
+    private var allDirectoryIDs: Set<String> {
+        Set(
+            allFindings
+                .filter { !$0.children.isEmpty }
+                .map(\.id)
+        )
+    }
+
+    private func matchesSearch(_ finding: SpaceFinding) -> Bool {
+        guard !searchText.isEmpty else { return true }
+        return finding.name.localizedCaseInsensitiveContains(searchText)
+            || finding.path.localizedCaseInsensitiveContains(searchText)
+    }
+
+    private func branchMatchesSearch(_ finding: SpaceFinding) -> Bool {
+        matchesSearch(finding)
+            || finding.children.contains(where: branchMatchesSearch)
+    }
+
+    private var browseRows: [SpaceFindingRow] {
+        var rows: [SpaceFindingRow] = []
+        func append(_ finding: SpaceFinding, depth: Int) {
+            if !searchText.isEmpty && !branchMatchesSearch(finding) {
+                return
+            }
+            rows.append(SpaceFindingRow(finding: finding, depth: depth))
+            let showChildren = !searchText.isEmpty
+                || expandedFindingIDs.contains(finding.id)
+            guard showChildren else { return }
+            for child in finding.children.sorted(by: compare) {
+                append(child, depth: depth + 1)
+            }
+        }
+        for root in roots.sorted(by: compare) {
+            append(root, depth: 0)
+        }
+        return rows
+    }
+
+    private var largestVideoRows: [SpaceFindingRow] {
+        allFindings
+            .filter { $0.kind == "video" && matchesSearch($0) }
+            .sorted(by: compare)
+            .map { SpaceFindingRow(finding: $0, depth: 0) }
     }
 
     private var findings: [SpaceFindingRow] {
-        let rows = allFindings
-        guard !searchText.isEmpty else { return rows }
-        return rows.filter {
-            $0.finding.name.localizedCaseInsensitiveContains(searchText)
-                || $0.finding.path.localizedCaseInsensitiveContains(searchText)
-        }
+        viewMode == .browse ? browseRows : largestVideoRows
+    }
+
+    private var visibleVideoIDs: Set<String> {
+        Set(findings.filter { $0.finding.kind == "video" }.map(\.finding.id))
+    }
+
+    private var selectedVideoBytes: Int64 {
+        allFindings
+            .filter {
+                $0.kind == "video"
+                    && model.selectedSpaceFindingIDs.contains($0.id)
+            }
+            .reduce(0) { $0 + $1.size }
     }
 
     private func descendantVideoIDs(_ item: SpaceFinding) -> Set<String> {
@@ -1644,15 +1756,11 @@ struct CompressionSourcePicker: View {
     }
 
     var body: some View {
-        GroupBox("Library selection") {
+        GroupBox("Choose Videos") {
             VStack(alignment: .leading, spacing: 12) {
-                Label(
-                    "Step 1 — Choose locations",
-                    systemImage: model.spaceScan == nil
-                        ? "1.circle.fill" : "checkmark.circle.fill"
-                )
-                .font(.headline)
                 HStack {
+                    Text("Locations")
+                        .font(.headline)
                     Button("Add Folders, Files, or Disks…") {
                         model.addSpacePaths()
                     }
@@ -1666,7 +1774,7 @@ struct CompressionSourcePicker: View {
                     Spacer()
                     Button(
                         model.spaceScan == nil
-                            ? "Scan Locations" : "Scan Again"
+                            ? "Scan Disk Usage" : "Rescan"
                     ) {
                         model.runSpaceMap(section: .workspace)
                     }
@@ -1710,26 +1818,96 @@ struct CompressionSourcePicker: View {
                     }
                     .frame(minHeight: 135, maxHeight: 190)
                 } else {
-                    Label(
-                        "Step 2 — Choose content",
-                        systemImage: "2.circle.fill"
-                    )
-                    .font(.headline)
+                    Divider()
+
                     HStack {
+                        Text("Contents")
+                            .font(.headline)
+                        if let scan = model.spaceScan {
+                            Label(
+                                "\(model.bytesLabel(scan.root.size)) "
+                                    + (scan.allocated ? "on disk" : "logical"),
+                                systemImage: "internaldrive"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(AppColors.secondaryText)
+                            Text("\(scan.root.files.formatted()) files")
+                                .font(.caption)
+                                .foregroundStyle(AppColors.secondaryText)
+                            if scan.root.errors > 0 {
+                                Label(
+                                    "\(scan.root.errors) unreadable",
+                                    systemImage: "exclamationmark.triangle"
+                                )
+                                .font(.caption)
+                                .foregroundStyle(AppColors.warning)
+                            }
+                        }
+                        Spacer()
+                    }
+
+                    HStack(spacing: 10) {
+                        Picker("View", selection: $viewMode) {
+                            ForEach(LibraryViewMode.allCases) {
+                                Text($0.rawValue).tag($0)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
+                        .frame(width: 230)
+
                         TextField("Filter scanned contents", text: $searchText)
                             .textFieldStyle(.roundedBorder)
-                            .frame(maxWidth: 320)
+                            .frame(minWidth: 180, maxWidth: 300)
+
                         Spacer()
+
+                        Picker("Sort", selection: $sortOption) {
+                            ForEach(LibrarySortOption.allCases) {
+                                Text($0.rawValue).tag($0)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .frame(width: 150)
+
+                        Button {
+                            ascending.toggle()
+                        } label: {
+                            Image(
+                                systemName: ascending
+                                    ? "arrow.up" : "arrow.down"
+                            )
+                        }
+                        .help(ascending ? "Ascending" : "Descending")
+
+                        if viewMode == .browse {
+                            Button("Expand All") {
+                                expandedFindingIDs = allDirectoryIDs
+                            }
+                            Button("Collapse All") {
+                                expandedFindingIDs.removeAll()
+                            }
+                        }
+                    }
+
+                    HStack(spacing: 8) {
+                        Text("Name")
+                            .font(.caption.bold())
+                        Spacer()
+                        Text("Files")
+                            .font(.caption.bold())
+                            .frame(width: 64, alignment: .trailing)
                         Text("Size")
                             .font(.caption.bold())
-                            .frame(width: 90, alignment: .trailing)
+                            .frame(width: 95, alignment: .trailing)
                         Text("Analyze")
                             .font(.caption.bold())
-                            .frame(width: 58)
-                        Text("SBS")
+                            .frame(width: 64)
+                        Text("Review")
                             .font(.caption.bold())
-                            .frame(width: 40)
+                            .frame(width: 52)
                     }
+                    .padding(.horizontal, 8)
 
                     List {
                         ForEach(findings) { row in
@@ -1737,6 +1915,28 @@ struct CompressionSourcePicker: View {
                             HStack(spacing: 8) {
                                 Color.clear
                                     .frame(width: CGFloat(row.depth * 16))
+                                if viewMode == .browse,
+                                   !item.children.isEmpty {
+                                    Button {
+                                        if expandedFindingIDs.contains(item.id) {
+                                            expandedFindingIDs.remove(item.id)
+                                        } else {
+                                            expandedFindingIDs.insert(item.id)
+                                        }
+                                    } label: {
+                                        Image(
+                                            systemName: expandedFindingIDs
+                                                .contains(item.id)
+                                                ? "chevron.down"
+                                                : "chevron.right"
+                                        )
+                                        .font(.caption.bold())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .frame(width: 14)
+                                } else {
+                                    Color.clear.frame(width: 14)
+                                }
                                 Image(
                                     systemName: item.kind == "directory"
                                         ? "folder.fill"
@@ -1749,16 +1949,31 @@ struct CompressionSourcePicker: View {
                                 )
                                 VStack(alignment: .leading, spacing: 1) {
                                     Text(item.name).lineLimit(1)
-                                    Text(item.path)
-                                        .font(.caption2)
-                                        .foregroundStyle(AppColors.tertiaryText)
-                                        .lineLimit(1)
+                                    if viewMode == .largestVideos
+                                        || !searchText.isEmpty {
+                                        Text(
+                                            URL(fileURLWithPath: item.path)
+                                                .deletingLastPathComponent().path
+                                        )
+                                            .font(.caption2)
+                                            .foregroundStyle(
+                                                AppColors.tertiaryText
+                                            )
+                                            .lineLimit(1)
+                                    }
                                 }
                                 Spacer()
+                                Text(
+                                    item.kind == "directory"
+                                        ? item.files.formatted() : "—"
+                                )
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(AppColors.secondaryText)
+                                    .frame(width: 64, alignment: .trailing)
                                 Text(model.bytesLabel(item.size))
                                     .font(.caption.monospacedDigit())
                                     .foregroundStyle(AppColors.secondaryText)
-                                    .frame(width: 90, alignment: .trailing)
+                                    .frame(width: 95, alignment: .trailing)
                                 Button {
                                     toggleAnalysis(item)
                                 } label: {
@@ -1770,7 +1985,7 @@ struct CompressionSourcePicker: View {
                                     )
                                 }
                                 .buttonStyle(.plain)
-                                .frame(width: 58)
+                                .frame(width: 64)
                                 .disabled(descendantVideoIDs(item).isEmpty)
                                 Button {
                                     toggleReview(item)
@@ -1783,65 +1998,57 @@ struct CompressionSourcePicker: View {
                                     )
                                 }
                                 .buttonStyle(.plain)
-                                .frame(width: 40)
+                                .frame(width: 52)
                                 .disabled(descendantVideoIDs(item).isEmpty)
                                 .help("Generate side-by-side samples")
                             }
+                            .padding(.vertical, 2)
                         }
                     }
-                    .frame(minHeight: 220, idealHeight: 280, maxHeight: 340)
+                    .overlay {
+                        if findings.isEmpty {
+                            ContentUnavailableView(
+                                "No matching items",
+                                systemImage: "line.3.horizontal.decrease.circle"
+                            )
+                        }
+                    }
+                    .frame(minHeight: 260, idealHeight: 340, maxHeight: 430)
 
                     HStack {
                         Text(
-                            "\(model.selectedSpaceVideoPaths.count.formatted()) video\(model.selectedSpaceVideoPaths.count == 1 ? "" : "s") selected for analysis"
+                            "\(model.selectedSpaceVideoPaths.count.formatted()) selected"
                         )
                         .font(.caption)
                         .foregroundStyle(AppColors.secondaryText)
+                        if selectedVideoBytes > 0 {
+                            Text("· \(model.bytesLabel(selectedVideoBytes))")
+                                .font(.caption)
+                                .foregroundStyle(AppColors.secondaryText)
+                        }
                         if !model.selectedReviewSpaceVideoPaths.isEmpty {
                             Text(
-                                "· \(model.selectedReviewSpaceVideoPaths.count.formatted()) for SBS"
+                                "· \(model.selectedReviewSpaceVideoPaths.count.formatted()) for review"
                             )
                             .font(.caption)
                             .foregroundStyle(AppColors.secondaryText)
                         }
                         Spacer()
-                        let everyVideoID = Set(
-                            allFindings
-                                .filter { $0.finding.kind == "video" }
-                                .map(\.finding.id)
-                        )
-                        let allSelected = !everyVideoID.isEmpty
-                            && everyVideoID.isSubset(
-                                of: model.selectedSpaceFindingIDs
+                        Button("Select Visible") {
+                            model.selectedSpaceFindingIDs.formUnion(
+                                visibleVideoIDs
                             )
-                        Button(allSelected ? "Deselect All" : "Select All") {
-                            if allSelected {
-                                model.selectedSpaceFindingIDs.subtract(
-                                    everyVideoID
-                                )
-                                model.selectedReviewSpaceFindingIDs.subtract(
-                                    everyVideoID
-                                )
-                            } else {
-                                model.selectedSpaceFindingIDs.formUnion(
-                                    everyVideoID
-                                )
-                            }
                         }
-                        Button("Clear Content Selection") {
+                        .disabled(visibleVideoIDs.isEmpty)
+                        Button("Select All") {
+                            model.selectedSpaceFindingIDs.formUnion(allVideoIDs)
+                        }
+                        .disabled(allVideoIDs.isEmpty)
+                        Button("Clear Selection") {
                             model.selectedSpaceFindingIDs.removeAll()
                             model.selectedReviewSpaceFindingIDs.removeAll()
                         }
                         .disabled(model.selectedSpaceFindingIDs.isEmpty)
-                    }
-
-                    HStack {
-                        Label(
-                            "SBS is optional.",
-                            systemImage: "rectangle.split.2x1"
-                        )
-                        .font(.caption)
-                        .foregroundStyle(AppColors.secondaryText)
                     }
                 }
 
@@ -1852,6 +2059,27 @@ struct CompressionSourcePicker: View {
                 }
             }
             .padding(.top, 6)
+        }
+        .onAppear {
+            if expandedFindingIDs.isEmpty {
+                expandedFindingIDs = Set(
+                    roots.filter { !$0.children.isEmpty }.map(\.id)
+                )
+            }
+        }
+        .onChange(of: scanIdentity) { _, _ in
+            expandedFindingIDs = Set(
+                roots.filter { !$0.children.isEmpty }.map(\.id)
+            )
+        }
+        .onChange(of: viewMode) { _, mode in
+            if mode == .largestVideos {
+                sortOption = .size
+                ascending = false
+            }
+        }
+        .onChange(of: sortOption) { _, option in
+            ascending = option == .name
         }
     }
 }
@@ -1991,7 +2219,7 @@ struct PreparedQueueView: View {
     }
 
     var body: some View {
-        GroupBox("Step 4 — Review and proceed") {
+        GroupBox("Ready to Encode") {
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
                     Label(session.summary, systemImage: "checkmark.circle.fill")
@@ -2053,7 +2281,7 @@ struct CompressView: View {
             VStack(alignment: .leading, spacing: 22) {
                 SectionHeading(
                     title: "Reclaim Space",
-                    subtitle: "Work from top to bottom."
+                    subtitle: "Choose videos and prepare a queue."
                 )
                 CompressionSourcePicker(model: model)
 
@@ -2177,7 +2405,7 @@ struct CompressView: View {
                     }
                     .padding(.top, 6)
                 } label: {
-                    Label("Step 3 — Choose options", systemImage: "3.circle.fill")
+                    Text("Options")
                         .font(.headline)
                 }
 
@@ -2209,7 +2437,7 @@ struct CompressView: View {
                 }
             }
             .padding(28)
-            .frame(maxWidth: 880, alignment: .leading)
+            .frame(maxWidth: 1100, alignment: .leading)
         }
         .alert("Permanently delete verified sources?", isPresented: $confirmDeletion) {
             Button("Cancel", role: .cancel) {}

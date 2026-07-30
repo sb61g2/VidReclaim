@@ -33,7 +33,9 @@ vidreclaim doctor
 - **Reclaim:** scan, select, analyze, review, and encode.
 - **Combine:** join clips in order.
 - **Activity:** filter, sort, control, and resume queues.
-- **Space Map:** find large folders and add them to a queue.
+
+The Reclaim picker shows disk use, folder hierarchy, and the largest videos
+across all scanned subfolders.
 
 New outputs are written to the visible `VidReclaim Output` folder under the
 selected root. Sources are kept by default.
