@@ -578,6 +578,77 @@ class QueueTests(unittest.TestCase):
             self.assertTrue(items[0]["selected"])
             self.assertFalse(items[1]["selected"])
 
+    def test_unselected_queue_thresholds_preserve_manual_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "session.json"
+            settings = self.settings(root)
+            settings["select_none"] = True
+            create_session(path, root=root, settings=settings)
+            store = SessionStore(path)
+
+            def add_items(data: dict[str, object]) -> None:
+                data["status"] = "paused"
+                data["items"] = [
+                    {
+                        "id": "eligible", "order": 0, "status": "ready",
+                        "selected": False,
+                        "source_bytes": 1_000_000_000,
+                        "projected_bytes": 500_000_000,
+                        "projected_savings_pct": 50,
+                    },
+                    {
+                        "id": "included", "order": 1, "status": "ready",
+                        "selected": True,
+                        "source_bytes": 1_000_000_000,
+                        "projected_bytes": 500_000_000,
+                        "projected_savings_pct": 50,
+                    },
+                ]
+
+            store.mutate(add_items)
+            control_session(
+                path,
+                action="threshold",
+                min_savings_pct=30,
+                min_reclaim_mb=100,
+            )
+            items = store.read()["items"]
+            self.assertFalse(items[0]["selected"])
+            self.assertTrue(items[1]["selected"])
+
+    def test_unselected_plan_waits_for_queue_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "session.json"
+            settings = self.settings(root)
+            settings["plan_only"] = True
+            settings["select_none"] = True
+            create_session(path, root=root, settings=settings)
+            store = SessionStore(path)
+
+            def add_item(data: dict[str, object]) -> None:
+                data["status"] = "paused"
+                data["items"] = [{
+                    "id": "eligible",
+                    "order": 0,
+                    "status": "ready",
+                    "selected": False,
+                    "message": "Ready",
+                    "plan": {"status": "encode"},
+                }]
+
+            store.mutate(add_item)
+            result = run_session(path, start_encoding=False)
+            session = store.read()
+            self.assertEqual(0, result)
+            self.assertEqual("paused", session["status"])
+            self.assertEqual("Choose videos", session["phase"])
+            self.assertEqual(
+                "1 video(s) ready to choose",
+                session["summary"],
+            )
+
     def test_starting_a_plan_reactivates_cancelled_selected_items(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

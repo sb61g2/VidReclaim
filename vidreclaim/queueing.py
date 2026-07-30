@@ -767,7 +767,11 @@ def _prepare_session(store: SessionStore) -> tuple[list[Plan], list[dict[str, An
                 store,
                 item_id,
                 status=item_status,
-                selected=item_status == "ready" and meets_threshold,
+                selected=(
+                    item_status == "ready"
+                    and meets_threshold
+                    and not settings.get("select_none", False)
+                ),
                 progress=0.0,
                 message=(
                     plan.reason if meets_threshold or item_status != "ready"
@@ -1046,19 +1050,32 @@ def run_session(
     settings = session["settings"]
     if settings.get("plan_only", False) and not start_encoding:
         def planned(data: dict[str, Any]) -> None:
+            candidate_count = sum(
+                item["status"] == "ready"
+                and bool(item.get("plan"))
+                and item.get("message") != "Excluded"
+                for item in data["items"]
+            )
             ready_count = sum(
                 item["status"] == "ready" and item.get("selected", True)
                 for item in data["items"]
             )
+            choose_items = bool(data["settings"].get("select_none", False))
             data.update({
-                "status": "paused" if ready_count else "complete",
+                "status": "paused" if candidate_count else "complete",
                 "phase": (
-                    "Ready"
+                    "Choose videos"
+                    if choose_items and candidate_count
+                    else "Ready"
                     if ready_count
                     else "No files met the encode thresholds"
                 ),
                 "worker_pid": None,
-                "summary": f"{ready_count} item(s) ready to encode",
+                "summary": (
+                    f"{candidate_count} video(s) ready to choose"
+                    if choose_items
+                    else f"{ready_count} item(s) ready to encode"
+                ),
             })
 
         store.mutate(planned)
@@ -1644,7 +1661,11 @@ def control_session(
                     float(item.get("projected_savings_pct") or 0) >= required_pct
                     and source_bytes - projected_bytes >= required_bytes
                 )
-                item["selected"] = eligible
+                if data.get("settings", {}).get("select_none", False):
+                    if not eligible:
+                        item["selected"] = False
+                else:
+                    item["selected"] = eligible
                 item["message"] = (
                     (item.get("plan") or {}).get("reason", "Ready")
                     if eligible else "Excluded"

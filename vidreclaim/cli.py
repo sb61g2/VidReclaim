@@ -254,6 +254,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="prepare the persistent queue but wait for queue-resume to encode",
     )
+    queue_start.add_argument(
+        "--select-none",
+        action="store_true",
+        help="prepare eligible items without selecting them",
+    )
     queue_start.set_defaults(handler=command_queue_start)
 
     queue_resume = subparsers.add_parser(
@@ -460,6 +465,7 @@ def _queue_settings(args: argparse.Namespace, root: Path) -> dict[str, Any]:
         "replace": args.replace,
         "delete_source_as_you_go": args.delete_source_as_you_go,
         "plan_only": args.plan_only,
+        "select_none": args.select_none,
         "output_dir": str(output_root),
         "include_paths": [
             str(path.expanduser().resolve()) for path in args.include_path

@@ -12,20 +12,13 @@ private enum AppColors {
 
 enum SidebarSection {
     case workspace
-    case activity
+    case queue
+    case status
 }
 
 enum WorkspaceOperation: String, CaseIterable, Identifiable {
-    case reclaim = "Reclaim Space"
-    case combine = "Combine Clips"
-
-    var id: String { rawValue }
-}
-
-enum AppDestination: String, CaseIterable, Identifiable {
-    case combine = "Combine"
     case reclaim = "Reclaim"
-    case activity = "Status"
+    case combine = "Combine"
 
     var id: String { rawValue }
 }
@@ -322,7 +315,7 @@ final class AppModel: ObservableObject {
 
     @Published var compressionSource: URL?
     @Published var compressionProfile = "balanced"
-    @Published var compressionEncoder = "x265"
+    @Published var compressionEncoder = "videotoolbox"
     @Published var compressionPreset = "medium"
     @Published var remoteEnabled = false
     @Published var remoteHost = ""
@@ -401,9 +394,7 @@ final class AppModel: ObservableObject {
             forKey: "VidReclaimRemotePort"
         )
         remotePort = savedRemotePort == 0 ? 22 : savedRemotePort
-        remoteEncoder = UserDefaults.standard.string(
-            forKey: "VidReclaimRemoteEncoder"
-        ) ?? "x265"
+        remoteEncoder = "x265"
         if let existing = try? String(contentsOf: logURL, encoding: .utf8) {
             log = String(existing.suffix(120_000))
         }
@@ -422,25 +413,6 @@ final class AppModel: ObservableObject {
             "/usr/local/bin/vidreclaim",
         ].compactMap { $0 }
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
-    }
-
-    var destination: AppDestination {
-        get {
-            if selection == .activity { return .activity }
-            return workspaceOperation == .combine ? .combine : .reclaim
-        }
-        set {
-            switch newValue {
-            case .reclaim:
-                selection = .workspace
-                workspaceOperation = .reclaim
-            case .combine:
-                selection = .workspace
-                workspaceOperation = .combine
-            case .activity:
-                selection = .activity
-            }
-        }
     }
 
     func chooseCompressionSource() {
@@ -757,6 +729,7 @@ final class AppModel: ObservableObject {
             "queue-start", root.path,
             "--session", session.path,
             "--plan-only",
+            "--select-none",
             "--output-dir", output.path,
         ] + spacePaths.flatMap { ["--include-path", $0.path] }
             + analysisArguments()
@@ -769,11 +742,11 @@ final class AppModel: ObservableObject {
         case .delete:
             arguments += ["--delete-source-as-you-go", "--yes"]
         }
-        selection = .activity
+        selection = .queue
         run(
             arguments: arguments,
             title: "Preparing queue",
-            section: .activity
+            section: .queue
         )
     }
 
@@ -812,7 +785,7 @@ final class AppModel: ObservableObject {
         run(
             arguments: ["queue-resume", session.path],
             title: "Resuming \(queueSession?.name ?? "queue")",
-            section: .workspace
+            section: .status
         )
     }
 
@@ -898,7 +871,7 @@ final class AppModel: ObservableObject {
         currentSessionURL = url
         UserDefaults.standard.set(url.path, forKey: "VidReclaimCurrentSession")
         selectedQueueItemIDs.removeAll()
-        selection = .activity
+        selection = .queue
         loadQueueSession()
     }
 
@@ -944,7 +917,8 @@ final class AppModel: ObservableObject {
             Set(session.items.map(\.id))
         )
         let shouldPublishQueueProgress = runningQueue
-            || selection == .activity
+            || selection == .queue
+            || selection == .status
             || (
                 selection == .workspace
                 && workspaceOperation == .reclaim
@@ -1308,7 +1282,7 @@ final class AppModel: ObservableObject {
             lastExitSuccessful = false
             phase = "Engine not found"
             appendLog("VidReclaim's installed engine could not be found. Reinstall the package.\n")
-            selection = .activity
+            selection = .status
             return
         }
 
@@ -1408,7 +1382,7 @@ final class AppModel: ObservableObject {
             phase = "Could not start"
             lastExitSuccessful = false
             appendLog("Could not launch the engine: \(error.localizedDescription)\n")
-            selection = .activity
+            selection = .status
         }
     }
 
@@ -1665,7 +1639,8 @@ struct AnchoredListHeader<Content: View>: View {
         }
         .font(.caption.bold())
         .foregroundStyle(AppColors.secondaryText)
-        .padding(.horizontal, 8)
+        .padding(.leading, 8)
+        .padding(.trailing, 24)
         .frame(height: 32)
         .background(Color(nsColor: .controlBackgroundColor))
         .overlay(alignment: .bottom) {
@@ -2535,6 +2510,14 @@ struct ReclaimLocationPicker: View {
                                 .buttonStyle(.plain)
                                 .frame(width: 22)
                             }
+                            .listRowInsets(
+                                EdgeInsets(
+                                    top: 0,
+                                    leading: 8,
+                                    bottom: 0,
+                                    trailing: 24
+                                )
+                            )
                         }
                     }
                     .frame(minHeight: 120, maxHeight: 220)
@@ -2695,6 +2678,11 @@ struct CompressView: View {
             .padding(28)
             .frame(maxWidth: 1100, alignment: .leading)
         }
+        .onChange(of: model.remoteEnabled) { _, enabled in
+            if enabled {
+                model.remoteEncoder = "x265"
+            }
+        }
         .alert("Permanently delete verified sources?", isPresented: $confirmDeletion) {
             Button("Cancel", role: .cancel) {}
             Button("Prepare", role: .destructive) {
@@ -2845,6 +2833,14 @@ struct StitchView: View {
                             }
                             .frame(width: 72, alignment: .trailing)
                         }
+                        .listRowInsets(
+                            EdgeInsets(
+                                top: 0,
+                                leading: 8,
+                                bottom: 0,
+                                trailing: 24
+                            )
+                        )
                     }
                 }
                 .overlay {
@@ -3522,8 +3518,14 @@ struct QueueFolderSummary: Identifiable {
     }
 }
 
+enum QueuePage {
+    case queue
+    case status
+}
+
 struct ActivityView: View {
     @ObservedObject var model: AppModel
+    let page: QueuePage
     @State private var showLog = false
     @State private var whatIfItem: QueueItem?
     @State private var searchText = ""
@@ -3531,7 +3533,7 @@ struct ActivityView: View {
     @State private var sortAscending = false
     @State private var folderSortOption: QueueFolderSortOption = .name
     @State private var folderSortAscending = true
-    @State private var statusFilter: QueueStatusFilter = .included
+    @State private var statusFilter: QueueStatusFilter = .all
     @State private var showProcessed = false
     @State private var selectedFolder = ""
     @State private var expandedFolders: Set<String> = [""]
@@ -3602,11 +3604,6 @@ struct ActivityView: View {
 
     private func isEffectivelyIncluded(_ item: QueueItem) -> Bool {
         item.isIncluded
-            || (
-                item.status == "ready"
-                && item.message == "Excluded"
-                && meetsThreshold(item)
-            )
     }
 
     private var thresholdItems: [QueueItem] {
@@ -3735,6 +3732,16 @@ struct ActivityView: View {
 
     private var filteredItems: [QueueItem] {
         let filtered = orderedItems.filter { item in
+            if page == .status {
+                guard item.isIncluded || item.isProcessed else { return false }
+                if !searchText.isEmpty
+                    && !item.name.localizedCaseInsensitiveContains(searchText)
+                    && !item.path.localizedCaseInsensitiveContains(searchText)
+                    && !(item.relativePath ?? "").localizedCaseInsensitiveContains(searchText) {
+                    return false
+                }
+                return true
+            }
             if !meetsThreshold(item) { return false }
             if !showProcessed
                 && statusFilter != .processed
@@ -3933,13 +3940,15 @@ struct ActivityView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
-                Text("Queue").font(.largeTitle.bold())
+                Text(page == .queue ? "Queue" : "Status")
+                    .font(.largeTitle.bold())
                 Spacer()
                 Button("Open Saved Queue…") { model.openQueueSession() }
             }
 
             if let session = model.queueSession {
-                GroupBox {
+                if page == .status {
+                    GroupBox {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
@@ -4078,10 +4087,12 @@ struct ActivityView: View {
                             }
                         }
                     }
-                    .padding(.top, 4)
+                        .padding(.top, 4)
+                    }
                 }
 
-                HStack(spacing: 10) {
+                if page == .status {
+                    HStack(spacing: 10) {
                     QueueSummaryCard(
                         title: "Included",
                         value: "\(includedItems.count.formatted()) videos",
@@ -4108,9 +4119,33 @@ struct ActivityView: View {
                         detail: "~\(model.durationLabel(projectedEncodeTime)) selected",
                         systemImage: "clock"
                     )
+                    }
                 }
 
-                GroupBox("Thresholds") {
+                if page == .queue {
+                    let scanProgress = session.scanFraction ?? (
+                        ["new", "scanning", "analyzing"].contains(
+                            session.status
+                        ) ? 0.0 : 1.0
+                    )
+                    if ["new", "scanning", "analyzing", "reviewing"]
+                        .contains(session.status) && scanProgress < 1 {
+                        HStack(spacing: 10) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text(session.displayPhase)
+                                .foregroundStyle(AppColors.secondaryText)
+                            Spacer()
+                            Text(
+                                "\(scanProgress * 100, specifier: "%.0f")%"
+                            )
+                            .monospacedDigit()
+                        }
+                        ProgressView(value: scanProgress)
+                            .progressViewStyle(.linear)
+                    }
+
+                    GroupBox("Thresholds") {
                     Grid(
                         alignment: .leading,
                         horizontalSpacing: 12,
@@ -4157,7 +4192,8 @@ struct ActivityView: View {
                             .frame(width: 64, alignment: .trailing)
                         }
                     }
-                    .padding(.top, 4)
+                        .padding(.top, 4)
+                    }
                 }
 
                 HStack(spacing: 8) {
@@ -4168,20 +4204,23 @@ struct ActivityView: View {
                     TextField("Search name or path", text: $searchText)
                         .textFieldStyle(.roundedBorder)
                         .frame(minWidth: 180, maxWidth: 260)
-                    Picker("Status", selection: $statusFilter) {
-                        ForEach(QueueStatusFilter.allCases) {
-                            Text($0.rawValue).tag($0)
+                    if page == .queue {
+                        Picker("Status", selection: $statusFilter) {
+                            ForEach(QueueStatusFilter.allCases) {
+                                Text($0.rawValue).tag($0)
+                            }
                         }
+                        .labelsHidden()
+                        .frame(width: 150)
+                        Toggle("Show processed", isOn: $showProcessed)
+                            .toggleStyle(.checkbox)
                     }
-                    .labelsHidden()
-                    .frame(width: 150)
-                    Toggle("Show processed", isOn: $showProcessed)
-                        .toggleStyle(.checkbox)
                     Spacer()
                 }
 
                 HStack(spacing: 8) {
-                    Button("Select All") {
+                    if page == .queue {
+                        Button("Select All") {
                         model.queueControl(
                             "include",
                             itemIDs: filteredItems
@@ -4234,11 +4273,16 @@ struct ActivityView: View {
                             )
                         }
                         .disabled(selectedItems.isEmpty)
-                    } label: {
-                        Label("Selection", systemImage: "checkmark.square")
+                        } label: {
+                            Label(
+                                "Selection",
+                                systemImage: "checkmark.square"
+                            )
+                        }
                     }
 
-                    Button {
+                    if page == .status {
+                        Button {
                         model.queueControl(
                             "pause", itemIDs: selectedItems.map(\.id)
                         )
@@ -4271,19 +4315,26 @@ struct ActivityView: View {
                     } label: {
                         Label("Skip", systemImage: "forward.end")
                     }
-                    .disabled(!selectedItems.contains { !$0.isTerminal })
-                    Button(role: .destructive) {
-                        model.queueControl(
-                            "cancel", itemIDs: selectedItems.map(\.id)
+                        .disabled(
+                            !selectedItems.contains { !$0.isTerminal }
                         )
-                    } label: {
-                        Label("Cancel", systemImage: "xmark")
+                        Button(role: .destructive) {
+                            model.queueControl(
+                                "cancel",
+                                itemIDs: selectedItems.map(\.id)
+                            )
+                        } label: {
+                            Label("Cancel", systemImage: "xmark")
+                        }
+                        .disabled(
+                            !selectedItems.contains { !$0.isTerminal }
+                        )
                     }
-                    .disabled(!selectedItems.contains { !$0.isTerminal })
 
                     if let item = selectedItem {
                         Divider().frame(height: 18)
-                        Button {
+                        if page == .queue {
+                            Button {
                             model.moveQueueItem(item.id, by: -1)
                         } label: {
                             Image(systemName: "arrow.up")
@@ -4311,8 +4362,9 @@ struct ActivityView: View {
                                 systemImage: "chart.bar.xaxis"
                             )
                         }
-                        .disabled((item.whatIf ?? []).isEmpty)
-                        if let output = item.output {
+                            .disabled((item.whatIf ?? []).isEmpty)
+                        }
+                        if page == .status, let output = item.output {
                             Button {
                                 model.revealQueueOutput(output)
                             } label: {
@@ -4321,48 +4373,90 @@ struct ActivityView: View {
                         }
                     }
                     Spacer()
-                    Button {
-                        model.queueControl("clear-completed")
-                        model.selectedQueueItemIDs.removeAll()
-                    } label: {
-                        Label("Clear Completed", systemImage: "trash")
-                    }
-                    .disabled(
-                        completedItems.isEmpty
-                            || model.isRunning
-                            || session.status == "running"
-                    )
-                    Menu {
-                        Button("Clear Cancelled") {
-                            model.queueControl("clear-cancelled")
-                            model.selectedQueueItemIDs.removeAll()
+                    if page == .queue {
+                        VStack(alignment: .trailing, spacing: 2) {
+                            Button(
+                                "Start \(includedItems.count.formatted())"
+                            ) {
+                                model.resumeQueue()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(
+                                includedItems.isEmpty
+                                    || model.isRunning
+                                    || (session.scanFraction ?? 0) < 1
+                            )
+                            Text(
+                                "\(model.bytesLabel(projectedSavings)) saved · "
+                                    + "~\(model.durationLabel(projectedEncodeTime))"
+                            )
+                            .font(.caption2)
+                            .foregroundStyle(AppColors.secondaryText)
                         }
-                        .disabled(cancelledItems.isEmpty)
-                        Button("Clear Finished") {
-                            model.queueControl("clear-finished")
-                            model.selectedQueueItemIDs.removeAll()
+                    } else {
+                        HStack(spacing: 0) {
+                            Button {
+                                model.queueControl("clear-completed")
+                                model.selectedQueueItemIDs.removeAll()
+                            } label: {
+                                Label(
+                                    "Clear Completed",
+                                    systemImage: "trash"
+                                )
+                                .frame(minWidth: 154, minHeight: 28)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(
+                                completedItems.isEmpty
+                                    || model.isRunning
+                                    || session.status == "running"
+                            )
+                            Divider().frame(height: 22)
+                            Menu {
+                                Button("Clear Cancelled") {
+                                    model.queueControl("clear-cancelled")
+                                    model.selectedQueueItemIDs.removeAll()
+                                }
+                                .disabled(cancelledItems.isEmpty)
+                                Button("Clear Finished") {
+                                    model.queueControl("clear-finished")
+                                    model.selectedQueueItemIDs.removeAll()
+                                }
+                                .disabled(finishedItems.isEmpty)
+                                Divider()
+                                Button("Clear All", role: .destructive) {
+                                    model.queueControl("clear-all")
+                                    model.selectedQueueItemIDs.removeAll()
+                                }
+                                .disabled(
+                                    model.isRunning
+                                        || session.status == "running"
+                                )
+                            } label: {
+                                Image(systemName: "chevron.down")
+                                    .frame(width: 30, height: 28)
+                            }
+                            .menuIndicator(.hidden)
+                            .menuStyle(.borderlessButton)
+                            .fixedSize()
                         }
-                        .disabled(finishedItems.isEmpty)
-                        Divider()
-                        Button("Clear All", role: .destructive) {
-                            model.queueControl("clear-all")
-                            model.selectedQueueItemIDs.removeAll()
-                        }
-                        .disabled(
-                            model.isRunning || session.status == "running"
+                        .background(
+                            Color(nsColor: .controlColor),
+                            in: RoundedRectangle(cornerRadius: 7)
                         )
-                    } label: {
-                        Image(systemName: "chevron.down")
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 7)
+                                .stroke(.separator)
+                        )
                     }
-                    .menuStyle(.borderlessButton)
-                    .fixedSize()
                 }
 
                 HSplitView {
-                    VStack(spacing: 0) {
+                    if page == .queue {
+                        VStack(spacing: 0) {
                         AnchoredListHeader {
-                            HStack(spacing: 4) {
-                                Color.clear.frame(width: 16)
+                            HStack(spacing: 7) {
+                                Color.clear.frame(width: 41)
                                 Button {
                                     toggleInclusion(for: thresholdItems)
                                 } label: {
@@ -4373,6 +4467,7 @@ struct ActivityView: View {
                                     )
                                 }
                                 .buttonStyle(.plain)
+                                .frame(width: 20)
                                 .disabled(
                                     !thresholdItems.contains(
                                         where: \.canChangeInclusion
@@ -4380,7 +4475,7 @@ struct ActivityView: View {
                                 )
                                 .help("Select or deselect all folders")
                             }
-                            .frame(width: 42)
+                            .frame(width: 68)
                             SortableListHeader(
                                 title: "Name",
                                 key: QueueFolderSortOption.name,
@@ -4512,34 +4607,46 @@ struct ActivityView: View {
                                         ? Color.accentColor.opacity(0.16)
                                         : Color.clear
                                 )
-                            }
-                        }
-                    }
-                    .frame(
-                        minWidth: 290,
-                        idealWidth: 350,
-                        maxWidth: 450
-                    )
-
-                    VStack(spacing: 0) {
-                        AnchoredListHeader {
-                            Button {
-                                toggleInclusion(for: filteredItems)
-                            } label: {
-                                Image(
-                                    systemName: inclusionIcon(
-                                        for: filteredItems
+                                .listRowInsets(
+                                    EdgeInsets(
+                                        top: 0,
+                                        leading: 8,
+                                        bottom: 0,
+                                        trailing: 24
                                     )
                                 )
                             }
-                            .buttonStyle(.plain)
-                            .frame(width: 24)
-                            .disabled(
-                                !filteredItems.contains(
-                                    where: \.canChangeInclusion
+                        }
+                    }
+                        .frame(
+                            minWidth: 290,
+                            idealWidth: 350,
+                            maxWidth: 450
+                        )
+                    }
+
+                    VStack(spacing: 0) {
+                        AnchoredListHeader {
+                            Color.clear.frame(width: 8)
+                            if page == .queue {
+                                Button {
+                                    toggleInclusion(for: filteredItems)
+                                } label: {
+                                    Image(
+                                        systemName: inclusionIcon(
+                                            for: filteredItems
+                                        )
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                                .frame(width: 24)
+                                .disabled(
+                                    !filteredItems.contains(
+                                        where: \.canChangeInclusion
+                                    )
                                 )
-                            )
-                            .help("Select or deselect visible videos")
+                                .help("Select or deselect visible videos")
+                            }
                             SortableListHeader(
                                 title: "#",
                                 key: QueueSortOption.queue,
@@ -4613,22 +4720,24 @@ struct ActivityView: View {
                         List(selection: $model.selectedQueueItemIDs) {
                             ForEach(filteredItems) { item in
                                 HStack(spacing: 8) {
-                                    Button {
-                                        model.queueControl(
-                                            item.isIncluded
-                                                ? "exclude" : "include",
-                                            itemID: item.id
-                                        )
-                                    } label: {
-                                        Image(
-                                            systemName: item.isIncluded
-                                                ? "checkmark.square.fill"
-                                                : "square"
-                                        )
+                                    if page == .queue {
+                                        Button {
+                                            model.queueControl(
+                                                item.isIncluded
+                                                    ? "exclude" : "include",
+                                                itemID: item.id
+                                            )
+                                        } label: {
+                                            Image(
+                                                systemName: item.isIncluded
+                                                    ? "checkmark.square.fill"
+                                                    : "square"
+                                            )
+                                        }
+                                        .buttonStyle(.plain)
+                                        .frame(width: 24)
+                                        .disabled(!item.canChangeInclusion)
                                     }
-                                    .buttonStyle(.plain)
-                                    .frame(width: 24)
-                                    .disabled(!item.canChangeInclusion)
                                     Text((item.order + 1).formatted())
                                         .font(.caption.monospacedDigit())
                                         .foregroundStyle(
@@ -4772,6 +4881,14 @@ struct ActivityView: View {
                                 }
                                 .padding(.vertical, 4)
                                 .tag(item.id)
+                                .listRowInsets(
+                                    EdgeInsets(
+                                        top: 0,
+                                        leading: 8,
+                                        bottom: 0,
+                                        trailing: 24
+                                    )
+                                )
                             }
                         }
                         .overlay {
@@ -4784,9 +4901,9 @@ struct ActivityView: View {
                                     systemImage:
                                         "line.3.horizontal.decrease.circle",
                                     description: Text(
-                                        showProcessed
-                                            ? "Change the filters."
-                                            : "Processed items are hidden."
+                                        orderedItems.isEmpty
+                                            ? "Prepare videos in Reclaim."
+                                            : "Change the filters."
                                     )
                                 )
                             }
@@ -4803,27 +4920,39 @@ struct ActivityView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
 
-            DisclosureGroup("Worker log", isExpanded: $showLog) {
-                VStack(spacing: 8) {
-                    HStack {
-                        Spacer()
-                        Button("Reveal") { model.revealLog() }
-                        Button("Copy") { model.copyLog() }
-                        Button("Clear") { model.clearLog() }
-                    }
-                    ScrollView {
-                        Text(model.log.isEmpty ? "Activity will appear here." : model.log)
+            if page == .status {
+                DisclosureGroup("Worker log", isExpanded: $showLog) {
+                    VStack(spacing: 8) {
+                        HStack {
+                            Spacer()
+                            Button("Reveal") { model.revealLog() }
+                            Button("Copy") { model.copyLog() }
+                            Button("Clear") { model.clearLog() }
+                        }
+                        ScrollView {
+                            Text(
+                                model.log.isEmpty
+                                    ? "Activity will appear here."
+                                    : model.log
+                            )
                             .font(.system(.caption, design: .monospaced))
                             .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                            .frame(
+                                maxWidth: .infinity,
+                                alignment: .topLeading
+                            )
                             .padding(10)
+                        }
+                        .frame(height: 130)
+                        .background(
+                            Color(nsColor: .textBackgroundColor),
+                            in: RoundedRectangle(cornerRadius: 8)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(.separator)
+                        )
                     }
-                    .frame(height: 130)
-                    .background(
-                        Color(nsColor: .textBackgroundColor),
-                        in: RoundedRectangle(cornerRadius: 8)
-                    )
-                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(.separator))
                 }
             }
         }
@@ -4852,21 +4981,21 @@ struct ContentView: View {
     @ObservedObject var model: AppModel
 
     @ViewBuilder
-    private func destinationButton(
+    private func sectionButton(
         _ title: String,
-        destination: AppDestination,
+        section: SidebarSection,
         width: CGFloat
     ) -> some View {
-        let selected = model.destination == destination
+        let selected = model.selection == section
         if selected {
             Button(title) {
-                model.destination = destination
+                model.selection = section
             }
             .buttonStyle(.borderedProminent)
             .frame(width: width)
         } else {
             Button(title) {
-                model.destination = destination
+                model.selection = section
             }
             .buttonStyle(.bordered)
             .frame(width: width)
@@ -4876,20 +5005,25 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                destinationButton(
-                    "Combine",
-                    destination: .combine,
-                    width: 88
+                Picker("Tool", selection: $model.workspaceOperation) {
+                    ForEach(WorkspaceOperation.allCases) {
+                        Text($0.rawValue).tag($0)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 126)
+                .onChange(of: model.workspaceOperation) { _, _ in
+                    model.selection = .workspace
+                }
+                sectionButton(
+                    "Queue",
+                    section: .queue,
+                    width: 74
                 )
-                destinationButton(
-                    "Reclaim",
-                    destination: .reclaim,
-                    width: 88
-                )
-                Spacer().frame(width: 18)
-                destinationButton(
+                sectionButton(
                     "Status",
-                    destination: .activity,
+                    section: .status,
                     width: 78
                 )
                 Spacer()
@@ -4903,10 +5037,14 @@ struct ContentView: View {
                 Group {
                     switch model.selection {
                     case .workspace: WorkspaceView(model: model)
-                    case .activity: ActivityView(model: model)
+                    case .queue:
+                        ActivityView(model: model, page: .queue)
+                    case .status:
+                        ActivityView(model: model, page: .status)
                     }
                 }
-                let hasInlineProgress = model.selection == .activity
+                let hasInlineProgress = model.selection == .queue
+                    || model.selection == .status
                     || (
                         model.selection == .workspace
                         && model.workspaceOperation == .combine
@@ -4951,7 +5089,7 @@ struct VidReclaimApp: App {
         .commands {
             CommandGroup(after: .appInfo) {
                 Button("Show Status") {
-                    model.selection = .activity
+                    model.selection = .status
                 }
                 .keyboardShortcut("l", modifiers: [.command, .shift])
             }
