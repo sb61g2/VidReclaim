@@ -18,6 +18,7 @@ from .model import MediaInfo, Plan, PROFILES, Source
 from .planner import analyze, analyze_fast
 from .probe import probe_file
 from .review import build_review_assets, review_in_browser
+from .remote import config_from_settings
 from .runner import (
     EncodeControl,
     archive_and_replace_file,
@@ -1092,7 +1093,10 @@ def run_session(
             requested_action=None,
             progress=0.0,
             encode_started_at_unix=time.time(),
-            message="Encoding",
+            message=(
+                f"Sending to {settings.get('remote_host')}"
+                if settings.get("remote_host") else "Encoding"
+            ),
         )
 
         def requested_action() -> str:
@@ -1139,6 +1143,14 @@ def run_session(
 
             store.mutate(update_overall)
 
+        def update_stage(message: str) -> None:
+            _update_item(
+                store,
+                item_id,
+                message=message,
+                encode_elapsed_seconds=elapsed_now(),
+            )
+
         try:
             if settings.get("delete_source_as_you_go") and plan.candidate:
                 output_root.mkdir(parents=True, exist_ok=True)
@@ -1160,6 +1172,11 @@ def run_session(
                 min_savings_pct=settings.get("min_savings_pct"),
                 progress=update_progress,
                 control=requested_action,
+                remote=(
+                    config_from_settings(settings)
+                    if plan.media.source.kind == "file" else None
+                ),
+                stage=update_stage,
             )
             result_data: dict[str, Any] = {
                 "status": "complete",

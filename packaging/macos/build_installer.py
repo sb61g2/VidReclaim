@@ -64,7 +64,7 @@ def build_app_icon(source: Path, destination: Path, build_root: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--version", default="0.4.6")
+    parser.add_argument("--version", default="0.5.0")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--output-dir", type=Path, default=ROOT / "outputs")
     parser.add_argument(
@@ -95,6 +95,7 @@ def main() -> int:
         "--workpath", str(pywork),
         "--specpath", str(spec),
         "--paths", str(ROOT),
+        "--add-data", f"{ROOT / 'vidreclaim' / 'windows_worker.ps1'}:vidreclaim",
         "--add-binary", "/opt/homebrew/bin/ffmpeg:tools",
         "--add-binary", "/opt/homebrew/bin/ffprobe:tools",
         "--add-binary", "/opt/homebrew/bin/HandBrakeCLI:tools",

@@ -16,11 +16,18 @@ from .dvd import handbrake_input_args
 from .model import Plan, Profile
 from .planner import Encoder, ffmpeg_video_args
 from .probe import probe_output
+from .remote import (
+    RemoteConfig,
+    RemoteEncodeControl,
+    remote_cleanup,
+    remote_encode,
+)
 from .util import CommandError, run
 
 
 ProgressCallback = Callable[[float, float | None], None]
 ControlCallback = Callable[[], str]
+StageCallback = Callable[[str], None]
 
 
 class EncodeControl(CommandError):
@@ -291,6 +298,8 @@ def encode(
     min_savings_pct: float | None = None,
     progress: ProgressCallback | None = None,
     control: ControlCallback | None = None,
+    remote: RemoteConfig | None = None,
+    stage: StageCallback | None = None,
 ) -> EncodeResult:
     if plan.status != "encode" or plan.candidate is None:
         raise ValueError("Only an encode plan can be run")
@@ -302,8 +311,20 @@ def encode(
     if temporary.exists():
         raise CommandError(f"Stale partial output exists: {temporary}")
 
+    remote_job: str | None = None
     try:
-        if plan.media.source.kind == "dvd":
+        if remote is not None:
+            remote_job = remote_encode(
+                plan,
+                temporary,
+                config=remote,
+                profile=profile,
+                preset=preset,
+                progress=progress,
+                control=control,
+                stage=stage,
+            )
+        elif plan.media.source.kind == "dvd":
             _encode_dvd(
                 plan, temporary, preset=preset, profile=profile, nice=nice,
                 progress=progress, control=control,
@@ -325,6 +346,11 @@ def encode(
                 f"actual savings {savings:.1f}% did not meet {required:.1f}% threshold"
             )
         temporary.replace(destination)
+        if remote is not None and remote_job is not None:
+            remote_cleanup(remote, remote_job)
+    except RemoteEncodeControl as error:
+        temporary.unlink(missing_ok=True)
+        raise EncodeControl(error.action) from error
     except EncodeControl:
         temporary.unlink(missing_ok=True)
         raise

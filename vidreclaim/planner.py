@@ -12,7 +12,7 @@ from .model import Candidate, MediaInfo, Plan, Profile
 from .util import CommandError, run
 
 
-Encoder = Literal["x265", "videotoolbox"]
+Encoder = Literal["x265", "videotoolbox", "nvenc"]
 
 
 def base_crf(height: int) -> int:
@@ -71,7 +71,7 @@ def estimated_encode_fps(
 ) -> float:
     """Conservative M4-oriented estimate, replaced by observed speed at runtime."""
     megapixels = max(0.25, width * height / 1_000_000)
-    if encoder == "videotoolbox":
+    if encoder in {"videotoolbox", "nvenc"}:
         return 310 / (megapixels ** 0.78)
     preset_factor = {
         "ultrafast": 3.2,
@@ -229,6 +229,22 @@ def _encoder_args(
             "-prio_speed", "0",
             "-power_efficient", "1",
             "-spatial_aq", "1",
+            "-tag:v", "hvc1",
+        ]
+    if encoder == "nvenc":
+        return [
+            "-c:v", "hevc_nvenc",
+            "-preset", "p7",
+            "-tune", "hq",
+            "-profile:v", "main10" if ten_bit else "main",
+            "-pix_fmt", "p010le" if ten_bit else "yuv420p",
+            "-rc", "vbr",
+            "-cq", str(crf),
+            "-b:v", "0",
+            "-multipass", "fullres",
+            "-rc-lookahead", "32",
+            "-spatial_aq", "1",
+            "-temporal_aq", "1",
             "-tag:v", "hvc1",
         ]
     return [

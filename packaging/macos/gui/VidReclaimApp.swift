@@ -285,6 +285,11 @@ final class AppModel: ObservableObject {
     @Published var compressionProfile = "balanced"
     @Published var compressionEncoder = "x265"
     @Published var compressionPreset = "medium"
+    @Published var remoteEnabled = false
+    @Published var remoteHost = ""
+    @Published var remoteUser = ""
+    @Published var remotePort = 22
+    @Published var remoteEncoder = "x265"
     @Published var minimumSavings = 20.0
     @Published var minimumReclaimMB = 100.0
     @Published var sampleCount = 3
@@ -344,6 +349,22 @@ final class AppModel: ObservableObject {
         sessionsURL = support
             .appendingPathComponent("VidReclaim", isDirectory: true)
             .appendingPathComponent("Sessions", isDirectory: true)
+        remoteEnabled = UserDefaults.standard.bool(
+            forKey: "VidReclaimRemoteEnabled"
+        )
+        remoteHost = UserDefaults.standard.string(
+            forKey: "VidReclaimRemoteHost"
+        ) ?? ""
+        remoteUser = UserDefaults.standard.string(
+            forKey: "VidReclaimRemoteUser"
+        ) ?? ""
+        let savedRemotePort = UserDefaults.standard.integer(
+            forKey: "VidReclaimRemotePort"
+        )
+        remotePort = savedRemotePort == 0 ? 22 : savedRemotePort
+        remoteEncoder = UserDefaults.standard.string(
+            forKey: "VidReclaimRemoteEncoder"
+        ) ?? "x265"
         if let existing = try? String(contentsOf: logURL, encoding: .utf8) {
             log = String(existing.suffix(120_000))
         }
@@ -602,9 +623,12 @@ final class AppModel: ObservableObject {
     }
 
     private func analysisArguments() -> [String] {
+        let planningEncoder = (
+            remoteEnabled && remoteEncoder == "nvenc"
+        ) ? "videotoolbox" : compressionEncoder
         var arguments = [
             "--profile", compressionProfile,
-            "--encoder", compressionEncoder,
+            "--encoder", planningEncoder,
             "--preset", compressionPreset,
             "--min-savings", String(format: "%.1f", minimumSavings),
             "--min-reclaim-mb", String(format: "%.0f", minimumReclaimMB),
@@ -617,7 +641,51 @@ final class AppModel: ObservableObject {
         if thoroughAnalysis {
             arguments.append("--thorough-analysis")
         }
+        if remoteEnabled {
+            UserDefaults.standard.set(
+                true, forKey: "VidReclaimRemoteEnabled"
+            )
+            UserDefaults.standard.set(
+                remoteHost, forKey: "VidReclaimRemoteHost"
+            )
+            UserDefaults.standard.set(
+                remoteUser, forKey: "VidReclaimRemoteUser"
+            )
+            UserDefaults.standard.set(
+                remotePort, forKey: "VidReclaimRemotePort"
+            )
+            UserDefaults.standard.set(
+                remoteEncoder, forKey: "VidReclaimRemoteEncoder"
+            )
+            arguments += [
+                "--remote-host", remoteHost,
+                "--remote-user", remoteUser,
+                "--remote-port", String(remotePort),
+                "--remote-encoder", remoteEncoder,
+            ]
+        } else {
+            UserDefaults.standard.set(
+                false, forKey: "VidReclaimRemoteEnabled"
+            )
+        }
         return arguments
+    }
+
+    func testRemote() {
+        guard !remoteHost.isEmpty, !remoteUser.isEmpty else {
+            phase = "Enter a Windows host and user"
+            return
+        }
+        run(
+            arguments: [
+                "remote-doctor", remoteHost,
+                "--user", remoteUser,
+                "--port", String(remotePort),
+                "--encoder", remoteEncoder,
+            ],
+            title: "Checking \(remoteHost)",
+            section: .workspace
+        )
     }
 
     func resumeQueue() {
@@ -964,7 +1032,9 @@ final class AppModel: ObservableObject {
     }
 
     var canPrepareSelectedVideos: Bool {
-        !selectedSpaceVideoPaths.isEmpty && selectedQueueRoot != nil
+        !selectedSpaceVideoPaths.isEmpty
+            && selectedQueueRoot != nil
+            && (!remoteEnabled || (!remoteHost.isEmpty && !remoteUser.isEmpty))
     }
 
     var queueSelectionIssue: String? {
@@ -1200,6 +1270,12 @@ final class AppModel: ObservableObject {
     }
 
     private func handleLine(_ line: String) {
+        if line.hasPrefix("REMOTE_DOCTOR ") {
+            phase = "Windows PC ready"
+            lastSummary = "\(remoteHost) is ready for \(remoteEncoder == "x265" ? "CPU x265" : "RTX 4090") encoding."
+            eta = "Ready"
+            return
+        }
         let stalePartialPrefix = "Stitch ERROR: Stale partial stitch exists: "
         if line.hasPrefix(stalePartialPrefix) {
             let path = String(line.dropFirst(stalePartialPrefix.count))
@@ -2024,26 +2100,92 @@ struct CompressView: View {
                             .pickerStyle(.segmented)
                         }
                         GridRow {
-                            Text("Encoder")
-                            Picker("Encoder", selection: $model.compressionEncoder) {
-                                Text("Smaller files (x265)").tag("x265")
-                                Text("Faster on M4 (hardware)").tag("videotoolbox")
-                            }
-                            .labelsHidden()
-                            .pickerStyle(.segmented)
-                        }
-                        GridRow {
-                            Color.clear.frame(width: 1, height: 1)
-                            Text(
-                                model.compressionEncoder == "videotoolbox"
-                                ? "Usually finishes about 4–8× sooner than x265 Medium on an M4, while often using 15–35% more space at similar casual-viewing quality."
-                                : "Usually takes about 4–8× longer than the M4 hardware encoder, but often produces files 15–35% smaller at similar casual-viewing quality."
+                            Text("Encode on")
+                            Toggle(
+                                "Windows PC",
+                                isOn: $model.remoteEnabled
                             )
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
+                            .toggleStyle(.switch)
                         }
-                        if model.compressionEncoder == "x265" {
+                        if model.remoteEnabled {
+                            GridRow {
+                                Text("Windows PC")
+                                HStack {
+                                    TextField(
+                                        "Host or IP",
+                                        text: $model.remoteHost
+                                    )
+                                    TextField(
+                                        "User",
+                                        text: $model.remoteUser
+                                    )
+                                    .frame(width: 120)
+                                    TextField(
+                                        "Port",
+                                        value: $model.remotePort,
+                                        format: .number
+                                    )
+                                    .frame(width: 58)
+                                    Button("Test") {
+                                        model.testRemote()
+                                    }
+                                    .disabled(
+                                        model.isRunning
+                                        || model.remoteHost.isEmpty
+                                        || model.remoteUser.isEmpty
+                                    )
+                                }
+                            }
+                            GridRow {
+                                Text("Windows encoder")
+                                Picker(
+                                    "Windows encoder",
+                                    selection: $model.remoteEncoder
+                                ) {
+                                    Text("CPU x265 · smaller").tag("x265")
+                                    Text("RTX 4090 · faster").tag("nvenc")
+                                }
+                                .labelsHidden()
+                                .pickerStyle(.segmented)
+                            }
+                            GridRow {
+                                Color.clear.frame(width: 1, height: 1)
+                                Text(
+                                    model.remoteEncoder == "x265"
+                                    ? "Best storage efficiency. Encodes run on the Ryzen CPU."
+                                    : "Much faster. Files may be larger at similar quality."
+                                )
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            }
+                        } else {
+                            GridRow {
+                                Text("Encoder")
+                                Picker("Encoder", selection: $model.compressionEncoder) {
+                                    Text("Smaller files (x265)").tag("x265")
+                                    Text("Faster on M4 (hardware)").tag("videotoolbox")
+                                }
+                                .labelsHidden()
+                                .pickerStyle(.segmented)
+                            }
+                            GridRow {
+                                Color.clear.frame(width: 1, height: 1)
+                                Text(
+                                    model.compressionEncoder == "videotoolbox"
+                                    ? "Usually 4–8× faster; often 15–35% larger."
+                                    : "Usually 15–35% smaller; often 4–8× slower."
+                                )
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            }
+                        }
+                        if (
+                            !model.remoteEnabled
+                            && model.compressionEncoder == "x265"
+                        ) || (
+                            model.remoteEnabled
+                            && model.remoteEncoder == "x265"
+                        ) {
                             GridRow {
                                 Text("x265 preset")
                                 Picker("x265 preset", selection: $model.compressionPreset) {

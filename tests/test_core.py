@@ -31,6 +31,12 @@ from vidreclaim.queueing import (
     run_session,
 )
 from vidreclaim.review import _render_html, build_review_assets
+from vidreclaim.remote import (
+    RemoteConfig,
+    _job_manifest,
+    config_from_settings,
+    remote_job_id,
+)
 from vidreclaim.runner import EncodeControl, _stream_command, output_path
 from vidreclaim.runner import (
     EncodeResult,
@@ -748,6 +754,59 @@ class QueueTests(unittest.TestCase):
             balanced["M4 hardware"]["projected_bytes"],
             balanced["x265 · Medium"]["projected_bytes"],
         )
+
+
+class RemoteEncodingTests(unittest.TestCase):
+    def test_cpu_encoder_is_the_remote_default(self) -> None:
+        config = config_from_settings({
+            "remote_host": "video-pc",
+            "remote_user": "encoder",
+        })
+        self.assertIsNotNone(config)
+        self.assertEqual("x265", config.encoder)
+
+    def test_job_identity_changes_with_remote_encoder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "movie.mkv"
+            source.write_bytes(b"source")
+            info = media(source, 1920, 1080)
+            plan = Plan(
+                info,
+                "encode",
+                "test",
+                Candidate(1920, 1080, 22, accepted=True),
+            )
+            cpu = remote_job_id(
+                plan, RemoteConfig("video-pc", "encoder", encoder="x265"),
+            )
+            gpu = remote_job_id(
+                plan, RemoteConfig("video-pc", "encoder", encoder="nvenc"),
+            )
+        self.assertNotEqual(cpu, gpu)
+
+    def test_nvenc_manifest_uses_ten_bit_hevc_when_source_is_hdr(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "movie.mkv"
+            source.write_bytes(b"source")
+            info = media(source, 3840, 2160)
+            info.hdr = True
+            info.bit_depth = 10
+            plan = Plan(
+                info,
+                "encode",
+                "test",
+                Candidate(3840, 2160, 24, accepted=True),
+            )
+            manifest = _job_manifest(
+                plan,
+                RemoteConfig("video-pc", "encoder", encoder="nvenc"),
+                PROFILES["balanced"],
+                "medium",
+                "source.mkv",
+            )
+        arguments = manifest["arguments"]
+        self.assertIn("hevc_nvenc", arguments)
+        self.assertIn("p010le", arguments)
 
 
 if __name__ == "__main__":

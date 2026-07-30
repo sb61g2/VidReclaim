@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import sys
 import time
@@ -21,6 +22,7 @@ from .queueing import (
     run_session,
 )
 from .review import review_in_browser
+from .remote import RemoteConfig, remote_doctor
 from .runner import (
     archive_and_replace_file,
     archive_dvd,
@@ -95,6 +97,26 @@ def _add_analysis_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_remote_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--remote-host",
+        help="Windows PC hostname or IP; omit to encode on this Mac",
+    )
+    parser.add_argument("--remote-user", help="Windows SSH user")
+    parser.add_argument("--remote-port", type=int, default=22)
+    parser.add_argument(
+        "--remote-encoder",
+        choices=("x265", "nvenc"),
+        default="x265",
+        help="CPU x265 saves more space; NVENC finishes sooner",
+    )
+    parser.add_argument(
+        "--remote-identity-file",
+        type=Path,
+        help="SSH private key; uses the normal SSH default when omitted",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vidreclaim",
@@ -105,6 +127,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = subparsers.add_parser("doctor", help="check local dependencies")
     doctor.set_defaults(handler=command_doctor)
+
+    remote_doctor_parser = subparsers.add_parser(
+        "remote-doctor", help="check a Windows encoding PC",
+    )
+    remote_doctor_parser.add_argument("host")
+    remote_doctor_parser.add_argument("--user", required=True)
+    remote_doctor_parser.add_argument("--port", type=int, default=22)
+    remote_doctor_parser.add_argument(
+        "--encoder", choices=("x265", "nvenc"), default="x265",
+    )
+    remote_doctor_parser.add_argument("--identity-file", type=Path)
+    remote_doctor_parser.set_defaults(handler=command_remote_doctor)
 
     stitch_parser = subparsers.add_parser(
         "stitch", help="join mixed video clips into one normalized video",
@@ -193,6 +227,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="generate side-by-side samples only for this selected path; may be repeated",
     )
     _add_analysis_options(queue_start)
+    _add_remote_options(queue_start)
     queue_start.add_argument("--output-dir", type=Path)
     queue_start.add_argument("--replace", action="store_true")
     queue_start.add_argument("--delete-source-as-you-go", action="store_true")
@@ -312,6 +347,25 @@ def command_doctor(_: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def command_remote_doctor(args: argparse.Namespace) -> int:
+    try:
+        result = remote_doctor(RemoteConfig(
+            host=args.host,
+            user=args.user,
+            port=args.port,
+            encoder=args.encoder,
+            identity_file=(
+                args.identity_file.expanduser()
+                if args.identity_file else None
+            ),
+        ))
+        print("REMOTE_DOCTOR " + json.dumps(result, separators=(",", ":")))
+        return 0
+    except (CommandError, OSError) as error:
+        print(f"Remote check ERROR: {error}", file=sys.stderr)
+        return 1
+
+
 def command_stitch(args: argparse.Namespace) -> int:
     try:
         stitch(
@@ -409,11 +463,22 @@ def _queue_settings(args: argparse.Namespace, root: Path) -> dict[str, Any]:
         "review_paths": [
             str(path.expanduser().resolve()) for path in args.review_path
         ],
+        "remote_host": args.remote_host,
+        "remote_user": args.remote_user,
+        "remote_port": args.remote_port,
+        "remote_encoder": args.remote_encoder,
+        "remote_identity_file": (
+            str(args.remote_identity_file.expanduser())
+            if args.remote_identity_file else None
+        ),
     }
 
 
 def command_queue_start(args: argparse.Namespace) -> int:
     root = args.root.expanduser().resolve()
+    if args.remote_host and not args.remote_user:
+        print("--remote-user is required with --remote-host.", file=sys.stderr)
+        return 2
     if args.delete_source_as_you_go and not args.yes:
         print(
             "--delete-source-as-you-go is irreversible and requires --yes.",

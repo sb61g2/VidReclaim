@@ -21,6 +21,13 @@ confirmation for rolling deletion, live scan, batch, and current-file
 progress, speed and ETA, cancellation, and a persistent activity log.
 Sessions survive app restarts and reboots.
 
+Regular video-file encodes can run on a Windows PC over the local network.
+Transfers use SSH, resume from byte offsets after an interruption, and stage
+the source on the Windows drive so FFmpeg retains normal seeking. The Mac still
+plans the job, verifies the returned output, applies the savings threshold, and
+handles the source. CPU x265 is the default remote encoder; NVIDIA NVENC is the
+speed-first option.
+
 The app uses the same installed command-line engine described below. Disk-usage
 findings stay in the native interface and can feed selected files or folders
 directly into a queue. Its unified picking flow first scans user-selected
@@ -329,6 +336,28 @@ Defaults:
 - quick verification: decode samples near the start, middle, and end
 
 Use `--deep-verify` to decode every frame before accepting an output.
+
+## Windows encoding PC
+
+Run `packaging/windows/Install-VidReclaimWorker.ps1` as Administrator on the
+Windows PC. It enables the built-in OpenSSH server, adds the firewall rule,
+installs FFmpeg through `winget` when needed, and can add the Mac's public SSH
+key. The native Mac app exposes the connection under **Quality and speed** and
+tests it before a job is prepared.
+
+Command-line example:
+
+```bash
+vidreclaim queue-start "/Volumes/Media" \
+  --remote-host VIDEO-PC --remote-user yourname \
+  --remote-encoder x265 --plan-only
+```
+
+Remote source uploads and output downloads are resumable. Each source is
+staged below `%USERPROFILE%\.vidreclaim\jobs`; it is removed after the Mac
+verifies and accepts the output. If either computer restarts during an encode,
+the staged source is reused and that encode restarts. Completed queue items do
+not restart. DVD title extraction and Combine jobs remain local.
 
 ## DVD main-content selection
 
