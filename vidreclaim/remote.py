@@ -585,12 +585,25 @@ $encoders = ''
 if ($ffmpeg) { $encoders = (& $ffmpeg.Source -hide_banner -encoders 2>&1 | Out-String) }
 $gpuName = ''
 if ($gpu) { $gpuName = (& $gpu.Source --query-gpu=name --format=csv,noheader 2>$null | Select-Object -First 1) }
+$monitor = $false
+$trayPidPath = Join-Path $env:LOCALAPPDATA 'VidReclaim\tray.pid'
+if (Test-Path $trayPidPath) {
+    try {
+        $trayPid = [int](Get-Content -Raw $trayPidPath)
+        $trayProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$trayPid"
+        $monitor = (
+            $trayProcess.Name -eq 'powershell.exe' -and
+            $trayProcess.CommandLine -like '*VidReclaimTray.ps1*'
+        )
+    } catch {}
+}
 [ordered]@{
     computer = $env:COMPUTERNAME
     ffmpeg = [bool]$ffmpeg
     x265 = $encoders.Contains('libx265')
     nvenc = $encoders.Contains('hevc_nvenc')
     gpu = $gpuName.Trim()
+    monitor = $monitor
 } | ConvertTo-Json -Compress
 """,
     )
@@ -599,6 +612,10 @@ if ($gpu) { $gpuName = (& $gpu.Source --query-gpu=name --format=csv,noheader 2>$
     except json.JSONDecodeError as error:
         raise CommandError(f"Windows worker check returned invalid data: {raw}") from error
     required = "nvenc" if config.encoder == "nvenc" else "x265"
+    if not result.get("monitor"):
+        raise CommandError(
+            "Windows worker is reachable but the VidReclaim tray is not running"
+        )
     if not result.get("ffmpeg") or not result.get(required):
         raise CommandError(
             f"Windows worker is reachable but FFmpeg {required} support is missing"

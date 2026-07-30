@@ -36,6 +36,96 @@ $startupShortcut = $(if ($SelfTest) {
 } else {
     Join-Path $startupDirectory "VidReclaim.lnk"
 })
+$legacyWorking = $(if ($SelfTest) { "" } else {
+    Join-Path $HOME ".vidreclaim"
+})
+
+function Remove-LegacyWorking {
+    if (-not $legacyWorking -or -not (Test-Path $legacyWorking)) {
+        return
+    }
+    try {
+        Remove-Item `
+            -Recurse `
+            -Force `
+            -Path $legacyWorking `
+            -ErrorAction Stop
+    }
+    catch {}
+}
+
+function Stop-WorkingProcesses {
+    param([string[]]$Roots)
+    $processIds = @()
+    foreach ($root in $Roots) {
+        if (-not $root -or -not (Test-Path $root)) {
+            continue
+        }
+        foreach (
+            $statusPath in Get-ChildItem `
+                -Path $root `
+                -Filter "status.json" `
+                -File `
+                -Recurse `
+                -ErrorAction SilentlyContinue
+        ) {
+            $status = Read-JsonFile $statusPath.FullName
+            if (-not $status) {
+                continue
+            }
+            foreach ($property in @("encoder_pid", "worker_pid")) {
+                $processIdValue = [int]$status.$property
+                if ($processIdValue -gt 0) {
+                    $processIds += $processIdValue
+                }
+            }
+        }
+        foreach (
+            $candidate in Get-CimInstance `
+                Win32_Process `
+                -ErrorAction SilentlyContinue
+        ) {
+            $commandLine = [string]$candidate.CommandLine
+            if (
+                $commandLine.IndexOf(
+                    $root,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                ) -ge 0
+            ) {
+                $processIds += [int]$candidate.ProcessId
+            }
+        }
+    }
+    foreach ($processIdValue in $processIds | Select-Object -Unique) {
+        if ($processIdValue -ne $PID) {
+            Stop-Process `
+                -Id $processIdValue `
+                -Force `
+                -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Remove-WorkingRoots {
+    param([string[]]$Roots)
+    for ($attempt = 0; $attempt -lt 12; $attempt++) {
+        foreach ($root in $Roots) {
+            if (-not $root -or -not (Test-Path $root)) {
+                continue
+            }
+            Remove-Item `
+                -Recurse `
+                -Force `
+                -Path $root `
+                -ErrorAction SilentlyContinue
+        }
+        if (-not ($Roots | Where-Object { $_ -and (Test-Path $_) })) {
+            return $true
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    return $false
+}
 
 function Read-JsonFile {
     param([string]$Path)
@@ -487,45 +577,11 @@ function Set-SshServiceState {
 }
 
 function Stop-VidReclaimCompletely {
-    $jobs = @(Get-RemoteJobs)
     Set-JobControl "cancel"
-    Start-Sleep -Seconds 3
-    foreach ($job in $jobs) {
-        if ($job.EncoderPid -gt 0) {
-            $encoderProcess = Get-CimInstance `
-                Win32_Process `
-                -Filter "ProcessId=$($job.EncoderPid)" `
-                -ErrorAction SilentlyContinue
-            if (
-                $encoderProcess -and
-                $encoderProcess.Name -eq "ffmpeg.exe" -and
-                $encoderProcess.CommandLine -like "*output.part.mkv*"
-            ) {
-                Stop-Process `
-                    -Id $job.EncoderPid `
-                    -Force `
-                    -ErrorAction SilentlyContinue
-            }
-        }
-        if (
-            $job.WorkerPid -gt 0 -and
-            $job.State -in @("starting", "running", "cancelling")
-        ) {
-            $workerProcess = Get-CimInstance `
-                Win32_Process `
-                -Filter "ProcessId=$($job.WorkerPid)" `
-                -ErrorAction SilentlyContinue
-            if (
-                $workerProcess -and
-                $workerProcess.Name -eq "powershell.exe"
-            ) {
-                Stop-Process `
-                    -Id $job.WorkerPid `
-                    -Force `
-                    -ErrorAction SilentlyContinue
-            }
-        }
-    }
+    Start-Sleep -Milliseconds 500
+    $workingRoot = Split-Path -Parent $jobRoot
+    $roots = @($workingRoot, $legacyWorking)
+    Stop-WorkingProcesses $roots
     if (-not (Invoke-ElevatedPowerShell "Stop-Service sshd -Force")) {
         [System.Windows.Forms.MessageBox]::Show(
             "Remote access could not be stopped.",
@@ -534,6 +590,14 @@ function Stop-VidReclaimCompletely {
             [System.Windows.Forms.MessageBoxIcon]::Warning
         ) | Out-Null
         return
+    }
+    if (-not (Remove-WorkingRoots $roots)) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "A working file is still in use. Quit will retry next time.",
+            "Quit VidReclaim",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        ) | Out-Null
     }
     $notify.Visible = $false
     [System.Windows.Forms.Application]::Exit()
@@ -836,11 +900,6 @@ $sshItem.Add_Click({ Set-SshServiceState })
 $menu.Items.Add("-") | Out-Null
 $stopAllItem = $menu.Items.Add("Quit VidReclaim...")
 $stopAllItem.Add_Click({ Stop-VidReclaimCompletely })
-$exitItem = $menu.Items.Add("Close Monitor Only")
-$exitItem.Add_Click({
-    $notify.Visible = $false
-    [System.Windows.Forms.Application]::Exit()
-})
 $notify.ContextMenuStrip = $menu
 $notify.Add_DoubleClick({
     $form.Show()
@@ -849,6 +908,7 @@ $notify.Add_DoubleClick({
 
 $knownStates = @{}
 function Update-Display {
+    Remove-LegacyWorking
     Invoke-PendingCleanup
     $jobs = @(Get-RemoteJobs)
     $active = @($jobs | Where-Object {
@@ -979,6 +1039,12 @@ try {
 }
 finally {
     $timer.Stop()
+    if (-not $SelfTest) {
+        Stop-WorkingProcesses @(
+            (Split-Path -Parent $jobRoot),
+            $legacyWorking
+        )
+    }
     $notify.Visible = $false
     $notify.Dispose()
     if ($trayIcon) {

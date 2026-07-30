@@ -50,8 +50,8 @@ Install VidReclaim Worker.cmd
 ```
 
 The setup installs the SSH worker, FFmpeg, and tray monitor. It can start with
-Windows. The tray can pause or cancel jobs, close only the monitor, or shut
-down VidReclaim and remote access.
+Windows. Closing the window keeps the tray active. Quit stops jobs, remote
+access, and the tray.
 
 Remote transfers resume after interruption. Upcoming files upload while the
 current file encodes; the next encode can start during the prior download.

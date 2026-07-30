@@ -23,8 +23,9 @@ The tray shows transfers and encodes. Interrupted jobs can resume from the Mac.
 Cancel, then Clear Finished, to remove one. It disappears immediately; disk
 cleanup finishes after active transfers stop.
 
-Quit VidReclaim cancels jobs, stops remote access, and exits. Close Monitor Only
-leaves jobs and remote access running.
+Closing the window keeps VidReclaim in the tray. Quit VidReclaim cancels jobs,
+stops worker processes and remote access, removes working files, and exits.
+Workers stop if the tray process ends unexpectedly.
 
 Start-menu entry: VidReclaim
 

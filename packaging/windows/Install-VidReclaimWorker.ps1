@@ -126,7 +126,70 @@ if (-not $SkipTray) {
     }
     $legacyWorking = Join-Path $HOME ".vidreclaim"
     if (Test-Path $legacyWorking) {
-        Remove-Item -Recurse -Force $legacyWorking
+        Write-Step "Removing old working files"
+        $legacyProcessIds = @()
+        foreach (
+            $statusPath in Get-ChildItem `
+                -Path $legacyWorking `
+                -Filter "status.json" `
+                -File `
+                -Recurse `
+                -ErrorAction SilentlyContinue
+        ) {
+            try {
+                $status = Get-Content -Raw $statusPath.FullName |
+                    ConvertFrom-Json
+                foreach ($property in @("encoder_pid", "worker_pid")) {
+                    $processIdValue = [int]$status.$property
+                    if ($processIdValue -gt 0) {
+                        $legacyProcessIds += $processIdValue
+                    }
+                }
+            }
+            catch {}
+        }
+        foreach (
+            $legacyProcess in Get-CimInstance `
+                Win32_Process `
+                -ErrorAction SilentlyContinue
+        ) {
+            $commandLine = [string]$legacyProcess.CommandLine
+            if (
+                $commandLine.IndexOf(
+                    $legacyWorking,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                ) -ge 0
+            ) {
+                $legacyProcessIds += [int]$legacyProcess.ProcessId
+            }
+        }
+        foreach ($processIdValue in $legacyProcessIds | Select-Object -Unique) {
+            Stop-Process `
+                -Id $processIdValue `
+                -Force `
+                -ErrorAction SilentlyContinue
+        }
+        $removedLegacyWorking = $false
+        for ($attempt = 0; $attempt -lt 12; $attempt++) {
+            try {
+                Remove-Item `
+                    -Recurse `
+                    -Force `
+                    -Path $legacyWorking `
+                    -ErrorAction Stop
+                $removedLegacyWorking = $true
+                break
+            }
+            catch {
+                Start-Sleep -Milliseconds 250
+            }
+        }
+        if (-not $removedLegacyWorking -and (Test-Path $legacyWorking)) {
+            Write-Warning (
+                "Old working files are still in use. " +
+                "Setup will continue and remove them after Windows releases them."
+            )
+        }
     }
     $trayDestination = Join-Path $trayRoot "VidReclaimTray.ps1"
     Copy-Item -Force $traySource $trayDestination

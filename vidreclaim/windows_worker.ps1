@@ -10,6 +10,28 @@ $progressPath = Join-Path $JobDir "ffmpeg-progress.txt"
 $errorPath = Join-Path $JobDir "ffmpeg-error.txt"
 $controlPath = Join-Path $JobDir "control.txt"
 $outputPath = Join-Path $JobDir "output.part.mkv"
+$monitorPidPath = Join-Path $env:LOCALAPPDATA "VidReclaim\tray.pid"
+
+function Test-MonitorRunning {
+    if (-not (Test-Path $monitorPidPath)) {
+        return $false
+    }
+    try {
+        $monitorPid = [int](Get-Content -Raw $monitorPidPath)
+        $monitor = Get-CimInstance `
+            Win32_Process `
+            -Filter "ProcessId=$monitorPid" `
+            -ErrorAction SilentlyContinue
+        return (
+            $null -ne $monitor -and
+            $monitor.Name -eq "powershell.exe" -and
+            $monitor.CommandLine -like "*VidReclaimTray.ps1*"
+        )
+    }
+    catch {
+        return $false
+    }
+}
 
 function Write-Status {
     param([hashtable]$Value)
@@ -21,6 +43,9 @@ function Write-Status {
 }
 
 try {
+    if (-not (Test-MonitorRunning)) {
+        throw "VidReclaim monitor is not running."
+    }
     $manifest = Get-Content -Raw $manifestPath | ConvertFrom-Json
     $ffmpeg = Get-Command ffmpeg.exe -ErrorAction Stop
     Remove-Item -Force -ErrorAction SilentlyContinue $progressPath, $errorPath, $outputPath
@@ -44,6 +69,18 @@ try {
         encoder_pid = $process.Id
     }
     while (-not $process.HasExited) {
+        if (-not (Test-MonitorRunning)) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            $process.WaitForExit()
+            Remove-Item -Force -ErrorAction SilentlyContinue $outputPath
+            Write-Status @{
+                state = "cancelled"
+                fraction = 0.0
+                speed_x = $null
+                message = "Monitor stopped."
+            }
+            exit 0
+        }
         if (Test-Path $controlPath) {
             $action = (Get-Content -Raw $controlPath).Trim().ToLowerInvariant()
             if ($action -in @("pause", "cancel", "skip")) {
