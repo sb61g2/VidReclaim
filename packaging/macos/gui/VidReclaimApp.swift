@@ -3527,6 +3527,7 @@ struct ActivityView: View {
     @ObservedObject var model: AppModel
     let page: QueuePage
     @State private var showLog = false
+    @State private var showCompletedScanDetails = false
     @State private var whatIfItem: QueueItem?
     @State private var searchText = ""
     @State private var sortOption: QueueSortOption = .savingsBytes
@@ -3973,24 +3974,68 @@ struct ActivityView: View {
                         let encodeProgress = session.encodeFraction
                             ?? session.overallFraction
                         VStack(alignment: .leading, spacing: 8) {
-                            HStack {
-                                Text("Scan & analysis")
-                                    .font(.caption.bold())
-                                Text(
-                                    scanProgress >= 1
-                                        ? "Complete" : session.displayPhase
-                                )
-                                .font(.caption)
-                                .foregroundStyle(AppColors.secondaryText)
-                                .lineLimit(1)
-                                Spacer()
-                                Text(
-                                    "\(scanProgress * 100, specifier: "%.1f")%"
-                                )
-                                .font(.caption.monospacedDigit())
+                            if scanProgress < 1
+                                || showCompletedScanDetails {
+                                HStack {
+                                    Text("Scan & analysis")
+                                        .font(.caption.bold())
+                                    Text(
+                                        scanProgress >= 1
+                                            ? "Complete"
+                                            : session.displayPhase
+                                    )
+                                    .font(.caption)
+                                    .foregroundStyle(
+                                        AppColors.secondaryText
+                                    )
+                                    .lineLimit(1)
+                                    Spacer()
+                                    Text(
+                                        "\(scanProgress * 100, specifier: "%.1f")%"
+                                    )
+                                    .font(.caption.monospacedDigit())
+                                    if scanProgress >= 1 {
+                                        Button {
+                                            showCompletedScanDetails = false
+                                        } label: {
+                                            Image(
+                                                systemName: "chevron.up"
+                                            )
+                                        }
+                                        .buttonStyle(.plain)
+                                        .help("Hide scan details")
+                                    }
+                                }
+                                ProgressView(value: scanProgress)
+                                    .progressViewStyle(.linear)
+                            } else {
+                                Button {
+                                    showCompletedScanDetails = true
+                                } label: {
+                                    HStack {
+                                        Label(
+                                            "Scan complete",
+                                            systemImage:
+                                                "checkmark.circle.fill"
+                                        )
+                                        .font(.caption.bold())
+                                        .foregroundStyle(
+                                            AppColors.secondaryText
+                                        )
+                                        Spacer()
+                                        Image(
+                                            systemName: "chevron.down"
+                                        )
+                                        .font(.caption)
+                                        .foregroundStyle(
+                                            AppColors.secondaryText
+                                        )
+                                    }
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .help("Show scan details")
                             }
-                            ProgressView(value: scanProgress)
-                                .progressViewStyle(.linear)
 
                             HStack {
                                 Text("Batch encoding")
@@ -4040,6 +4085,12 @@ struct ActivityView: View {
                                 }
                                 ProgressView(value: current.progress)
                                     .progressViewStyle(.linear)
+                            }
+                        }
+                        .onChange(of: scanProgress >= 1) {
+                            _, scanCompleted in
+                            if scanCompleted {
+                                showCompletedScanDetails = false
                             }
                         }
                         HStack {
