@@ -232,6 +232,19 @@ struct QueueSession: Codable {
         case encodeFraction = "encode_fraction"
         case etaSeconds = "eta_seconds"
     }
+
+    var displayPhase: String {
+        guard phase == "Plan ready"
+                || phase == "Plan ready; start when convenient" else {
+            return phase
+        }
+        let hasRunnableItem = items.contains {
+            $0.isIncluded
+                && ["ready", "paused", "cancelled", "error"].contains($0.status)
+                && $0.output != nil
+        }
+        return hasRunnableItem ? "Ready" : "Nothing selected"
+    }
 }
 
 enum SourcePolicy: String, CaseIterable, Identifiable {
@@ -692,8 +705,8 @@ final class AppModel: ObservableObject {
         currentSessionURL = url
         UserDefaults.standard.set(url.path, forKey: "VidReclaimCurrentSession")
         selectedQueueItemIDs.removeAll()
-        loadQueueSession()
         selection = .activity
+        loadQueueSession()
     }
 
     private func loadLatestQueueSession() {
@@ -737,8 +750,16 @@ final class AppModel: ObservableObject {
         selectedQueueItemIDs.formIntersection(
             Set(session.items.map(\.id))
         )
+        let shouldPublishQueueProgress = runningQueue
+            || selection == .activity
+            || (
+                selection == .workspace
+                && workspaceOperation == .reclaim
+                && !runningCombine
+            )
+        guard shouldPublishQueueProgress else { return }
         overallProgress = session.encodeFraction ?? session.overallFraction
-        phase = session.phase
+        phase = session.displayPhase
         eta = durationLabel(session.etaSeconds)
         if let active = session.items.first(where: { $0.isActive }) {
             jobName = active.name
@@ -1242,7 +1263,7 @@ final class AppModel: ObservableObject {
         }
         if line.hasPrefix("Plan:") {
             lastSummary = line
-            phase = "Plan ready"
+            phase = "Ready"
             eta = extractEstimate(from: line) ?? "See plan"
             return
         }
@@ -3169,6 +3190,11 @@ struct ActivityView: View {
         }
     }
 
+    private func itemDetail(_ item: QueueItem) -> String {
+        guard item.isActive else { return item.message }
+        return String(format: "%.1f%%", item.progress * 100)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
@@ -3208,7 +3234,7 @@ struct ActivityView: View {
                                     .font(.caption.bold())
                                 Text(
                                     scanProgress >= 1
-                                        ? "Complete" : session.phase
+                                        ? "Complete" : session.displayPhase
                                 )
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
@@ -3227,7 +3253,7 @@ struct ActivityView: View {
                                     .font(.caption.bold())
                                 Text(
                                     scanProgress < 1
-                                        ? "Waiting for scan" : session.phase
+                                        ? "Waiting for scan" : session.displayPhase
                                 )
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
@@ -3607,15 +3633,10 @@ struct ActivityView: View {
                                         .font(.caption2)
                                         .foregroundStyle(.tertiary)
                                         .lineLimit(1)
-                                    if item.isActive {
-                                        ProgressView(value: item.progress)
-                                            .progressViewStyle(.linear)
-                                    } else {
-                                        Text(item.message)
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                            .lineLimit(1)
-                                    }
+                                    Text(itemDetail(item))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
                                 }
                                 Spacer(minLength: 8)
                                 VStack(alignment: .trailing, spacing: 2) {
@@ -3756,7 +3777,13 @@ struct ContentView: View {
                     case .activity: ActivityView(model: model)
                     }
                 }
-                if model.isRunning {
+                let hasInlineProgress = model.selection == .activity
+                    || (
+                        model.selection == .workspace
+                        && model.workspaceOperation == .combine
+                        && model.combineAttempted
+                    )
+                if model.isRunning && !hasInlineProgress {
                     RunningBanner(model: model)
                 }
             }

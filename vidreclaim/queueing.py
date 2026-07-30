@@ -928,6 +928,8 @@ def _normalize_interrupted(store: SessionStore) -> None:
         if data["status"] in {"running", "interrupted"}:
             data["status"] = "queued"
             data["phase"] = "Ready to resume"
+        elif data.get("phase") == "Plan ready; start when convenient":
+            data["phase"] = "Ready"
 
     store.mutate(change)
 
@@ -968,7 +970,7 @@ def run_session(
             data.update({
                 "status": "paused" if ready_count else "complete",
                 "phase": (
-                    "Plan ready"
+                    "Ready"
                     if ready_count
                     else "No files met the encode thresholds"
                 ),

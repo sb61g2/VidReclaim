@@ -380,6 +380,21 @@ class SpaceMapTests(unittest.TestCase):
 
 
 class QueueTests(unittest.TestCase):
+    def test_legacy_plan_ready_phase_is_shortened(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "session.json"
+            create_session(path, root=root, settings=self.settings(root))
+            store = SessionStore(path)
+
+            def add_legacy_phase(data: dict[str, object]) -> None:
+                data["status"] = "paused"
+                data["phase"] = "Plan ready; start when convenient"
+
+            store.mutate(add_legacy_phase)
+            _normalize_interrupted(store)
+            self.assertEqual("Ready", store.read()["phase"])
+
     def test_scan_progress_tracks_metadata_and_analysis_stages(self) -> None:
         data = {
             "items": [
@@ -472,7 +487,7 @@ class QueueTests(unittest.TestCase):
 
             def add_cancelled_item(data: dict[str, object]) -> None:
                 data["status"] = "paused"
-                data["phase"] = "Plan ready"
+                data["phase"] = "Ready"
                 data["items"] = [{
                     "id": "movie",
                     "order": 0,

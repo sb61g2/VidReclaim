@@ -221,6 +221,10 @@ source size, estimated output size and size change, and estimated encode time.
 Encode progress and ETA then update while the job runs. The verified output
 size replaces the estimate when the job finishes.
 
+Only one combine progress bar is shown. Queue screens retain separate scan,
+batch, and current-file progress; the global progress strip is hidden there.
+An idle saved queue cannot replace the status of a running combine.
+
 If a combine is interrupted, the app reports its partial output before scanning
 the inputs again. It can reveal that file in Finder or move it to Trash and
 retry. It never removes the partial without the user's action.
