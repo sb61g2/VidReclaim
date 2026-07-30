@@ -23,9 +23,9 @@ enum WorkspaceOperation: String, CaseIterable, Identifiable {
 }
 
 enum AppDestination: String, CaseIterable, Identifiable {
-    case reclaim = "Reclaim"
     case combine = "Combine"
-    case activity = "Activity"
+    case reclaim = "Reclaim"
+    case activity = "Status"
 
     var id: String { rawValue }
 }
@@ -2427,6 +2427,7 @@ struct ReclaimLocationPicker: View {
 struct CompressView: View {
     @ObservedObject var model: AppModel
     @State private var confirmDeletion = false
+    @State private var encodingExpanded = true
 
     var body: some View {
         ScrollView {
@@ -2437,7 +2438,10 @@ struct CompressView: View {
                 )
                 ReclaimLocationPicker(model: model)
 
-                DisclosureGroup("Encoding") {
+                DisclosureGroup(
+                    "Encoding",
+                    isExpanded: $encodingExpanded
+                ) {
                     Grid(
                         alignment: .leading,
                         horizontalSpacing: 18,
@@ -4305,23 +4309,47 @@ struct WorkspaceView: View {
 struct ContentView: View {
     @ObservedObject var model: AppModel
 
+    @ViewBuilder
+    private func destinationButton(
+        _ title: String,
+        destination: AppDestination,
+        width: CGFloat
+    ) -> some View {
+        let selected = model.destination == destination
+        if selected {
+            Button(title) {
+                model.destination = destination
+            }
+            .buttonStyle(.borderedProminent)
+            .frame(width: width)
+        } else {
+            Button(title) {
+                model.destination = destination
+            }
+            .buttonStyle(.bordered)
+            .frame(width: width)
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Picker(
-                    "View",
-                    selection: Binding(
-                        get: { model.destination },
-                        set: { model.destination = $0 }
-                    )
-                ) {
-                    ForEach(AppDestination.allCases) { destination in
-                        Text(destination.rawValue).tag(destination)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                .frame(width: 300)
+            HStack(spacing: 8) {
+                destinationButton(
+                    "Combine",
+                    destination: .combine,
+                    width: 88
+                )
+                destinationButton(
+                    "Reclaim",
+                    destination: .reclaim,
+                    width: 88
+                )
+                Spacer().frame(width: 18)
+                destinationButton(
+                    "Status",
+                    destination: .activity,
+                    width: 78
+                )
                 Spacer()
             }
             .padding(.horizontal, 20)
@@ -4380,7 +4408,7 @@ struct VidReclaimApp: App {
         .windowStyle(.titleBar)
         .commands {
             CommandGroup(after: .appInfo) {
-                Button("Show Activity") {
+                Button("Show Status") {
                     model.selection = .activity
                 }
                 .keyboardShortcut("l", modifiers: [.command, .shift])
