@@ -219,11 +219,23 @@ enum QueueSortOption: String, CaseIterable, Identifiable {
     case savingsBytes = "Greatest space savings"
     case savingsPercent = "Greatest percentage savings"
     case sourceSize = "Largest source"
+    case outputSize = "Largest output"
     case encodeTime = "Longest encode"
     case name = "Name"
     case status = "Status"
 
     var id: String { rawValue }
+}
+
+enum QueueFolderSortOption: String {
+    case name
+    case items
+    case savings
+}
+
+enum LocationSortOption: String {
+    case name
+    case kind
 }
 
 enum QueueStatusFilter: String, CaseIterable, Identifiable {
@@ -1640,6 +1652,64 @@ struct SectionHeading: View {
     }
 }
 
+struct AnchoredListHeader<Content: View>: View {
+    let content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            content
+        }
+        .font(.caption.bold())
+        .foregroundStyle(AppColors.secondaryText)
+        .padding(.horizontal, 8)
+        .frame(height: 32)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .overlay(alignment: .bottom) {
+            Divider()
+        }
+    }
+}
+
+struct SortableListHeader<Key: Equatable>: View {
+    let title: String
+    let key: Key
+    @Binding var selection: Key
+    @Binding var ascending: Bool
+    let defaultAscending: Bool
+    var alignment: Alignment = .leading
+
+    var body: some View {
+        Button {
+            if selection == key {
+                ascending.toggle()
+            } else {
+                selection = key
+                ascending = defaultAscending
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Text(title)
+                    .lineLimit(1)
+                if selection == key {
+                    Image(
+                        systemName: ascending
+                            ? "chevron.up" : "chevron.down"
+                    )
+                    .font(.system(size: 8, weight: .bold))
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: alignment)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Sort by \(title.lowercased())")
+    }
+}
+
 struct RunningBanner: View {
     @ObservedObject var model: AppModel
 
@@ -2371,6 +2441,31 @@ struct PreparedQueueView: View {
 
 struct ReclaimLocationPicker: View {
     @ObservedObject var model: AppModel
+    @State private var sortOption: LocationSortOption = .name
+    @State private var sortAscending = true
+
+    private var locations: [URL] {
+        model.spacePaths.sorted { left, right in
+            let comparison: ComparisonResult
+            switch sortOption {
+            case .name:
+                comparison = left.lastPathComponent.localizedStandardCompare(
+                    right.lastPathComponent
+                )
+            case .kind:
+                let leftKind = left.hasDirectoryPath ? "Folder" : "Video"
+                let rightKind = right.hasDirectoryPath ? "Folder" : "Video"
+                comparison = leftKind == rightKind
+                    ? left.lastPathComponent.localizedStandardCompare(
+                        right.lastPathComponent
+                    )
+                    : leftKind.localizedStandardCompare(rightKind)
+            }
+            return sortAscending
+                ? comparison == .orderedAscending
+                : comparison == .orderedDescending
+        }
+    }
 
     var body: some View {
         GroupBox("Videos") {
@@ -2381,41 +2476,75 @@ struct ReclaimLocationPicker: View {
                         .disabled(model.spacePaths.isEmpty || model.isRunning)
                     Spacer()
                 }
-                List {
-                    ForEach(model.spacePaths, id: \.self) { url in
-                        HStack(spacing: 10) {
-                            Image(
-                                systemName: url.hasDirectoryPath
-                                    ? "folder.fill" : "film.fill"
-                            )
-                            .foregroundStyle(AppColors.secondaryText)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(
-                                    url.lastPathComponent.isEmpty
-                                        ? url.path : url.lastPathComponent
+                VStack(spacing: 0) {
+                    AnchoredListHeader {
+                        SortableListHeader(
+                            title: "Name",
+                            key: LocationSortOption.name,
+                            selection: $sortOption,
+                            ascending: $sortAscending,
+                            defaultAscending: true
+                        )
+                        SortableListHeader(
+                            title: "Kind",
+                            key: LocationSortOption.kind,
+                            selection: $sortOption,
+                            ascending: $sortAscending,
+                            defaultAscending: true,
+                            alignment: .leading
+                        )
+                        .frame(width: 72)
+                        Color.clear.frame(width: 22)
+                    }
+                    List {
+                        ForEach(locations, id: \.self) { url in
+                            HStack(spacing: 10) {
+                                Image(
+                                    systemName: url.hasDirectoryPath
+                                        ? "folder.fill" : "film.fill"
                                 )
-                                Text(url.path)
-                                    .font(.caption2)
-                                    .foregroundStyle(AppColors.secondaryText)
-                                    .lineLimit(1)
+                                .foregroundStyle(AppColors.secondaryText)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(
+                                        url.lastPathComponent.isEmpty
+                                            ? url.path
+                                            : url.lastPathComponent
+                                    )
+                                    Text(url.path)
+                                        .font(.caption2)
+                                        .foregroundStyle(
+                                            AppColors.secondaryText
+                                        )
+                                        .lineLimit(1)
+                                }
+                                Spacer()
+                                Text(
+                                    url.hasDirectoryPath
+                                        ? "Folder" : "Video"
+                                )
+                                .font(.caption)
+                                .foregroundStyle(
+                                    AppColors.secondaryText
+                                )
+                                .frame(width: 72, alignment: .leading)
+                                Button {
+                                    model.spacePaths.removeAll { $0 == url }
+                                } label: {
+                                    Image(systemName: "minus.circle")
+                                }
+                                .buttonStyle(.plain)
+                                .frame(width: 22)
                             }
-                            Spacer()
-                            Button {
-                                model.spacePaths.removeAll { $0 == url }
-                            } label: {
-                                Image(systemName: "minus.circle")
-                            }
-                            .buttonStyle(.plain)
                         }
                     }
-                }
-                .frame(minHeight: 120, maxHeight: 220)
-                .overlay {
-                    if model.spacePaths.isEmpty {
-                        ContentUnavailableView(
-                            "Choose videos or folders",
-                            systemImage: "folder.badge.plus"
-                        )
+                    .frame(minHeight: 120, maxHeight: 220)
+                    .overlay {
+                        if model.spacePaths.isEmpty {
+                            ContentUnavailableView(
+                                "Choose videos or folders",
+                                systemImage: "folder.badge.plus"
+                            )
+                        }
                     }
                 }
             }
@@ -2638,52 +2767,101 @@ struct StitchView: View {
                 Text("\(model.stitchInputs.count) selected")
                     .foregroundStyle(AppColors.secondaryText)
             }
-            List {
-                ForEach(Array(model.stitchInputs.enumerated()), id: \.element) { index, url in
-                    HStack {
-                        Text("\(index + 1)").monospacedDigit().foregroundStyle(AppColors.secondaryText)
-                            .frame(width: 25, alignment: .trailing)
-                        Image(systemName: url.hasDirectoryPath ? "folder" : "film")
-                        VStack(alignment: .leading) {
-                            Text(url.lastPathComponent).lineLimit(1)
-                            Text(url.deletingLastPathComponent().path)
-                                .font(.caption).foregroundStyle(AppColors.secondaryText).lineLimit(1)
+            VStack(spacing: 0) {
+                AnchoredListHeader {
+                    Text("#")
+                        .frame(width: 25, alignment: .trailing)
+                    Text("Name")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Text("Kind")
+                        .frame(width: 72, alignment: .leading)
+                    Color.clear.frame(width: 72)
+                }
+                List {
+                    ForEach(
+                        Array(model.stitchInputs.enumerated()),
+                        id: \.element
+                    ) { index, url in
+                        HStack(spacing: 8) {
+                            Text("\(index + 1)")
+                                .monospacedDigit()
+                                .foregroundStyle(AppColors.secondaryText)
+                                .frame(width: 25, alignment: .trailing)
+                            Image(
+                                systemName: url.hasDirectoryPath
+                                    ? "folder" : "film"
+                            )
+                            VStack(alignment: .leading) {
+                                Text(url.lastPathComponent).lineLimit(1)
+                                Text(
+                                    url.deletingLastPathComponent().path
+                                )
+                                .font(.caption)
+                                .foregroundStyle(
+                                    AppColors.secondaryText
+                                )
+                                .lineLimit(1)
+                            }
+                            Spacer()
+                            Text(
+                                url.hasDirectoryPath ? "Folder" : "Video"
+                            )
+                                .font(.caption)
+                                .foregroundStyle(AppColors.secondaryText)
+                                .frame(width: 72, alignment: .leading)
+                            HStack(spacing: 8) {
+                                Button {
+                                    model.moveStitchInput(
+                                        from: index,
+                                        by: -1
+                                    )
+                                } label: {
+                                    Image(systemName: "chevron.up")
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(index == 0 || model.isRunning)
+                                Button {
+                                    model.moveStitchInput(
+                                        from: index,
+                                        by: 1
+                                    )
+                                } label: {
+                                    Image(systemName: "chevron.down")
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(
+                                    index
+                                        == model.stitchInputs.count - 1
+                                        || model.isRunning
+                                )
+                                Button(role: .destructive) {
+                                    model.resetCombineEstimate()
+                                    model.stitchInputs.remove(at: index)
+                                } label: {
+                                    Image(systemName: "xmark.circle")
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(model.isRunning)
+                            }
+                            .frame(width: 72, alignment: .trailing)
                         }
-                        Spacer()
-                        Button { model.moveStitchInput(from: index, by: -1) } label: {
-                            Image(systemName: "chevron.up")
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(index == 0 || model.isRunning)
-                        Button { model.moveStitchInput(from: index, by: 1) } label: {
-                            Image(systemName: "chevron.down")
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(
-                            index == model.stitchInputs.count - 1
-                                || model.isRunning
-                        )
-                        Button(role: .destructive) {
-                            model.resetCombineEstimate()
-                            model.stitchInputs.remove(at: index)
-                        } label: {
-                            Image(systemName: "xmark.circle")
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(model.isRunning)
                     }
                 }
-            }
-            .overlay {
-                if model.stitchInputs.isEmpty {
-                    ContentUnavailableView(
-                        "No clips yet",
-                        systemImage: "rectangle.stack.badge.plus",
-                        description: Text("Add at least two clips.")
-                    )
+                .overlay {
+                    if model.stitchInputs.isEmpty {
+                        ContentUnavailableView(
+                            "No clips yet",
+                            systemImage: "rectangle.stack.badge.plus",
+                            description: Text("Add at least two clips.")
+                        )
+                    }
                 }
+                .frame(
+                    minHeight: 190,
+                    idealHeight: 280,
+                    maxHeight: 360
+                )
             }
-            .frame(minHeight: 190, idealHeight: 280, maxHeight: 360)
 
             if model.combineAttempted {
                 GroupBox("Combine status") {
@@ -3350,6 +3528,9 @@ struct ActivityView: View {
     @State private var whatIfItem: QueueItem?
     @State private var searchText = ""
     @State private var sortOption: QueueSortOption = .savingsBytes
+    @State private var sortAscending = false
+    @State private var folderSortOption: QueueFolderSortOption = .name
+    @State private var folderSortAscending = true
     @State private var statusFilter: QueueStatusFilter = .included
     @State private var showProcessed = false
     @State private var selectedFolder = ""
@@ -3474,11 +3655,6 @@ struct ActivityView: View {
                 sourceBytes: count.sourceBytes,
                 savingsBytes: count.savingsBytes
             )
-        }.sorted {
-            if $0.path.isEmpty { return true }
-            if $1.path.isEmpty { return false }
-            return $0.path.localizedStandardCompare($1.path)
-                == .orderedAscending
         }
     }
 
@@ -3502,8 +3678,59 @@ struct ActivityView: View {
         return true
     }
 
+    private func compareFolders(
+        _ left: QueueFolderSummary,
+        _ right: QueueFolderSummary
+    ) -> Bool {
+        let comparison: ComparisonResult
+        switch folderSortOption {
+        case .name:
+            comparison = left.path.localizedStandardCompare(right.path)
+        case .items:
+            if left.total == right.total {
+                comparison = left.path.localizedStandardCompare(right.path)
+            } else {
+                comparison = left.total < right.total
+                    ? .orderedAscending : .orderedDescending
+            }
+        case .savings:
+            if left.savingsBytes == right.savingsBytes {
+                comparison = left.path.localizedStandardCompare(right.path)
+            } else {
+                comparison = left.savingsBytes < right.savingsBytes
+                    ? .orderedAscending : .orderedDescending
+            }
+        }
+        return folderSortAscending
+            ? comparison == .orderedAscending
+            : comparison == .orderedDescending
+    }
+
+    private var orderedFolderSummaries: [QueueFolderSummary] {
+        let root = folderSummaries.first { $0.path.isEmpty }
+        var rows: [QueueFolderSummary] = []
+
+        func appendChildren(of folder: String) {
+            let children = folderSummaries
+                .filter { parentFolder($0.path) == folder }
+                .sorted(by: compareFolders)
+            for child in children {
+                rows.append(child)
+                appendChildren(of: child.path)
+            }
+        }
+
+        if let root {
+            rows.append(root)
+            appendChildren(of: root.path)
+        }
+        return rows
+    }
+
     private var visibleFolderSummaries: [QueueFolderSummary] {
-        folderSummaries.filter { $0.path.isEmpty || ancestorsExpanded($0.path) }
+        orderedFolderSummaries.filter {
+            $0.path.isEmpty || ancestorsExpanded($0.path)
+        }
     }
 
     private var filteredItems: [QueueItem] {
@@ -3537,26 +3764,69 @@ struct ActivityView: View {
             }
         }
         return filtered.sorted { left, right in
+            let comparison: ComparisonResult
             switch sortOption {
             case .queue:
-                return left.order < right.order
+                comparison = left.order == right.order
+                    ? .orderedSame
+                    : (left.order < right.order
+                        ? .orderedAscending : .orderedDescending)
             case .savingsBytes:
-                return left.projectedSavingsBytes > right.projectedSavingsBytes
+                let leftValue = displayedSavingsBytes(left)
+                let rightValue = displayedSavingsBytes(right)
+                comparison = leftValue
+                    == rightValue
+                    ? .orderedSame
+                    : (leftValue
+                        < rightValue
+                        ? .orderedAscending : .orderedDescending)
             case .savingsPercent:
-                return (left.projectedSavingsPct ?? -1)
-                    > (right.projectedSavingsPct ?? -1)
+                let leftValue = left.isProcessed
+                    ? (left.actualSavingsPct ?? -1)
+                    : (left.projectedSavingsPct ?? -1)
+                let rightValue = right.isProcessed
+                    ? (right.actualSavingsPct ?? -1)
+                    : (right.projectedSavingsPct ?? -1)
+                comparison = leftValue == rightValue
+                    ? .orderedSame
+                    : (leftValue < rightValue
+                        ? .orderedAscending : .orderedDescending)
             case .sourceSize:
-                return (left.sourceBytes ?? 0) > (right.sourceBytes ?? 0)
+                let leftValue = left.sourceBytes ?? 0
+                let rightValue = right.sourceBytes ?? 0
+                comparison = leftValue == rightValue
+                    ? .orderedSame
+                    : (leftValue < rightValue
+                        ? .orderedAscending : .orderedDescending)
+            case .outputSize:
+                let leftValue = left.outputBytes
+                    ?? left.projectedBytes ?? 0
+                let rightValue = right.outputBytes
+                    ?? right.projectedBytes ?? 0
+                comparison = leftValue == rightValue
+                    ? .orderedSame
+                    : (leftValue < rightValue
+                        ? .orderedAscending : .orderedDescending)
             case .encodeTime:
-                return (left.projectedEncodeSeconds ?? 0)
-                    > (right.projectedEncodeSeconds ?? 0)
+                let leftValue = left.encodeElapsedSeconds
+                    ?? left.projectedEncodeSeconds ?? 0
+                let rightValue = right.encodeElapsedSeconds
+                    ?? right.projectedEncodeSeconds ?? 0
+                comparison = leftValue == rightValue
+                    ? .orderedSame
+                    : (leftValue < rightValue
+                        ? .orderedAscending : .orderedDescending)
             case .name:
-                return left.name.localizedStandardCompare(right.name)
-                    == .orderedAscending
+                comparison = left.name.localizedStandardCompare(right.name)
             case .status:
-                return left.status.localizedStandardCompare(right.status)
-                    == .orderedAscending
+                comparison = left.status.localizedStandardCompare(right.status)
             }
+            if comparison == .orderedSame {
+                return left.order < right.order
+            }
+            return sortAscending
+                ? comparison == .orderedAscending
+                : comparison == .orderedDescending
         }
     }
 
@@ -3613,9 +3883,51 @@ struct ActivityView: View {
 
     private func itemDetail(_ item: QueueItem) -> String {
         if !item.isIncluded || item.status == "skipped" { return "" }
-        guard item.isActive else { return item.message }
+        guard item.isActive else {
+            return ["error", "cancelled"].contains(item.status)
+                ? item.message : ""
+        }
         if item.transferProgress != nil { return item.message }
         return String(format: "%.1f%%", item.progress * 100)
+    }
+
+    private func inclusionIcon(for items: [QueueItem]) -> String {
+        let selectable = items.filter(\.canChangeInclusion)
+        guard !selectable.isEmpty else { return "square" }
+        let included = selectable.filter(\.isIncluded).count
+        if included == 0 { return "square" }
+        return included == selectable.count
+            ? "checkmark.square.fill" : "minus.square.fill"
+    }
+
+    private func toggleInclusion(for items: [QueueItem]) {
+        let selectable = items.filter(\.canChangeInclusion)
+        guard !selectable.isEmpty else { return }
+        let action = selectable.allSatisfy(\.isIncluded)
+            ? "exclude" : "include"
+        model.queueControl(action, itemIDs: selectable.map(\.id))
+    }
+
+    private func displayedOutputBytes(_ item: QueueItem) -> Int64? {
+        item.outputBytes ?? item.projectedBytes
+    }
+
+    private func displayedSavingsBytes(_ item: QueueItem) -> Int64 {
+        item.isProcessed ? item.actualSavingsBytes : item.projectedSavingsBytes
+    }
+
+    private func displayedSavingsPercent(_ item: QueueItem) -> Double? {
+        item.isProcessed
+            ? item.actualSavingsPct : item.projectedSavingsPct
+    }
+
+    private func displayedEncodeSeconds(_ item: QueueItem) -> Double? {
+        if item.isProcessed || item.status == "complete" {
+            return item.encodeElapsedSeconds
+                ?? item.projectedEncodeSeconds
+        }
+        return item.projectedEncodeSeconds
+            ?? item.etaSeconds
     }
 
     var body: some View {
@@ -3863,13 +4175,6 @@ struct ActivityView: View {
                     }
                     .labelsHidden()
                     .frame(width: 150)
-                    Picker("Sort", selection: $sortOption) {
-                        ForEach(QueueSortOption.allCases) {
-                            Text($0.rawValue).tag($0)
-                        }
-                    }
-                    .labelsHidden()
-                    .frame(width: 210)
                     Toggle("Show processed", isOn: $showProcessed)
                         .toggleStyle(.checkbox)
                     Spacer()
@@ -4054,200 +4359,437 @@ struct ActivityView: View {
                 }
 
                 HSplitView {
-                    List {
-                        ForEach(visibleFolderSummaries) { summary in
-                            let folder = summary.path
-                            let depth = folder.split(separator: "/").count
-                            HStack(spacing: 7) {
-                                if hasChildFolder(folder) {
-                                    Button {
-                                        if expandedFolders.contains(folder) {
-                                            expandedFolders.remove(folder)
-                                        } else {
-                                            expandedFolders.insert(folder)
+                    VStack(spacing: 0) {
+                        AnchoredListHeader {
+                            HStack(spacing: 4) {
+                                Color.clear.frame(width: 16)
+                                Button {
+                                    toggleInclusion(for: thresholdItems)
+                                } label: {
+                                    Image(
+                                        systemName: inclusionIcon(
+                                            for: thresholdItems
+                                        )
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(
+                                    !thresholdItems.contains(
+                                        where: \.canChangeInclusion
+                                    )
+                                )
+                                .help("Select or deselect all folders")
+                            }
+                            .frame(width: 42)
+                            SortableListHeader(
+                                title: "Name",
+                                key: QueueFolderSortOption.name,
+                                selection: $folderSortOption,
+                                ascending: $folderSortAscending,
+                                defaultAscending: true
+                            )
+                            SortableListHeader(
+                                title: "Items",
+                                key: QueueFolderSortOption.items,
+                                selection: $folderSortOption,
+                                ascending: $folderSortAscending,
+                                defaultAscending: false,
+                                alignment: .trailing
+                            )
+                            .frame(width: 52)
+                            SortableListHeader(
+                                title: "Savings",
+                                key: QueueFolderSortOption.savings,
+                                selection: $folderSortOption,
+                                ascending: $folderSortAscending,
+                                defaultAscending: false,
+                                alignment: .trailing
+                            )
+                            .frame(width: 82)
+                        }
+                        List {
+                            ForEach(visibleFolderSummaries) { summary in
+                                let folder = summary.path
+                                let depth = folder
+                                    .split(separator: "/").count
+                                HStack(spacing: 7) {
+                                    Color.clear.frame(
+                                        width: CGFloat(depth * 14)
+                                    )
+                                    if hasChildFolder(folder) {
+                                        Button {
+                                            if expandedFolders.contains(
+                                                folder
+                                            ) {
+                                                expandedFolders.remove(folder)
+                                            } else {
+                                                expandedFolders.insert(folder)
+                                            }
+                                        } label: {
+                                            Image(
+                                                systemName: expandedFolders
+                                                    .contains(folder)
+                                                    ? "minus.square"
+                                                    : "plus.square"
+                                            )
                                         }
+                                        .buttonStyle(.plain)
+                                        .frame(width: 16)
+                                        .help(
+                                            expandedFolders.contains(folder)
+                                                ? "Collapse" : "Expand"
+                                        )
+                                    } else {
+                                        Color.clear.frame(width: 16)
+                                    }
+                                    Button {
+                                        toggleInclusion(
+                                            for: thresholdItems.filter {
+                                                isInFolder(
+                                                    $0,
+                                                    folder: folder
+                                                )
+                                            }
+                                        )
                                     } label: {
                                         Image(
-                                            systemName: expandedFolders
-                                                .contains(folder)
-                                                ? "minus.square"
-                                                : "plus.square"
+                                            systemName: summary.selectionIcon
                                         )
                                     }
                                     .buttonStyle(.plain)
-                                    .help(
-                                        expandedFolders.contains(folder)
-                                            ? "Collapse" : "Expand"
-                                    )
-                                } else {
-                                    Color.clear.frame(width: 13)
-                                }
-                                Button {
-                                    let action = (
-                                        summary.selectable > 0
-                                        && summary.included == summary.selectable
-                                    ) ? "exclude" : "include"
-                                    let ids = thresholdItems
-                                        .filter {
-                                            isInFolder($0, folder: folder)
-                                                && $0.canChangeInclusion
-                                        }
-                                        .map(\.id)
-                                    model.queueControl(action, itemIDs: ids)
-                                } label: {
-                                    Image(
-                                        systemName: summary.selectionIcon
-                                    )
-                                }
-                                .buttonStyle(.plain)
-                                .disabled(summary.selectable == 0)
-                                Button {
-                                    selectedFolder = folder
-                                } label: {
-                                    HStack {
-                                        Image(
-                                            systemName: folder.isEmpty
-                                                ? "externaldrive.fill"
-                                                : "folder.fill"
-                                        )
-                                        Text(
-                                            folder.isEmpty
-                                                ? session.name
-                                                : URL(
-                                                    fileURLWithPath: folder
-                                                ).lastPathComponent
-                                        )
-                                        .lineLimit(1)
-                                        Spacer()
-                                        VStack(alignment: .trailing, spacing: 1) {
-                                            Text(
-                                                "save "
-                                                + model.bytesLabel(
-                                                    summary.savingsBytes
-                                                )
+                                    .frame(width: 20)
+                                    .disabled(summary.selectable == 0)
+                                    Button {
+                                        selectedFolder = folder
+                                    } label: {
+                                        HStack(spacing: 6) {
+                                            Image(
+                                                systemName: folder.isEmpty
+                                                    ? "externaldrive.fill"
+                                                    : "folder.fill"
                                             )
                                             Text(
-                                                "\(summary.total.formatted()) files"
+                                                folder.isEmpty
+                                                    ? session.name
+                                                    : URL(
+                                                        fileURLWithPath: folder
+                                                    ).lastPathComponent
                                             )
-                                            .font(.caption2)
-                                        }
-                                        .foregroundStyle(AppColors.secondaryText)
-                                    }
-                                    .contentShape(Rectangle())
-                                }
-                                .buttonStyle(.plain)
-                            }
-                            .padding(
-                                .leading,
-                                CGFloat(depth * 16)
-                            )
-                            .listRowBackground(
-                                selectedFolder == folder
-                                    ? Color.accentColor.opacity(0.16)
-                                    : Color.clear
-                            )
-                        }
-                    }
-                    .frame(minWidth: 190, idealWidth: 230, maxWidth: 300)
-
-                    List(selection: $model.selectedQueueItemIDs) {
-                        ForEach(filteredItems) { item in
-                            HStack(spacing: 10) {
-                                Button {
-                                    model.queueControl(
-                                        item.isIncluded ? "exclude" : "include",
-                                        itemID: item.id
-                                    )
-                                } label: {
-                                    Image(
-                                        systemName: item.isIncluded
-                                            ? "checkmark.square.fill" : "square"
-                                    )
-                                }
-                                .buttonStyle(.plain)
-                                .disabled(!item.canChangeInclusion)
-                                Image(systemName: statusIcon(item.status))
-                                    .font(.title3)
-                                    .foregroundStyle(statusColor(item.status))
-                                    .frame(width: 22)
-                                VStack(alignment: .leading, spacing: 3) {
-                                    HStack(spacing: 6) {
-                                        Text(item.name)
-                                            .fontWeight(.semibold)
                                             .lineLimit(1)
-                                        if item.isProcessed {
-                                            Text("Processed")
-                                                .font(.caption2.bold())
-                                                .foregroundStyle(AppColors.success)
-                                        } else if !item.isIncluded {
-                                            Text("Excluded")
-                                                .font(.caption2.bold())
-                                                .foregroundStyle(AppColors.secondaryText)
-                                        } else {
-                                            Text(item.status.capitalized)
-                                                .font(.caption2.bold())
-                                                .foregroundStyle(
-                                                    statusColor(item.status)
-                                                )
+                                            Spacer()
                                         }
+                                        .contentShape(Rectangle())
                                     }
-                                    Text(item.relativePath ?? item.path)
-                                        .font(.caption2)
-                                        .foregroundStyle(AppColors.tertiaryText)
-                                        .lineLimit(1)
-                                    let detail = itemDetail(item)
-                                    if !detail.isEmpty {
-                                        Text(detail)
-                                            .font(.caption)
-                                            .foregroundStyle(AppColors.secondaryText)
-                                            .lineLimit(1)
-                                    }
-                                }
-                                Spacer(minLength: 8)
-                                VStack(alignment: .trailing, spacing: 2) {
-                                    if let savings = item.projectedSavingsPct {
-                                        Text(
-                                            "Save ~\(model.bytesLabel(item.projectedSavingsBytes)) · \(savings, specifier: "%.0f")%"
-                                        )
-                                        .monospacedDigit()
-                                    } else if item.isProcessed {
-                                        Text(
-                                            "Saved \(model.bytesLabel(item.actualSavingsBytes))"
-                                        )
-                                        .monospacedDigit()
-                                    }
-                                    Text(
-                                        "\(model.bytesLabel(item.sourceBytes)) → \(model.bytesLabel(item.projectedBytes ?? item.outputBytes))"
+                                    .buttonStyle(.plain)
+                                    .frame(
+                                        maxWidth: .infinity,
+                                        alignment: .leading
                                     )
-                                    .font(.caption)
-                                    .foregroundStyle(AppColors.secondaryText)
-                                    if !item.isTerminal {
-                                        Text(
-                                            "~\(model.durationLabel(item.projectedEncodeSeconds ?? item.etaSeconds))"
-                                        )
+                                    Text(summary.total.formatted())
                                         .font(.caption.monospacedDigit())
-                                        .foregroundStyle(AppColors.secondaryText)
-                                    }
+                                        .foregroundStyle(
+                                            AppColors.secondaryText
+                                        )
+                                        .frame(
+                                            width: 52,
+                                            alignment: .trailing
+                                        )
+                                    Text(
+                                        model.bytesLabel(
+                                            summary.savingsBytes
+                                        )
+                                    )
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(AppColors.secondaryText)
+                                    .frame(
+                                        width: 82,
+                                        alignment: .trailing
+                                    )
                                 }
-                                .frame(width: 215, alignment: .trailing)
+                                .padding(.vertical, 3)
+                                .listRowBackground(
+                                    selectedFolder == folder
+                                        ? Color.accentColor.opacity(0.16)
+                                        : Color.clear
+                                )
                             }
-                            .padding(.vertical, 4)
-                            .tag(item.id)
                         }
                     }
-                    .overlay {
-                        if filteredItems.isEmpty {
-                            ContentUnavailableView(
-                                orderedItems.isEmpty
-                                    && session.status == "scanning"
-                                    ? "Scanning…" : "No matching videos",
-                                systemImage: "line.3.horizontal.decrease.circle",
-                                description: Text(
-                                    showProcessed
-                                        ? "Change the filters."
-                                        : "Processed items are hidden."
+                    .frame(
+                        minWidth: 290,
+                        idealWidth: 350,
+                        maxWidth: 450
+                    )
+
+                    VStack(spacing: 0) {
+                        AnchoredListHeader {
+                            Button {
+                                toggleInclusion(for: filteredItems)
+                            } label: {
+                                Image(
+                                    systemName: inclusionIcon(
+                                        for: filteredItems
+                                    )
+                                )
+                            }
+                            .buttonStyle(.plain)
+                            .frame(width: 24)
+                            .disabled(
+                                !filteredItems.contains(
+                                    where: \.canChangeInclusion
                                 )
                             )
+                            .help("Select or deselect visible videos")
+                            SortableListHeader(
+                                title: "#",
+                                key: QueueSortOption.queue,
+                                selection: $sortOption,
+                                ascending: $sortAscending,
+                                defaultAscending: true,
+                                alignment: .trailing
+                            )
+                            .frame(width: 34)
+                            SortableListHeader(
+                                title: "Name",
+                                key: QueueSortOption.name,
+                                selection: $sortOption,
+                                ascending: $sortAscending,
+                                defaultAscending: true
+                            )
+                            SortableListHeader(
+                                title: "Status",
+                                key: QueueSortOption.status,
+                                selection: $sortOption,
+                                ascending: $sortAscending,
+                                defaultAscending: true
+                            )
+                            .frame(width: 82)
+                            SortableListHeader(
+                                title: "Source",
+                                key: QueueSortOption.sourceSize,
+                                selection: $sortOption,
+                                ascending: $sortAscending,
+                                defaultAscending: false,
+                                alignment: .trailing
+                            )
+                            .frame(width: 76)
+                            SortableListHeader(
+                                title: "Output",
+                                key: QueueSortOption.outputSize,
+                                selection: $sortOption,
+                                ascending: $sortAscending,
+                                defaultAscending: false,
+                                alignment: .trailing
+                            )
+                            .frame(width: 76)
+                            SortableListHeader(
+                                title: "Savings",
+                                key: QueueSortOption.savingsBytes,
+                                selection: $sortOption,
+                                ascending: $sortAscending,
+                                defaultAscending: false,
+                                alignment: .trailing
+                            )
+                            .frame(width: 86)
+                            SortableListHeader(
+                                title: "%",
+                                key: QueueSortOption.savingsPercent,
+                                selection: $sortOption,
+                                ascending: $sortAscending,
+                                defaultAscending: false,
+                                alignment: .trailing
+                            )
+                            .frame(width: 42)
+                            SortableListHeader(
+                                title: "Time",
+                                key: QueueSortOption.encodeTime,
+                                selection: $sortOption,
+                                ascending: $sortAscending,
+                                defaultAscending: false,
+                                alignment: .trailing
+                            )
+                            .frame(width: 70)
+                        }
+                        List(selection: $model.selectedQueueItemIDs) {
+                            ForEach(filteredItems) { item in
+                                HStack(spacing: 8) {
+                                    Button {
+                                        model.queueControl(
+                                            item.isIncluded
+                                                ? "exclude" : "include",
+                                            itemID: item.id
+                                        )
+                                    } label: {
+                                        Image(
+                                            systemName: item.isIncluded
+                                                ? "checkmark.square.fill"
+                                                : "square"
+                                        )
+                                    }
+                                    .buttonStyle(.plain)
+                                    .frame(width: 24)
+                                    .disabled(!item.canChangeInclusion)
+                                    Text((item.order + 1).formatted())
+                                        .font(.caption.monospacedDigit())
+                                        .foregroundStyle(
+                                            AppColors.secondaryText
+                                        )
+                                        .frame(
+                                            width: 34,
+                                            alignment: .trailing
+                                        )
+                                    HStack(spacing: 7) {
+                                        Image(systemName: "film.fill")
+                                            .foregroundStyle(
+                                                AppColors.secondaryText
+                                            )
+                                        VStack(
+                                            alignment: .leading,
+                                            spacing: 2
+                                        ) {
+                                            Text(item.name)
+                                                .fontWeight(.semibold)
+                                                .lineLimit(1)
+                                            Text(
+                                                item.relativePath
+                                                    ?? item.path
+                                            )
+                                            .font(.caption2)
+                                            .foregroundStyle(
+                                                AppColors.tertiaryText
+                                            )
+                                            .lineLimit(1)
+                                        }
+                                    }
+                                    .frame(
+                                        maxWidth: .infinity,
+                                        alignment: .leading
+                                    )
+                                    VStack(
+                                        alignment: .leading,
+                                        spacing: 2
+                                    ) {
+                                        HStack(spacing: 4) {
+                                            Image(
+                                                systemName: statusIcon(
+                                                    item.status
+                                                )
+                                            )
+                                            Text(
+                                                item.isProcessed
+                                                    ? "Processed"
+                                                    : (
+                                                        item.isIncluded
+                                                            ? item.status
+                                                                .capitalized
+                                                            : "Excluded"
+                                                    )
+                                            )
+                                            .lineLimit(1)
+                                        }
+                                        .foregroundStyle(
+                                            item.isIncluded
+                                                ? statusColor(item.status)
+                                                : AppColors.secondaryText
+                                        )
+                                        let detail = itemDetail(item)
+                                        if !detail.isEmpty {
+                                            Text(detail)
+                                                .font(.caption2)
+                                                .foregroundStyle(
+                                                    AppColors.secondaryText
+                                                )
+                                                .lineLimit(1)
+                                        }
+                                    }
+                                    .font(.caption)
+                                    .frame(
+                                        width: 82,
+                                        alignment: .leading
+                                    )
+                                    Text(
+                                        model.bytesLabel(item.sourceBytes)
+                                    )
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(
+                                        AppColors.secondaryText
+                                    )
+                                    .frame(
+                                        width: 76,
+                                        alignment: .trailing
+                                    )
+                                    Text(
+                                        model.bytesLabel(
+                                            displayedOutputBytes(item)
+                                        )
+                                    )
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(
+                                        AppColors.secondaryText
+                                    )
+                                    .frame(
+                                        width: 76,
+                                        alignment: .trailing
+                                    )
+                                    Text(
+                                        item.sourceBytes == nil
+                                            ? "—"
+                                            : model.bytesLabel(
+                                                displayedSavingsBytes(item)
+                                            )
+                                    )
+                                    .font(.caption.monospacedDigit())
+                                    .frame(
+                                        width: 86,
+                                        alignment: .trailing
+                                    )
+                                    Text(
+                                        displayedSavingsPercent(item).map {
+                                            String(
+                                                format: "%.0f%%",
+                                                $0
+                                            )
+                                        } ?? "—"
+                                    )
+                                    .font(.caption.monospacedDigit())
+                                    .frame(
+                                        width: 42,
+                                        alignment: .trailing
+                                    )
+                                    Text(
+                                        displayedEncodeSeconds(item).map {
+                                            model.durationLabel($0)
+                                        } ?? "—"
+                                    )
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(
+                                        AppColors.secondaryText
+                                    )
+                                    .frame(
+                                        width: 70,
+                                        alignment: .trailing
+                                    )
+                                }
+                                .padding(.vertical, 4)
+                                .tag(item.id)
+                            }
+                        }
+                        .overlay {
+                            if filteredItems.isEmpty {
+                                ContentUnavailableView(
+                                    orderedItems.isEmpty
+                                        && session.status == "scanning"
+                                        ? "Scanning…"
+                                        : "No matching videos",
+                                    systemImage:
+                                        "line.3.horizontal.decrease.circle",
+                                    description: Text(
+                                        showProcessed
+                                            ? "Change the filters."
+                                            : "Processed items are hidden."
+                                    )
+                                )
+                            }
                         }
                     }
                 }
@@ -4286,7 +4828,7 @@ struct ActivityView: View {
             }
         }
         .padding(28)
-        .frame(maxWidth: 1150, maxHeight: .infinity, alignment: .topLeading)
+        .frame(maxWidth: 1400, maxHeight: .infinity, alignment: .topLeading)
         .sheet(item: $whatIfItem) { item in
             WhatIfView(model: model, item: item)
         }
@@ -4403,7 +4945,7 @@ struct VidReclaimApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView(model: model)
-                .frame(minWidth: 900, minHeight: 650)
+                .frame(minWidth: 1180, minHeight: 650)
         }
         .windowStyle(.titleBar)
         .commands {
