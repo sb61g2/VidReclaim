@@ -18,6 +18,7 @@ $jobRoot = $(if ($SelfTest) {
     Join-Path $HOME ".vidreclaim\jobs"
 })
 $trashRoot = Join-Path (Split-Path -Parent $jobRoot) "trash"
+$removedRoot = Join-Path (Split-Path -Parent $jobRoot) "removed"
 $leaseFreshSeconds = 15
 $cleanupGraceSeconds = 5
 $scriptPath = $MyInvocation.MyCommand.Path
@@ -99,12 +100,20 @@ function Test-FreshFile {
     )
 }
 
+function Get-RemovalMarkerPath {
+    param([string]$JobId)
+    return Join-Path $removedRoot ($JobId + ".txt")
+}
+
 function Get-RemoteJobs {
     $jobs = @()
     if (-not (Test-Path $jobRoot)) {
         return $jobs
     }
     foreach ($directory in Get-ChildItem $jobRoot -Directory -ErrorAction SilentlyContinue) {
+        if (Test-Path (Get-RemovalMarkerPath $directory.Name)) {
+            continue
+        }
         $manifest = Read-JsonFile (Join-Path $directory.FullName "manifest.json")
         $status = Read-JsonFile (Join-Path $directory.FullName "status.json")
         $source = Get-ChildItem `
@@ -274,12 +283,18 @@ function Set-JobControl {
 }
 
 function Request-FinishedCleanup {
+    New-Item -ItemType Directory -Force -Path $removedRoot | Out-Null
     foreach ($job in Get-RemoteJobs) {
         if ($job.State -in @("complete", "cancelled", "error", "skipped")) {
+            $requestedAt = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
             Set-Content `
                 -Encoding ASCII `
                 -Path (Join-Path $job.Directory "cleanup.txt") `
-                -Value ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
+                -Value $requestedAt
+            Set-Content `
+                -Encoding ASCII `
+                -Path (Get-RemovalMarkerPath $job.Id) `
+                -Value $requestedAt
         }
     }
 }
@@ -289,6 +304,7 @@ function Invoke-PendingCleanup {
         return
     }
     New-Item -ItemType Directory -Force -Path $trashRoot | Out-Null
+    New-Item -ItemType Directory -Force -Path $removedRoot | Out-Null
     foreach (
         $trashDirectory in Get-ChildItem `
             $trashRoot `
@@ -308,7 +324,11 @@ function Invoke-PendingCleanup {
             -ErrorAction SilentlyContinue
     ) {
         $cleanupPath = Join-Path $directory.FullName "cleanup.txt"
-        if (-not (Test-Path $cleanupPath)) {
+        $removalMarker = Get-RemovalMarkerPath $directory.Name
+        if (
+            -not (Test-Path $cleanupPath) -and
+            -not (Test-Path $removalMarker)
+        ) {
             continue
         }
         if (
@@ -317,6 +337,12 @@ function Invoke-PendingCleanup {
             ) $leaseFreshSeconds
         ) {
             continue
+        }
+        if (-not (Test-Path $removalMarker)) {
+            Set-Content `
+                -Encoding ASCII `
+                -Path $removalMarker `
+                -Value ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
         }
         $status = Read-JsonFile (
             Join-Path $directory.FullName "status.json"
@@ -331,7 +357,7 @@ function Invoke-PendingCleanup {
         ) {
             $cleanupDelay = 300
         }
-        if (Test-FreshFile $cleanupPath $cleanupDelay) {
+        if (Test-FreshFile $removalMarker $cleanupDelay) {
             continue
         }
         $workerPid = $(if ($status -and $status.worker_pid) {
@@ -346,22 +372,21 @@ function Invoke-PendingCleanup {
         ) {
             continue
         }
-        $trash = Join-Path $trashRoot (
-            $directory.Name + "-" + [Guid]::NewGuid().ToString("N")
-        )
         try {
-            Move-Item `
-                -LiteralPath $directory.FullName `
-                -Destination $trash `
-                -ErrorAction Stop
             Remove-Item `
-                -LiteralPath $trash `
+                -LiteralPath $directory.FullName `
                 -Recurse `
                 -Force `
-                -ErrorAction SilentlyContinue
+                -ErrorAction Stop
         }
         catch {
-            # Keep the complete job folder and retry later.
+            # Keep the external marker and retry after open handles close.
+        }
+        if (-not (Test-Path $directory.FullName)) {
+            Remove-Item `
+                -LiteralPath $removalMarker `
+                -Force `
+                -ErrorAction SilentlyContinue
         }
     }
 }
@@ -545,8 +570,15 @@ if ($SelfTest) {
         )
         $cleanupGraceSeconds = 0
         Request-FinishedCleanup
-        Assert-Test (@(Get-RemoteJobs)[0].State -eq "clearing") (
-            "Finished job did not enter clearing state."
+        Assert-Test (@(Get-RemoteJobs).Count -eq 0) (
+            "Cleared job remained visible."
+        )
+        Remove-Item `
+            -Force `
+            -ErrorAction SilentlyContinue `
+            -LiteralPath (Join-Path $interrupted "cleanup.txt")
+        Assert-Test (@(Get-RemoteJobs).Count -eq 0) (
+            "Partially cleared job reappeared."
         )
         Invoke-PendingCleanup
         Assert-Test (-not (Test-Path $interrupted)) (
@@ -567,6 +599,9 @@ if ($SelfTest) {
         Invoke-PendingCleanup
         Assert-Test (Test-Path $leased) (
             "Active client job was removed."
+        )
+        Assert-Test (@(Get-RemoteJobs).Count -eq 0) (
+            "Cleared active-client job remained visible."
         )
         Remove-Item -Force (Join-Path $leased "client.lease")
         Invoke-PendingCleanup

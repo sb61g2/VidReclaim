@@ -20,8 +20,8 @@ Manual alternative from PowerShell as Administrator:
    click Test.
 
 The tray shows transfers and encodes. Interrupted jobs can resume from the Mac.
-Cancel, then Clear Finished, to remove an interrupted job. Cleanup waits for
-active transfers to stop.
+Cancel, then Clear Finished, to remove one. It disappears immediately; disk
+cleanup finishes after active transfers stop.
 
 Quit VidReclaim cancels jobs, stops remote access, and exits. Close Monitor Only
 leaves jobs and remote access running.

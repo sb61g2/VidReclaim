@@ -220,6 +220,10 @@ def _claim_remote_job(config: RemoteConfig, job_root: str) -> None:
         f"""
 $job = Join-Path $HOME '{job_root}'
 New-Item -ItemType Directory -Force -Path $job | Out-Null
+$removed = Join-Path $HOME (
+    '.vidreclaim\\removed\\' + (Split-Path -Leaf $job) + '.txt'
+)
+if (Test-Path $removed) {{ Remove-Item -Force $removed }}
 $cleanup = Join-Path $job 'cleanup.txt'
 if (Test-Path $cleanup) {{ Remove-Item -Force $cleanup }}
 Set-Content -Encoding ASCII (Join-Path $job 'client.protocol') -Value '3'
@@ -543,8 +547,19 @@ def remote_cleanup(config: RemoteConfig, job_id: str) -> None:
     _ssh_text(
         config,
         f"""
-$path = Join-Path $HOME '.vidreclaim\\jobs\\{job_id}'
-if (Test-Path $path) {{ Remove-Item -Recurse -Force $path }}
+$job = Join-Path $HOME '.vidreclaim\\jobs\\{job_id}'
+$removedRoot = Join-Path $HOME '.vidreclaim\\removed'
+$removed = Join-Path $removedRoot '{job_id}.txt'
+New-Item -ItemType Directory -Force -Path $removedRoot | Out-Null
+[DateTimeOffset]::UtcNow.ToUnixTimeSeconds() |
+    Set-Content -Encoding ASCII $removed
+if (Test-Path $job) {{
+    Set-Content -Encoding ASCII (Join-Path $job 'cleanup.txt') -Value 'client'
+    Remove-Item -Recurse -Force $job -ErrorAction SilentlyContinue
+}}
+if (-not (Test-Path $job)) {{
+    Remove-Item -Force $removed -ErrorAction SilentlyContinue
+}}
 """,
         check=False,
     )

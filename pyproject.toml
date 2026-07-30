@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vidreclaim"
-version = "0.6.3"
+version = "0.6.4"
 description = "Sample-driven, space-saving video transcoding for macOS"
 readme = "README.md"
 requires-python = ">=3.11"
